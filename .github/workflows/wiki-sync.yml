@@ -1,0 +1,56 @@
+# Sync the wiki source of truth (docs/wiki/*.md in this repo) to the
+# GitHub wiki repo (koneho-ai/ha-scene-renderer.wiki, branch master).
+#
+# The wiki repo cannot be written from outside GitHub Actions: the REST API
+# has no endpoints for .wiki repos, and a PAT cannot push to github.com from
+# the maintainer's VM. GITHUB_TOKEN can push to the wiki repo, so this
+# workflow is the only write path. Edit the pages under docs/wiki/ and push
+# to main; the wiki follows automatically.
+name: wiki-sync
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'docs/wiki/**'
+      - '.github/workflows/wiki-sync.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+# Two pushes must never race on the wiki repo.
+concurrency:
+  group: wiki-sync
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out main repo
+        uses: actions/checkout@v4
+
+      - name: Clone wiki repo
+        run: |
+          git clone https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/koneho-ai/ha-scene-renderer.wiki.git wiki
+          cd wiki
+          git config user.name "Koneho"
+          git config user.email "koneho@2ty.one"
+
+      - name: Copy pages and push
+        run: |
+          cd wiki
+          cp ../docs/wiki/*.md .
+          if [ -z "$(git status --porcelain)" ]; then
+            echo "Wiki is already in sync, nothing to do."
+            exit 0
+          fi
+          git add -A
+          git commit -m "Sync wiki from docs/wiki/ (${{ github.sha }})"
+          if ! git push origin master; then
+            echo "Push rejected (non-fast-forward), rebasing once and retrying..."
+            git fetch origin master
+            git pull --rebase origin master
+            git push origin master
+          fi

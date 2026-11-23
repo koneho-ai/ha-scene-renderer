@@ -1,0 +1,34 @@
+name: HA Scene Renderer
+description: Renders a 3D model of your home lit by your real lights and the sun
+version: "0.1.0"
+slug: scene-renderer
+url: https://github.com/koneho-ai/ha-scene-renderer
+# Multi-arch image published by CI (see .github/workflows/builder.yaml).
+# The Supervisor pulls the tag matching `version` below.
+image: "ghcr.io/koneho-ai/ha-scene-renderer"
+arch:
+  - amd64
+  - aarch64
+# S6 overlay must be the first process in the container.
+init: false
+startup: application
+boot: auto
+host_network: false
+ports:
+  3000/tcp: null
+ports_description:
+  3000/tcp: Render service HTTP API. Only needed for debugging — Home Assistant
+    talks to the add-on on the internal network, no host port required.
+map:
+  - share:rw
+options:
+  model: sample-apartment.glb
+  width: 1280
+  height: 720
+  log_level: info
+schema:
+  model: str
+  width: "int(320,3840)"
+  height: "int(240,2160)"
+  log_level: list(trace|debug|info|notice|warning|error|fatal)
+watchdog: "http://[HOST]:3000/health"

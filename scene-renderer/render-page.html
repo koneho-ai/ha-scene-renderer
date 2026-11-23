@@ -1,0 +1,66 @@
+<!doctype html>
+<!-- Render page for the Puppeteer backend. Served by server.mjs at
+     /render-page; not for humans. Loads the same scene.mjs the node-webgl
+     backend uses, so both backends render identically. -->
+<html>
+<head>
+<meta charset="utf-8">
+<title>HA Scene Renderer</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "/static/three/build/three.module.js",
+    "three/addons/": "/static/three/examples/jsm/"
+  }
+}
+</script>
+<style>html, body { margin: 0; padding: 0; background: #000; } canvas { display: block; }</style>
+</head>
+<body>
+<script type="module">
+import * as THREE from "three";
+import * as sceneLib from "/static/scene.mjs";
+
+const response = await fetch("/model.glb");
+if (!response.ok) throw new Error(`failed to load model: HTTP ${response.status}`);
+const model = await sceneLib.loadModel(await response.arrayBuffer());
+
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.shadowMap.enabled = true;
+renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = sceneLib.BASE_EXPOSURE;
+renderer.setPixelRatio(1);
+document.body.appendChild(renderer.domElement);
+
+window.__lights = () => sceneLib.listLights(model.lights);
+window.__cameraNames = () => sceneLib.getCameraNames(model);
+// Route scene.mjs log messages to the browser console; the puppeteer
+// backend forwards console errors and warnings to the add-on log, so
+// invalid cameras.yaml entries are visible there — matching the
+// node-webgl backend, which passes its log straight through.
+function pageLog(level, message) {
+  if (level === "error") console.error(message);
+  else if (level === "warning") console.warn(message);
+  else console.log(message);
+}
+window.__cameras = ({ fileConfig, defaults }) =>
+  sceneLib.listCameras(model, fileConfig || {}, defaults, pageLog);
+window.__render = ({ lights, sun, cameras, width, height, fileConfig }) =>
+  sceneLib.renderCameras({
+    renderer,
+    model,
+    lights: lights || {},
+    sun: sun ?? null,
+    cameras,
+    width,
+    height,
+    fileConfig: fileConfig || {},
+    setSize: (w, h) => renderer.setSize(w, h, false),
+    capture: () => renderer.domElement.toDataURL("image/png"),
+    log: pageLog,
+  });
+window.__sceneReady = true;
+</script>
+</body>
+</html>

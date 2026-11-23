@@ -1,0 +1,43 @@
+# Per-camera configuration for HA Scene Renderer.
+#
+# Copy this file to /share/scene-renderer/cameras.yaml on your Home
+# Assistant host and edit it there. The file is optional: without it,
+# every camera renders at the add-on's global size with the model's own
+# framing. Changes are picked up automatically (hot-reloaded) — no
+# add-on restart needed.
+#
+# Keys are camera names exactly as GET /cameras lists them: the named
+# glTF cameras in your model, or the built-in virtual cameras
+# (overview, topdown, front) when the model defines none. Every field
+# is optional; anything you leave out falls back to the model value,
+# then to the global default.
+#
+# Precedence: this file > model > global defaults (add-on options).
+#
+# If a camera's entry is invalid, that entry is ignored (logged) and the
+# camera renders with defaults; other cameras are unaffected. Unknown
+# camera names are warned about and ignored. A malformed file keeps the
+# last good config — rendering never breaks because of this file.
+
+overview:
+  # Render size for this camera (overrides the add-on's width/height).
+  width: 1280
+  height: 720
+  # Vertical field of view in degrees (perspective cameras only).
+  fov: 50
+  # Near / far clip planes (model units, usually metres).
+  near: 0.1
+  far: 100
+  # Camera position and look-at target (model units). Overrides the
+  # position/framing from the model (or the computed pose for built-in
+  # virtual cameras).
+  position: [6, 8, 10]
+  target: [6, 0, 4]
+  # Clear color: a hex color, or null for transparent (the default).
+  background: "#1a1a2e"
+  # Tone-mapping exposure multiplier (1.0 = the add-on's base exposure).
+  exposure: 1.0
+
+living_room:
+  width: 800
+  height: 600

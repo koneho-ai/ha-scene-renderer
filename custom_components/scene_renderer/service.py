@@ -65,8 +65,40 @@ class RenderServiceClient:
             raise RenderServiceError("render service returned an unexpected /cameras response")
         return cameras
 
-    async def async_render(self, payload: dict[str, Any]) -> dict[str, bytes]:
-        """POST /render. Returns {camera_name: PNG bytes}."""
+    async def async_script(self) -> dict[str, Any]:
+        """GET /script. Returns the user script (scene.js) status.
+
+        Shape: {"script": {"present": bool, "hash": str | None,
+        "subscribe": [...], "status": "none"|"ok"|"error", "error": ...,
+        "last_error": ..., "error_count": int}}.
+        """
+        try:
+            async with asyncio.timeout(PROBE_TIMEOUT):
+                async with self._session.get(f"{self.base_url}/script") as resp:
+                    if resp.status != 200:
+                        raise RenderServiceError(f"script request failed: HTTP {resp.status}")
+                    data = await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            raise RenderServiceError(f"cannot reach render service: {err}") from err
+        script = data.get("script")
+        if not isinstance(script, dict):
+            raise RenderServiceError("render service returned an unexpected /script response")
+        return script
+
+    async def async_render(
+        self, payload: dict[str, Any]
+    ) -> tuple[dict[str, tuple[bytes, str]], dict[str, Any]]:
+        """POST /render.
+
+        Returns ({camera_name: (bytes, content_type)}, script_info).
+        Stills come back as image/png; cameras with a clip: entry in
+        cameras.yaml come back as image/webp (animated). The script info
+        is the /script status block (present/hash/subscribe/status/...),
+        so the coordinator can re-subscribe when the script changes.
+
+        Accepts the legacy v1 response shape too (renders as plain base64
+        strings), treating those as image/png.
+        """
 
         try:
             async with asyncio.timeout(RENDER_TIMEOUT):
@@ -84,12 +116,25 @@ class RenderServiceClient:
         renders = data.get("renders")
         if not isinstance(renders, dict):
             raise RenderServiceError("render service returned an unexpected /render response")
-        out: dict[str, bytes] = {}
-        for name, encoded in renders.items():
-            if not isinstance(encoded, str):
+        out: dict[str, tuple[bytes, str]] = {}
+        for name, rendered in renders.items():
+            if isinstance(rendered, str):
+                # Legacy v1 shape: plain base64 PNG.
+                encoded, content_type = rendered, "image/png"
+            elif isinstance(rendered, dict):
+                encoded = rendered.get("data")
+                content_type = rendered.get("content_type", "image/png")
+                if not isinstance(encoded, str) or not isinstance(content_type, str):
+                    raise RenderServiceError(
+                        "render service returned an unexpected /render response"
+                    )
+            else:
                 raise RenderServiceError("render service returned an unexpected /render response")
             try:
-                out[name] = base64.b64decode(encoded, validate=True)
+                out[name] = (base64.b64decode(encoded, validate=True), content_type)
             except ValueError as err:
-                raise RenderServiceError(f"render service returned invalid PNG data for camera {name!r}") from err
-        return out
+                raise RenderServiceError(f"render service returned invalid image data for camera {name!r}") from err
+        script = data.get("script")
+        if not isinstance(script, dict):
+            script = {}
+        return out, script

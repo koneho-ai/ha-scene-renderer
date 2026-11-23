@@ -2,15 +2,19 @@
 //
 // Plain node:http server, no framework. Endpoints:
 //   GET  /            service info
-//   GET  /health      status, backend, model, scene lights, cameras
+//   GET  /health      status, backend, model, scene lights, cameras, script
 //   GET  /lights      scene lights from the loaded model
 //   GET  /cameras     scene cameras with their effective config
 //                     (model + cameras.yaml + defaults, merged)
-//   POST /render      { lights, sun, cameras, width, height }
-//                     -> JSON { renders: { cameraName: base64 PNG } }
+//   GET  /script      user script (scene.js) status + subscriptions
+//   POST /render      { lights, sun, entities, cameras, width, height }
+//                     -> JSON { renders: { cameraName:
+//                     { data: base64, content_type } }, script: {...} }
+//                     Renders are PNG stills, or animated WebP clips for
+//                     cameras with a clip: entry in cameras.yaml.
 //   GET  /model.glb   the loaded model (used by the puppeteer render page)
 //   GET  /render-page the puppeteer render page
-//   GET  /static/*    three.js + scene.mjs for the render page
+//   GET  /static/*    three.js + scene.mjs + script.mjs + ses for the page
 //
 // Configuration (environment; set by run.sh from the add-on options):
 //   PORT                default 3000
@@ -18,6 +22,7 @@
 //   WIDTH / HEIGHT      default 1280x720 (global default render size;
 //                       cameras.yaml can override per camera)
 //   CAMERAS_CONFIG_PATH default /share/scene-renderer/cameras.yaml
+//   SCENE_SCRIPT_PATH   default /share/scene-renderer/scene.js
 //   RENDER_BACKEND      node-webgl (default) | puppeteer
 //   LOG_LEVEL           trace|debug|info|notice|warning|error|fatal (default info)
 import { createReadStream, existsSync, readFileSync, statSync } from "node:fs";
@@ -26,6 +31,7 @@ import { basename, dirname, extname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { createCameraConfigStore } from "./camera-config.mjs";
+import { createScriptStore } from "./script-store.mjs";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const VERSION = JSON.parse(readFileSync(join(HERE, "package.json"), "utf8")).version;
@@ -51,6 +57,7 @@ const CONFIG = {
   width: parseInt(process.env.WIDTH || "1280", 10),
   height: parseInt(process.env.HEIGHT || "720", 10),
   camerasFile: process.env.CAMERAS_CONFIG_PATH || "/share/scene-renderer/cameras.yaml",
+  scriptFile: process.env.SCENE_SCRIPT_PATH || "/share/scene-renderer/scene.js",
   backend: (process.env.RENDER_BACKEND || "node-webgl").toLowerCase(),
 };
 
@@ -67,21 +74,41 @@ const cameraStore = createCameraConfigStore({ filePath: CONFIG.camerasFile, log 
 await cameraStore.load();
 cameraStore.watch();
 
+// The script store compiles in the backend's realm (the backend owns the
+// SES compartment), so the store is wired up once the backend exists —
+// `compileScriptInBackend` closes over the backend variable set at
+// startup. Loading happens after the backend is ready (see below).
+let backend = null;
+const scriptStore = createScriptStore({
+  filePath: CONFIG.scriptFile,
+  log,
+  compile: async (source) => {
+    if (!backend) return { ok: false, error: "render backend is not ready yet" };
+    return backend.setScript(source);
+  },
+});
+
 // ---------------------------------------------------------------------------
 // Backend + render queue (serialized, coalesced by union of cameras)
 // ---------------------------------------------------------------------------
-let backend = null;
 let ready = false;
 let renderCount = 0;
 let lastRenderMs = null;
 const startedAt = Date.now();
+
+// Render generation: incremented on every /render request. A clip render
+// in progress checks it between frames and aborts early when a newer
+// request arrived, so a state change mid-clip does not waste the full
+// render — the aborted waiters are re-queued and served by the newer
+// render with the freshest state.
+let renderGeneration = 0;
 
 const renderQueue = [];
 let renderActive = false;
 
 function enqueueRender(args) {
   return new Promise((resolvePromise, reject) => {
-    renderQueue.push({ args, resolvePromise, reject });
+    renderQueue.push({ args, generation: renderGeneration, resolvePromise, reject });
     pumpRenders();
   });
 }
@@ -90,8 +117,8 @@ async function pumpRenders() {
   if (renderActive) return;
   if (renderQueue.length === 0) return;
   // Coalesce everything queued: render the UNION of the requested cameras
-  // once, with the freshest light/sun/size from the latest request, then
-  // give each waiter the subset of cameras it asked for.
+  // once, with the freshest light/sun/size/entities from the latest
+  // request, then give each waiter the subset of cameras it asked for.
   const items = renderQueue.splice(0, renderQueue.length);
   const latest = items[items.length - 1];
   const cameraSet = new Set();
@@ -99,10 +126,14 @@ async function pumpRenders() {
     for (const name of item.args.cameras) cameraSet.add(name);
   }
   const merged = { ...latest.args, cameras: [...cameraSet] };
+  const generation = latest.generation;
   renderActive = true;
   const t0 = Date.now();
   try {
-    const renders = await backend.render(merged);
+    const renders = await backend.render({
+      ...merged,
+      shouldAbort: () => renderGeneration !== generation,
+    });
     renderCount += 1;
     lastRenderMs = Date.now() - t0;
     log("debug", `rendered ${merged.cameras.join(", ")} in ${lastRenderMs} ms`);
@@ -114,8 +145,17 @@ async function pumpRenders() {
       item.resolvePromise(subset);
     }
   } catch (err) {
-    log("error", `render failed: ${err.message}`);
-    for (const item of items) item.reject(err);
+    if (err && err.code === "RENDER_ABORTED") {
+      // A newer request arrived mid-render: re-queue these waiters so the
+      // newer render serves them with fresh state. (The newer request is
+      // always in the queue — the generation only advances when one
+      // arrives.) Not an error; log at debug.
+      log("debug", "render aborted by a newer request; re-queuing waiters");
+      renderQueue.unshift(...items);
+    } else {
+      log("error", `render failed: ${err.message}`);
+      for (const item of items) item.reject(err);
+    }
   } finally {
     renderActive = false;
     if (renderQueue.length > 0) pumpRenders();
@@ -177,6 +217,26 @@ function globalSize() {
   return { width: CONFIG.width, height: CONFIG.height };
 }
 
+// Script status for /health, GET /script, and the /render response: the
+// file status from the store, plus the last runtime error from the backend
+// (a script that compiles but throws while rendering).
+async function scriptStatus() {
+  const status = scriptStore.getStatus();
+  let runtime = { lastError: null, errorCount: 0 };
+  if (backend && typeof backend.getScriptInfo === "function") {
+    try {
+      runtime = await backend.getScriptInfo();
+    } catch {
+      // ignore — the store status is still useful on its own
+    }
+  }
+  return {
+    ...status,
+    last_error: runtime.lastError || null,
+    error_count: runtime.errorCount || 0,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Routes
 // ---------------------------------------------------------------------------
@@ -199,7 +259,7 @@ const server = createServer(async (req, res) => {
         version: VERSION,
         backend: CONFIG.backend,
         ready,
-        endpoints: ["GET /health", "GET /lights", "GET /cameras", "POST /render"],
+        endpoints: ["GET /health", "GET /lights", "GET /cameras", "GET /script", "POST /render"],
       });
       return;
     }
@@ -210,6 +270,7 @@ const server = createServer(async (req, res) => {
         return;
       }
       await cameraStore.maybeReload();
+      await scriptStore.maybeReload();
       sendJson(res, 200, {
         status: "ok",
         backend: backend.name,
@@ -217,10 +278,22 @@ const server = createServer(async (req, res) => {
         model: basename(CONFIG.modelPath),
         lights: backend.lights,
         cameras: backend.cameraNames,
+        animations: backend.animations || [],
+        script: await scriptStatus(),
         uptime_s: Math.round((Date.now() - startedAt) / 1000),
         renders: renderCount,
         last_render_ms: lastRenderMs,
       });
+      return;
+    }
+
+    if (req.method === "GET" && path === "/script") {
+      if (!ready) {
+        sendError(res, 503, "render service is still starting");
+        return;
+      }
+      await scriptStore.maybeReload();
+      sendJson(res, 200, { script: await scriptStatus() });
       return;
     }
 
@@ -257,6 +330,7 @@ const server = createServer(async (req, res) => {
         return;
       }
       await cameraStore.maybeReload();
+      await scriptStore.maybeReload();
       const width = Math.min(3840, Math.max(64, parseInt(body.width, 10) || CONFIG.width));
       const height = Math.min(2160, Math.max(64, parseInt(body.height, 10) || CONFIG.height));
       // Cameras: the requested list, filtered to cameras the model offers;
@@ -282,18 +356,26 @@ const server = createServer(async (req, res) => {
       const args = {
         lights: body.lights && typeof body.lights === "object" ? body.lights : {},
         sun: body.sun && typeof body.sun === "object" ? body.sun : null,
+        // Entity snapshot for the user script (subscribed entities +
+        // mapped lights + sun, as sent by the integration). The script
+        // sees the same snapshot on every frame of a clip.
+        entities: body.entities && typeof body.entities === "object" ? body.entities : {},
         cameras,
         width,
         height,
         fileConfig: cameraStore.get(),
       };
+      renderGeneration += 1;
       try {
         const renders = await enqueueRender(args);
         const encoded = {};
-        for (const [name, png] of Object.entries(renders)) {
-          encoded[name] = png.toString("base64");
+        for (const [name, render] of Object.entries(renders)) {
+          encoded[name] = {
+            data: render.data.toString("base64"),
+            content_type: render.contentType,
+          };
         }
-        sendJson(res, 200, { renders: encoded });
+        sendJson(res, 200, { renders: encoded, script: await scriptStatus() });
       } catch (err) {
         sendError(res, 500, `render failed: ${err.message}`);
       }
@@ -315,6 +397,12 @@ const server = createServer(async (req, res) => {
       let file;
       if (rel === "scene.mjs") {
         file = join(HERE, "scene.mjs");
+      } else if (rel === "script.mjs") {
+        file = join(HERE, "script.mjs");
+      } else if (rel === "ses/dist/lockdown.umd.js") {
+        // The SES sandbox for the render page (classic script, sets the
+        // lockdown/Compartment/harden globals). Self-contained bundle.
+        file = join(HERE, "node_modules", "ses", "dist", "lockdown.umd.js");
       } else if (rel.startsWith("three/")) {
         // Only serve files from the three package, no path traversal.
         file = resolve(join(HERE, "node_modules", rel));
@@ -352,6 +440,9 @@ server.listen(CONFIG.port, "0.0.0.0", async () => {
       log,
     });
     cameraStore.setKnownCameras(backend.cameraNames);
+    // Load the user script now that the backend can compile it.
+    await scriptStore.load();
+    scriptStore.watch();
     ready = true;
     log("info", `ready (backend: ${backend.name}, ${backend.lights.length} scene lights, ${backend.cameraNames.length} cameras)`);
   } catch (err) {
@@ -364,6 +455,7 @@ async function shutdown(signal) {
   log("info", `received ${signal}, shutting down`);
   server.close();
   cameraStore.close();
+  scriptStore.close();
   if (backend && typeof backend.close === "function") {
     try {
       await backend.close();

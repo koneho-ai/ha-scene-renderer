@@ -3,14 +3,24 @@
 
 Builds a small, clean, dollhouse-style apartment (4 rooms, simple box
 furniture) and writes it as a binary glTF file (.glb) with named
-KHR_lights_punctual lights and named glTF cameras. The light names are
-the identifiers the HA integration maps to light entities, and the
-camera names are the identifiers for the image entities — both follow
-the snake_case naming convention:
+KHR_lights_punctual lights, named glTF cameras, and a ceiling fan with a
+rotation keyframe animation. The light names are the identifiers the HA
+integration maps to light entities, and the camera names are the
+identifiers for the image entities — both follow the snake_case naming
+convention:
 
     lights:  living_room_ceiling, kitchen_counter, bedroom_ceiling,
              bathroom_ceiling, living_room_lamp
     cameras: overview, living_room
+    animated: ceiling_fan (3 s per full turn, matching the default clip
+              duration, so a 3 s clip loops seamlessly)
+
+The fan is a group node (hub + 4 blades as children) with a rotation
+animation about Y; the downrod is static. A `blinds` group node hangs
+over the living-room window for the scene.js example (the script moves
+it with the sun elevation). Group nodes carry real transforms, so the
+scene.js API reads/writes their position — unlike furniture boxes, whose
+position is baked into the geometry.
 
 Camera names are set on BOTH the camera definition and the node that
 references it: three.js names a loaded camera from the definition's
@@ -133,6 +143,10 @@ class GlbBuilder:
         self.nodes: list[dict] = []
         self.lights: list[dict] = []
         self.cameras: list[dict] = []
+        self.animations: list[dict] = []
+        # Node translations, parallel to self.nodes (None = identity).
+        # Used to place child boxes in a group node's local frame.
+        self._node_translations: list[tuple[float, float, float] | None] = []
 
     # -- materials ------------------------------------------------------
     def material(self, name: str, rgb: tuple[float, float, float],
@@ -154,8 +168,18 @@ class GlbBuilder:
 
     # -- geometry -------------------------------------------------------
     def box(self, name: str, center: tuple[float, float, float],
-            size: tuple[float, float, float], material: int) -> int:
-        """Add an axis-aligned box. Returns the node index."""
+            size: tuple[float, float, float], material: int,
+            parent: int | None = None) -> int:
+        """Add an axis-aligned box. Returns the node index.
+
+        `center` is in world coordinates; when `parent` is given, the
+        vertices are placed in the parent node's local frame and the box
+        node becomes a child of the parent (callers must NOT also add it
+        to the root children).
+        """
+        if parent is not None:
+            pt = self._node_translations[parent] or (0.0, 0.0, 0.0)
+            center = (center[0] - pt[0], center[1] - pt[1], center[2] - pt[2])
         cx, cy, cz = center
         hx, hy, hz = size[0] / 2, size[1] / 2, size[2] / 2
         base_vertex = len(self.positions) // 3
@@ -184,7 +208,45 @@ class GlbBuilder:
         })
         node_index = len(self.nodes)
         self.nodes.append({"name": name, "mesh": mesh_index})
+        self._node_translations.append(None)
+        if parent is not None:
+            self.nodes[parent].setdefault("children", []).append(node_index)
         return node_index
+
+    # -- groups ---------------------------------------------------------
+    def group(self, name: str,
+              translation: tuple[float, float, float]) -> int:
+        """Add an empty group node at a translation. Returns its index.
+
+        Children (boxes with parent=) are placed in this node's local
+        frame. The node carries a real transform, so animations and the
+        scene.js API can move/rotate it.
+        """
+        node_index = len(self.nodes)
+        self.nodes.append({
+            "name": name,
+            "translation": [translation[0], translation[1], translation[2]],
+            "children": [],
+        })
+        self._node_translations.append(translation)
+        return node_index
+
+    # -- animations -----------------------------------------------------
+    def rotation_animation(self, name: str, node_index: int,
+                           times: list[float],
+                           quaternions: list[tuple[float, float, float, float]]) -> None:
+        """Add a rotation keyframe animation for a node.
+
+        A full 360-degree turn needs intermediate keyframes: the start
+        and end quaternions describe the same orientation, and slerp
+        between them takes the zero-length path. Use 90-degree steps.
+        """
+        assert len(times) == len(quaternions) and len(times) >= 2
+        self.animations.append({
+            "name": name, "node": node_index,
+            "times": list(times),
+            "rotations": [list(q) for q in quaternions],
+        })
 
     # -- lights ---------------------------------------------------------
     def light(self, name: str, position: tuple[float, float, float],
@@ -204,6 +266,7 @@ class GlbBuilder:
             "translation": [position[0], position[1], position[2]],
             "extensions": {"KHR_lights_punctual": {"light": light_index}},
         })
+        self._node_translations.append(position)
         return node_index
 
     # -- cameras --------------------------------------------------------
@@ -235,6 +298,7 @@ class GlbBuilder:
             "translation": [position[0], position[1], position[2]],
             "rotation": list(look_at_quaternion(position, target)),
         })
+        self._node_translations.append(position)
         return node_index
 
     # -- output ---------------------------------------------------------
@@ -242,23 +306,28 @@ class GlbBuilder:
         """Serialise to a GLB byte string."""
         # Root node groups everything.
         self.nodes.append({"name": "apartment", "children": root_children})
+        self._node_translations.append(None)
 
         position_bytes = struct.pack(f"<{len(self.positions)}f", *self.positions)
         normal_bytes = struct.pack(f"<{len(self.normals)}f", *self.normals)
         index_bytes = struct.pack(f"<{len(self.indices)}I", *self.indices)
 
+        blob = bytearray()
         buffer_views = []
         accessors = []
-        offset = 0
 
-        def add_view(data: bytes, target: int) -> int:
-            nonlocal offset
+        def add_view(data: bytes, target: int | None) -> int:
             idx = len(buffer_views)
-            buffer_views.append({
-                "buffer": 0, "byteOffset": offset,
-                "byteLength": len(data), "target": target,
-            })
-            offset += len(data)
+            view: dict = {
+                "buffer": 0, "byteOffset": len(blob),
+                "byteLength": len(data),
+            }
+            if target is not None:
+                view["target"] = target
+            buffer_views.append(view)
+            blob.extend(data)
+            while len(blob) % 4:  # keep every view 4-byte aligned
+                blob.append(0)
             return idx
 
         pos_view = add_view(position_bytes, 34962)   # ARRAY_BUFFER
@@ -294,6 +363,41 @@ class GlbBuilder:
             accessors[pos_acc]["min"] = [min(xs), min(ys), min(zs)]
             accessors[pos_acc]["max"] = [max(xs), max(ys), max(zs)]
 
+        # Animation samplers (time + rotation keyframes per animation).
+        animations_json: list[dict] = []
+        for anim in self.animations:
+            times = anim["times"]
+            rots = anim["rotations"]
+            time_view = add_view(struct.pack(f"<{len(times)}f", *times), None)
+            flat_rots = [c for q in rots for c in q]
+            rot_view = add_view(struct.pack(f"<{len(flat_rots)}f", *flat_rots), None)
+            time_acc = len(accessors)
+            accessors.append({
+                "bufferView": time_view,
+                "componentType": 5126, "count": len(times), "type": "SCALAR",
+                "min": [min(times)], "max": [max(times)],
+            })
+            rot_acc = len(accessors)
+            accessors.append({
+                "bufferView": rot_view,
+                "componentType": 5126, "count": len(rots), "type": "VEC4",
+                "min": [min(flat_rots[0::4]), min(flat_rots[1::4]),
+                        min(flat_rots[2::4]), min(flat_rots[3::4])],
+                "max": [max(flat_rots[0::4]), max(flat_rots[1::4]),
+                        max(flat_rots[2::4]), max(flat_rots[3::4])],
+            })
+            animations_json.append({
+                "name": anim["name"],
+                "samplers": [{
+                    "input": time_acc, "interpolation": "LINEAR",
+                    "output": rot_acc,
+                }],
+                "channels": [{
+                    "sampler": 0,
+                    "target": {"node": anim["node"], "path": "rotation"},
+                }],
+            })
+
         gltf = {
             "asset": {"version": "2.0",
                       "generator": "ha-scene-renderer generate_sample_model.py"},
@@ -304,16 +408,18 @@ class GlbBuilder:
             "materials": self.materials,
             "accessors": accessors,
             "bufferViews": buffer_views,
-            "buffers": [{"byteLength": len(position_bytes) + len(normal_bytes) + len(index_bytes)}],
+            "buffers": [{"byteLength": len(blob)}],
             "extensionsUsed": ["KHR_lights_punctual"],
             "extensions": {"KHR_lights_punctual": {"lights": self.lights}},
         }
         if self.cameras:
             gltf["cameras"] = self.cameras
+        if animations_json:
+            gltf["animations"] = animations_json
 
         json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
         json_bytes += b" " * (-len(json_bytes) % 4)
-        bin_bytes = position_bytes + normal_bytes + index_bytes
+        bin_bytes = bytes(blob)
         bin_bytes += b"\x00" * (-len(bin_bytes) % 4)
 
         total = 12 + 8 + len(json_bytes) + 8 + len(bin_bytes)
@@ -396,6 +502,40 @@ def build_apartment(include_cameras: bool = True) -> tuple[GlbBuilder, list[int]
     box("lamp_pole", (5.8, 0.85, 1.0), (0.06, 1.5, 0.06), metal)
     box("lamp_shade", (5.8, 1.55, 1.0), (0.4, 0.3, 0.4), fabric_red)
     box("lamp_base", (5.8, 0.13, 1.0), (0.3, 0.06, 0.3), metal)
+
+    # -- ceiling fan (living room): a group node so the rotation
+    # animation can spin it. The downrod is static (not part of the
+    # group). One full turn per 3 s — the default clip duration, so a
+    # 3 s clip loops seamlessly.
+    box("fan_downrod", (3.5, 2.4, 2.5), (0.06, 0.4, 0.06), metal)
+    fan = b.group("ceiling_fan", (3.5, 2.2, 2.5))
+    children.append(fan)
+    b.box("fan_hub", (3.5, 2.2, 2.5), (0.25, 0.12, 0.25), metal, parent=fan)
+    for i, (dx, dz, size) in enumerate([
+        (0.6, 0.0, (1.1, 0.03, 0.18)),
+        (-0.6, 0.0, (1.1, 0.03, 0.18)),
+        (0.0, 0.6, (0.18, 0.03, 1.1)),
+        (0.0, -0.6, (0.18, 0.03, 1.1)),
+    ]):
+        b.box(f"fan_blade_{i}", (3.5 + dx, 2.2, 2.5 + dz), size,
+              wood_dark, parent=fan)
+    # Rotation keyframes about Y in 90-degree steps (a 360-degree turn
+    # cannot be keyframed with start/end alone — slerp takes the
+    # zero-length path between identical orientations).
+    fan_times = [0.0, 0.75, 1.5, 2.25, 3.0]
+    fan_rots = []
+    for deg in (0, 90, 180, 270, 360):
+        half = math.radians(deg) / 2
+        fan_rots.append((0.0, math.sin(half), 0.0, math.cos(half)))
+    b.rotation_animation("ceiling_fan_spin", fan, fan_times, fan_rots)
+
+    # -- living-room window + blinds (north wall). The blinds are a
+    # group node so scene.js can move them (position.y) with the sun.
+    box("window_glass", (2.0, 1.7, 0.09), (1.8, 1.4, 0.03), glass)
+    blinds = b.group("blinds", (2.0, 1.8, 0.14))
+    children.append(blinds)
+    b.box("blinds_panel", (2.0, 1.8, 0.14), (1.6, 1.2, 0.05), white,
+          parent=blinds)
 
     # -- kitchen furniture --
     box("counter", (11.5, 0.55, 2.5), (0.7, 0.9, 4.0), white)
@@ -482,6 +622,9 @@ def main() -> int:
     print("  cameras:")
     for cam in builder.cameras:
         print(f"    - {cam['name']} ({cam['type']}, yfov {math.degrees(cam['perspective']['yfov']):.0f}°)")
+    print("  animations:")
+    for anim in builder.animations:
+        print(f"    - {anim['name']} (node {anim['node']}, {len(anim['times'])} keyframes, {anim['times'][-1]}s)")
     return 0
 
 

@@ -35,6 +35,7 @@
 //     one camera's overrides never leak into the next camera's render.
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { runScriptCall } from "./script.mjs";
 
 export const BUILTIN_CAMERAS = ["overview", "topdown", "front"];
 
@@ -156,7 +157,17 @@ export async function loadModel(arrayBuffer) {
   const hemi = new THREE.HemisphereLight(0xbfd4e6, 0x8a7a66, 0.5);
   scene.add(hemi);
 
-  return { scene, lights, cameras, bounds, center, size, diag, sun, hemi };
+  // glTF animations (e.g. a spinning fan): one mixer, all clips playing,
+  // sampled per frame with mixer.setTime(t). Actions loop by default
+  // (LoopRepeat), so a time past the clip's duration wraps around.
+  const mixer = new THREE.AnimationMixer(scene);
+  const animations = [];
+  for (const clip of gltf.animations || []) {
+    mixer.clipAction(clip).play();
+    animations.push({ name: clip.name, duration: clip.duration });
+  }
+
+  return { scene, lights, cameras, bounds, center, size, diag, sun, hemi, mixer, animations, sunState: null };
 }
 
 export function listLights(lights) {
@@ -243,17 +254,13 @@ function sunColorForElevation(elevation) {
   return stops[stops.length - 1][1].map((v) => Math.round(v * 255));
 }
 
-export function applySun(model, sun) {
-  const { sun: sunLight, hemi, center, diag } = model;
-  if (!sun || typeof sun.elevation !== "number" || sun.elevation <= 0) {
-    // Night, or sun disabled: no direct sun; a low ambient so the interior
-    // lights carry the scene.
-    sunLight.intensity = 0;
-    hemi.intensity = sun ? 0.06 : 0.5;
-    return;
-  }
-  const az = (sun.azimuth * Math.PI) / 180;
-  const el = (sun.elevation * Math.PI) / 180;
+// Position the sun light from azimuth/elevation (HA convention, see
+// applySun). Shared by applySun and the script's getSun() — a script can
+// move the sun the same way the built-in mapping does.
+export function positionSun(model, azimuth, elevation) {
+  const { sun: sunLight, center, diag } = model;
+  const az = (azimuth * Math.PI) / 180;
+  const el = (elevation * Math.PI) / 180;
   const dir = new THREE.Vector3(
     Math.cos(el) * Math.sin(az),
     Math.sin(el),
@@ -262,10 +269,29 @@ export function applySun(model, sun) {
   sunLight.position.copy(center).addScaledVector(dir, diag * 2);
   sunLight.target.position.copy(center);
   sunLight.target.updateMatrixWorld();
+  model.sunState = { azimuth, elevation };
+}
+
+// Daylight intensity ramp: 0 at the horizon, full at 30 degrees.
+function sunIntensityForElevation(elevation) {
+  return 3.0 * Math.min(1, Math.max(0, elevation / 30));
+}
+
+export function applySun(model, sun) {
+  const { sun: sunLight, hemi } = model;
+  if (!sun || typeof sun.elevation !== "number" || sun.elevation <= 0) {
+    // Night, or sun disabled: no direct sun; a low ambient so the interior
+    // lights carry the scene.
+    sunLight.intensity = 0;
+    hemi.intensity = sun ? 0.06 : 0.5;
+    model.sunState = sun ? { azimuth: sun.azimuth ?? 0, elevation: sun.elevation ?? 0 } : null;
+    return;
+  }
+  positionSun(model, sun.azimuth, sun.elevation);
   const rgb = sunColorForElevation(sun.elevation);
   sunLight.color.setRGB(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, THREE.SRGBColorSpace);
-  // Ramp in over the first 30 degrees; 3.0 is bright daylight with ACES.
-  sunLight.intensity = 3.0 * Math.min(1, Math.max(0, sun.elevation / 30));
+  // 3.0 is bright daylight with ACES.
+  sunLight.intensity = sunIntensityForElevation(sun.elevation);
   hemi.intensity = 0.15 + 0.45 * Math.min(1, Math.max(0, sun.elevation / 30));
 }
 
@@ -387,7 +413,8 @@ function isHexColor(v) {
 // An invalid file entry is dropped wholesale for that camera (logged);
 // other cameras are unaffected. Returns the effective config:
 // { name, type, fov, near, far, position, target, width, height,
-//   background, exposure, source }.
+//   background, exposure, source, clip } where clip is
+// { duration, fps, frames } or null (no clip key -> a still image).
 export function resolveCameraConfig(info, fileEntry, defaults, log = () => {}) {
   const out = {
     name: info.name,
@@ -402,6 +429,7 @@ export function resolveCameraConfig(info, fileEntry, defaults, log = () => {}) {
     background: null,
     exposure: 1.0,
     source: info.source,
+    clip: null,
   };
   if (fileEntry === undefined || fileEntry === null) return out;
   if (!isPlainObject(fileEntry)) {
@@ -471,6 +499,31 @@ export function resolveCameraConfig(info, fileEntry, defaults, log = () => {}) {
       return out;
     }
   }
+  // Motion clip (opt-in): clip: { duration, fps }. Frames per loop =
+  // duration x fps. The clip uses the camera's configured resolution.
+  let clip = null;
+  if (fileEntry.clip !== undefined && fileEntry.clip !== null) {
+    if (!isPlainObject(fileEntry.clip)) {
+      invalid("clip", `want a mapping {duration, fps}, got ${JSON.stringify(fileEntry.clip)}`);
+      return out;
+    }
+    const duration = fileEntry.clip.duration ?? 3;
+    const fps = fileEntry.clip.fps ?? 10;
+    if (typeof duration !== "number" || !Number.isFinite(duration) || duration < 0.5 || duration > 30) {
+      invalid("clip.duration", `want a number 0.5..30 (seconds), got ${JSON.stringify(fileEntry.clip.duration)}`);
+      return out;
+    }
+    if (!Number.isInteger(fps) || fps < 1 || fps > 30) {
+      invalid("clip.fps", `want an integer 1..30, got ${JSON.stringify(fileEntry.clip.fps)}`);
+      return out;
+    }
+    const frames = Math.round(duration * fps);
+    if (frames < 2 || frames > 300) {
+      invalid("clip", `duration x fps = ${frames} frames, want 2..300`);
+      return out;
+    }
+    clip = { duration, fps, frames };
+  }
 
   if (fileEntry.width !== undefined) out.width = fileEntry.width;
   if (fileEntry.height !== undefined) out.height = fileEntry.height;
@@ -481,7 +534,19 @@ export function resolveCameraConfig(info, fileEntry, defaults, log = () => {}) {
   if (fileEntry.target !== undefined) out.target = fileEntry.target;
   if (fileEntry.background !== undefined) out.background = fileEntry.background;
   if (fileEntry.exposure !== undefined) out.exposure = fileEntry.exposure;
+  out.clip = clip;
   return out;
+}
+
+// Frame times for a clip: frame i at t = i/fps seconds, loop phase
+// i/frames (0..1, exclusive of 1 — the loop wraps to the first frame).
+export function clipFrameTimes(duration, fps) {
+  const frames = Math.round(duration * fps);
+  const times = [];
+  for (let i = 0; i < frames; i += 1) {
+    times.push({ time: i / fps, loop: i / frames });
+  }
+  return times;
 }
 
 // Effective config for every camera the model offers.
@@ -493,8 +558,285 @@ export function listCameras(model, fileConfig, defaults, log = () => {}) {
 }
 
 // ---------------------------------------------------------------------------
-// Batch rendering
+// Scene API for user scripts (scene.js)
+//
+// Capability-limited helpers — the script never sees raw three.js objects.
+// A fresh API object is built per frame (wrappers are cheap closures); the
+// script sets absolute values, so nothing carries over between frames
+// except through the scene itself. Unknown names throw a clear error (the
+// script call is isolated — a throw only skips the script for that frame);
+// hasLight/hasObject guard optional access.
 // ---------------------------------------------------------------------------
+function vec3Proxy(vec) {
+  return Object.freeze({
+    get x() {
+      return vec.x;
+    },
+    set x(v) {
+      vec.x = v;
+    },
+    get y() {
+      return vec.y;
+    },
+    set y(v) {
+      vec.y = v;
+    },
+    get z() {
+      return vec.z;
+    },
+    set z(v) {
+      vec.z = v;
+    },
+  });
+}
+
+function lightWrapper(light) {
+  const wrapper = {
+    name: light.name,
+    get visible() {
+      return light.visible;
+    },
+    set visible(v) {
+      light.visible = !!v;
+    },
+    get intensity() {
+      return light.intensity;
+    },
+    set intensity(v) {
+      light.intensity = v;
+    },
+    // Color as sRGB [r, g, b] 0..255.
+    get color() {
+      const c = light.color.getRGB(new THREE.Color(), THREE.SRGBColorSpace);
+      return [Math.round(c.r * 255), Math.round(c.g * 255), Math.round(c.b * 255)];
+    },
+    set color(rgb) {
+      if (!Array.isArray(rgb) || rgb.length !== 3 || !rgb.every((n) => typeof n === "number")) {
+        throw new Error(`scene.js: light color must be [r, g, b] (0..255), got ${JSON.stringify(rgb)}`);
+      }
+      light.color.setRGB(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, THREE.SRGBColorSpace);
+    },
+  };
+  return Object.freeze(wrapper);
+}
+
+function objectWrapper(obj) {
+  const wrapper = {
+    name: obj.name,
+    position: vec3Proxy(obj.position),
+    rotation: vec3Proxy(obj.rotation),
+    scale: vec3Proxy(obj.scale),
+    get visible() {
+      return obj.visible;
+    },
+    set visible(v) {
+      obj.visible = !!v;
+    },
+    lookAt(x, y, z) {
+      obj.lookAt(x, y, z);
+    },
+  };
+  return Object.freeze(wrapper);
+}
+
+export function createSceneApi(model) {
+  const api = {
+    getLight(name) {
+      const light = model.lights.get(name);
+      if (!light) throw new Error(`scene.js: no light named "${name}" in the model`);
+      return lightWrapper(light);
+    },
+    getObject(name) {
+      const obj = model.scene.getObjectByName(name);
+      if (!obj) throw new Error(`scene.js: no object named "${name}" in the model`);
+      return objectWrapper(obj);
+    },
+    getSun() {
+      const sun = model.sun;
+      const wrapper = {
+        get azimuth() {
+          return model.sunState ? model.sunState.azimuth : null;
+        },
+        set azimuth(v) {
+          const el = model.sunState ? model.sunState.elevation : 30;
+          positionSun(model, v, el);
+        },
+        get elevation() {
+          return model.sunState ? model.sunState.elevation : null;
+        },
+        set elevation(v) {
+          const az = model.sunState ? model.sunState.azimuth : 180;
+          positionSun(model, az, v);
+          // Moving the sun re-derives daylight intensity from the new
+          // elevation (same ramp as the built-in mapping); the script
+          // can still override intensity afterwards.
+          sun.intensity = sunIntensityForElevation(v);
+        },
+        get intensity() {
+          return sun.intensity;
+        },
+        set intensity(v) {
+          sun.intensity = v;
+        },
+        get color() {
+          const c = sun.color.getRGB(new THREE.Color(), THREE.SRGBColorSpace);
+          return [Math.round(c.r * 255), Math.round(c.g * 255), Math.round(c.b * 255)];
+        },
+        set color(rgb) {
+          if (!Array.isArray(rgb) || rgb.length !== 3 || !rgb.every((n) => typeof n === "number")) {
+            throw new Error(`scene.js: sun color must be [r, g, b] (0..255), got ${JSON.stringify(rgb)}`);
+          }
+          sun.color.setRGB(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, THREE.SRGBColorSpace);
+        },
+      };
+      return Object.freeze(wrapper);
+    },
+    // Morph target weight (0..1) for a mesh in the model.
+    setMorph(objectName, morphName, weight) {
+      const obj = model.scene.getObjectByName(objectName);
+      if (!obj) throw new Error(`scene.js: no object named "${objectName}" in the model`);
+      if (!obj.isMesh || !obj.morphTargetDictionary) {
+        throw new Error(`scene.js: object "${objectName}" has no morph targets`);
+      }
+      const index = obj.morphTargetDictionary[morphName];
+      if (index === undefined) {
+        throw new Error(`scene.js: object "${objectName}" has no morph target named "${morphName}"`);
+      }
+      obj.morphTargetInfluences[index] = Math.min(1, Math.max(0, Number(weight)));
+    },
+    kelvinToRgb(k) {
+      return kelvinToRgb(k);
+    },
+    hasLight(name) {
+      return model.lights.has(name);
+    },
+    hasObject(name) {
+      return model.scene.getObjectByName(name) !== undefined;
+    },
+    listLights() {
+      return [...model.lights.keys()];
+    },
+    listObjects() {
+      const names = [];
+      model.scene.traverse((o) => {
+        if (o.name) names.push(o.name);
+      });
+      return names;
+    },
+  };
+  return Object.freeze(api);
+}
+
+// ---------------------------------------------------------------------------
+// Per-frame rendering
+//
+// One frame of one camera. The pipeline (per frame):
+//   camera setup (reset to base + apply overrides) -> built-in light
+//   mapping -> sun -> glTF animations sampled at `time` -> user script
+//   -> render.
+// The built-in mapping is re-applied before every frame, so the script
+// always starts from the entity state and sets absolute values — frames
+// are independent and clips loop cleanly. A still is one frame at
+// time 0, loop 0; a clip is N frames at t = i/fps, loop = i/frames.
+// ---------------------------------------------------------------------------
+export function renderFrame({
+  renderer,
+  model,
+  lights,
+  sun,
+  entities,
+  info,
+  cfg,
+  time,
+  loop,
+  script,
+  setSize,
+  capture,
+  onScriptError,
+  log = () => {},
+}) {
+  const camera = getRenderCamera(model, info, cfg);
+  applyLightStates(model.lights, lights || {});
+  applySun(model, sun ?? null);
+  if (model.mixer) model.mixer.setTime(time);
+  if (script) {
+    const result = runScriptCall(script, {
+      entities: entities || {},
+      scene: createSceneApi(model),
+      time,
+      loop,
+    });
+    if (!result.ok && result.newError) {
+      log("error", `scene.js: ${result.error} — continuing without the script's changes for this frame`);
+      if (typeof onScriptError === "function") onScriptError(result.error);
+    }
+  }
+  setSize(cfg.width, cfg.height);
+  if (cfg.background) {
+    renderer.setClearColor(new THREE.Color(cfg.background), 1);
+  } else {
+    renderer.setClearColor(DEFAULT_CLEAR_COLOR, DEFAULT_CLEAR_ALPHA);
+  }
+  renderer.toneMappingExposure = BASE_EXPOSURE * cfg.exposure;
+  renderer.render(model.scene, camera);
+  const out = capture();
+  // Reset per-frame state so nothing leaks into the next frame/camera.
+  resetRenderCamera(model, info, camera);
+  renderer.setClearColor(DEFAULT_CLEAR_COLOR, DEFAULT_CLEAR_ALPHA);
+  renderer.toneMappingExposure = BASE_EXPOSURE;
+  return out;
+}
+
+// Render a batch of still cameras against the already-loaded scene.
+//   setSize(width, height) — resize the drawing buffer for a camera.
+//   capture() — return the current frame (Buffer in Node, data URL in the
+//     browser page).
+// Returns { cameraName: capture() } for every requested camera that exists.
+// `script` is a compiled script handle (or null); `entities` is the frozen
+// entity snapshot the script reads.
+export function renderCameras({
+  renderer,
+  model,
+  lights,
+  sun,
+  entities,
+  script,
+  cameras,
+  width,
+  height,
+  fileConfig,
+  setSize,
+  capture,
+  onScriptError,
+  log = () => {},
+}) {
+  const out = {};
+  for (const name of cameras) {
+    const info = getCameraInfo(model, name);
+    if (!info) {
+      log("warning", `unknown camera "${name}" — skipping it`);
+      continue;
+    }
+    const cfg = resolveCameraConfig(info, fileConfig?.[name], { width, height }, log);
+    out[name] = renderFrame({
+      renderer,
+      model,
+      lights,
+      sun,
+      entities,
+      info,
+      cfg,
+      time: 0,
+      loop: 0,
+      script: script || null,
+      setSize,
+      capture,
+      onScriptError,
+      log,
+    });
+  }
+  return out;
+}
 
 // Restore a model camera to the base values captured at load time, so a
 // previous render's overrides never leak into the next render.
@@ -573,49 +915,3 @@ function getRenderCamera(model, info, cfg) {
   return camera;
 }
 
-// Render a batch of cameras against the already-loaded scene. Light/sun
-// state is applied once; each camera is one additional render() call.
-//   setSize(width, height) — resize the drawing buffer for a camera.
-//   capture() — return the current frame (Buffer in Node, data URL in the
-//     browser page).
-// Returns { cameraName: capture() } for every requested camera that exists.
-export function renderCameras({
-  renderer,
-  model,
-  lights,
-  sun,
-  cameras,
-  width,
-  height,
-  fileConfig,
-  setSize,
-  capture,
-  log = () => {},
-}) {
-  applyLightStates(model.lights, lights || {});
-  applySun(model, sun ?? null);
-  const out = {};
-  for (const name of cameras) {
-    const info = getCameraInfo(model, name);
-    if (!info) {
-      log("warning", `unknown camera "${name}" — skipping it`);
-      continue;
-    }
-    const cfg = resolveCameraConfig(info, fileConfig?.[name], { width, height }, log);
-    const camera = getRenderCamera(model, info, cfg);
-    setSize(cfg.width, cfg.height);
-    if (cfg.background) {
-      renderer.setClearColor(new THREE.Color(cfg.background), 1);
-    } else {
-      renderer.setClearColor(DEFAULT_CLEAR_COLOR, DEFAULT_CLEAR_ALPHA);
-    }
-    renderer.toneMappingExposure = BASE_EXPOSURE * cfg.exposure;
-    renderer.render(model.scene, camera);
-    out[name] = capture();
-    // Reset per-camera state so nothing leaks into the next camera.
-    resetRenderCamera(model, info, camera);
-    renderer.setClearColor(DEFAULT_CLEAR_COLOR, DEFAULT_CLEAR_ALPHA);
-    renderer.toneMappingExposure = BASE_EXPOSURE;
-  }
-  return out;
-}

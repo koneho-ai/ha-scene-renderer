@@ -56,6 +56,7 @@ class SceneRenderSensor(SensorEntity):
     def extra_state_attributes(self) -> dict[str, Any]:
         """Return render diagnostics."""
         coordinator = self.coordinator
+        script = coordinator.script_status
         return {
             "last_render": (
                 coordinator.last_rendered.isoformat()
@@ -68,4 +69,10 @@ class SceneRenderSensor(SensorEntity):
             "service_url": coordinator.service_url,
             "cameras": list(coordinator.cameras),
             "mapped_lights": len(coordinator.mapping),
+            "script_status": script.get("status"),
+            "script_hash": script.get("hash"),
+            "script_subscriptions": list(script.get("subscribe") or []),
+            "script_error": script.get("error"),
+            "script_last_error": script.get("last_error"),
+            "script_error_count": script.get("error_count", 0),
         }

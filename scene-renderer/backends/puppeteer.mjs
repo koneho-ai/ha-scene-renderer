@@ -5,7 +5,24 @@
 // Requires the optional `puppeteer` dependency (installed only in the
 // puppeteer image variant) and a Chromium that can run headless with the
 // SwiftShader software GL.
+//
+// The user script (scene.js) runs in a SES Compartment inside the page
+// (lockdown in render-page.html); this module only forwards source and
+// status across page.evaluate.
+//
+// Render output: a map cameraName -> { data: Buffer, contentType }.
+// Cameras with a clip: entry in cameras.yaml render a duration×fps frame
+// sequence (one page.evaluate per frame, so the loop can abort between
+// frames) and are encoded to animated WebP in this process via sharp;
+// the rest are PNG stills.
+import { encodeClip } from "../clip-encode.mjs";
+import { clipFrameTimes } from "../scene.mjs";
+
 export const BACKEND_NAME = "puppeteer";
+
+function dataUrlToBuffer(dataUrl) {
+  return Buffer.from(dataUrl.split(",")[1], "base64");
+}
 
 export async function createBackend({ serverUrl, log }) {
   let puppeteer;
@@ -43,12 +60,14 @@ export async function createBackend({ serverUrl, log }) {
   await page.waitForFunction("window.__sceneReady === true", { timeout: 60000 });
   const lights = await page.evaluate(() => window.__lights());
   const cameraNames = await page.evaluate(() => window.__cameraNames());
-  log("info", `render page ready: ${lights.length} named lights, ${cameraNames.length} cameras`);
+  const animations = await page.evaluate(() => window.__animations());
+  log("info", `render page ready: ${lights.length} named lights, ${cameraNames.length} cameras, ${animations.length} animation(s)`);
 
   return {
     name: BACKEND_NAME,
     lights,
     cameraNames,
+    animations,
 
     async listCameras(fileConfig, defaults) {
       return page.evaluate(
@@ -57,21 +76,79 @@ export async function createBackend({ serverUrl, log }) {
       );
     },
 
-    async render({ lights: lightStates, sun, cameras, width, height, fileConfig }) {
-      const dataUrls = await page.evaluate(
-        (args) => window.__render(args),
-        {
-          lights: lightStates || {},
-          sun: sun ?? null,
-          cameras,
-          width,
-          height,
-          fileConfig: fileConfig || {},
-        },
+    async setScript(source) {
+      return page.evaluate((src) => window.__setScript(src), source ?? null);
+    },
+
+    async getScriptInfo() {
+      return page.evaluate(() => window.__scriptInfo());
+    },
+
+    async render({ lights: lightStates, sun, entities, cameras, width, height, fileConfig, shouldAbort }) {
+      // Split stills from clips using the effective configs (which carry
+      // the per-camera clip entry, or null). listCameras returns an array;
+      // index it by name.
+      const configList = await page.evaluate(
+        (args) => window.__cameras(args),
+        { fileConfig: fileConfig || {}, defaults: { width, height } },
       );
+      const configs = {};
+      for (const cfg of configList) configs[cfg.name] = cfg;
+      const stillNames = [];
+      const clipCameras = [];
+      for (const name of cameras) {
+        const cfg = configs[name];
+        if (!cfg) {
+          log("warning", `unknown camera "${name}" — skipping it`);
+          continue;
+        }
+        if (cfg.clip) clipCameras.push({ name, cfg });
+        else stillNames.push(name);
+      }
       const out = {};
-      for (const [name, dataUrl] of Object.entries(dataUrls)) {
-        out[name] = Buffer.from(dataUrl.split(",")[1], "base64");
+      if (stillNames.length > 0) {
+        const dataUrls = await page.evaluate(
+          (args) => window.__render(args),
+          {
+            lights: lightStates || {},
+            sun: sun ?? null,
+            entities: entities || {},
+            cameras: stillNames,
+            width,
+            height,
+            fileConfig: fileConfig || {},
+          },
+        );
+        for (const [name, dataUrl] of Object.entries(dataUrls)) {
+          out[name] = { data: dataUrlToBuffer(dataUrl), contentType: "image/png" };
+        }
+      }
+      for (const { name, cfg } of clipCameras) {
+        const frames = [];
+        for (const { time, loop } of clipFrameTimes(cfg.clip.duration, cfg.clip.fps)) {
+          if (shouldAbort && shouldAbort()) {
+            const err = new Error(`render aborted: newer state arrived while rendering the clip for "${name}"`);
+            err.code = "RENDER_ABORTED";
+            throw err;
+          }
+          const dataUrl = await page.evaluate(
+            (args) => window.__renderFrame(args),
+            {
+              name,
+              lights: lightStates || {},
+              sun: sun ?? null,
+              entities: entities || {},
+              cfg,
+              time,
+              loop,
+            },
+          );
+          frames.push(dataUrlToBuffer(dataUrl));
+        }
+        out[name] = {
+          data: await encodeClip(frames, { width: cfg.width, height: cfg.height, fps: cfg.clip.fps }),
+          contentType: "image/webp",
+        };
       }
       return out;
     },

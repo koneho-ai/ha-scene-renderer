@@ -65,13 +65,19 @@ class SceneRenderImage(ImageEntity):
         """Bump image_last_updated so the frontend refetches the image."""
         if self.coordinator.last_rendered is not None:
             self._attr_image_last_updated = self.coordinator.last_rendered
+        # The content type can change per render (a cameras.yaml edit
+        # turns a still into a clip or back); read it fresh each update.
+        self._attr_content_type = self.coordinator.content_type_for(self.camera)
         self.async_write_ha_state()
 
     async def async_image(self) -> bytes | None:
         """Return the latest render bytes for this camera (no re-render)."""
-        return self.coordinator.png_for(self.camera)
+        return self.coordinator.render_for(self.camera)
 
     @property
     def extra_state_attributes(self) -> dict[str, str]:
-        """Return the camera this entity renders."""
-        return {"camera": self.camera}
+        """Return the camera this entity renders, and its image type."""
+        return {
+            "camera": self.camera,
+            "content_type": self.coordinator.content_type_for(self.camera),
+        }

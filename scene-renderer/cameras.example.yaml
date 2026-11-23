@@ -41,3 +41,14 @@ overview:
 living_room:
   width: 800
   height: 600
+  # Motion clip: instead of a still, this camera renders a looping
+  # animated WebP (duration x fps frames, here 3s x 10fps = 30 frames)
+  # whenever the state changes. The clip uses this camera's resolution.
+  # Frames per loop = duration x fps (2..300 frames; duration 0.5..30s,
+  # fps 1..30). Cameras without a clip entry stay stills.
+  # Cost: a 3s clip at 10fps renders 30 frames (~6s at 720p on a Pi-class
+  # host) — keep clips short and small. The old clip keeps looping in
+  # Home Assistant while the new one renders.
+  clip:
+    duration: 3
+    fps: 10

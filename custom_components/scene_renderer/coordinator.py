@@ -7,9 +7,20 @@ transitions, or at most every 15 minutes while it is up. Renders are
 serialized with a minimum interval and coalesced (latest state wins).
 
 Each update is ONE batch render request carrying the light parameters,
-the sun, and the selected cameras; the service returns one PNG per
-camera, stored in :attr:`renders` and served by one image entity per
-camera.
+the sun, the subscribed entity snapshot, and the selected cameras; the
+service returns one image per camera — a PNG still, or an animated WebP
+clip for cameras with a clip: entry in cameras.yaml — stored in
+:attr:`renders` (bytes) and :attr:`content_types`, and served by one
+image entity per camera.
+
+Scripting (scene.js): the service exposes the script's ``subscribe``
+list via GET /script. The coordinator resolves those patterns (exact
+entity IDs, ``domain.*``, globs) against the state machine, subscribes
+to the resolved entities, and sends their state in every render request
+(``entities`` in the payload). When a render response carries a new
+script hash, the coordinator re-fetches the subscriptions, re-subscribes,
+and re-renders with the new entity set. No script -> the built-in set
+(mapped lights + sun) only.
 
 Light parametrization: each mapped entity is normalized into a render
 parameter set (see :func:`normalize_light_state`):
@@ -24,9 +35,11 @@ else the model's base color).
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import logging
 import time
 from collections.abc import Callable
+from datetime import date, datetime
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
@@ -118,6 +131,36 @@ def normalize_light_state(state: State | None) -> dict[str, Any]:
     }
 
 
+def _jsonable(value: Any) -> Any:
+    """Recursively convert a value to something json.dumps accepts.
+
+    HA state attributes can hold datetimes, sets, and other non-JSON
+    values; the entity snapshot sent to the render service must survive
+    serialization. Unknown types fall back to str().
+    """
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    if isinstance(value, dict):
+        return {str(k): _jsonable(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(v) for v in value]
+    if isinstance(value, (set, frozenset)):
+        return sorted((_jsonable(v) for v in value), key=str)
+    return str(value)
+
+
+def _entity_snapshot(state: State | None) -> dict[str, Any] | None:
+    """An entity's state + attributes as the script sees it, or None."""
+    if state is None:
+        return None
+    return {
+        "state": state.state,
+        "attributes": _jsonable(dict(state.attributes)),
+    }
+
+
 class SceneRenderCoordinator:
     """Owns the render loop for one config entry."""
 
@@ -135,13 +178,32 @@ class SceneRenderCoordinator:
         self.cameras: list[str] = list(entry.options.get(CONF_CAMERAS, []))
         self.service = RenderServiceClient(hass, self.service_url)
 
-        # Latest render per camera: {camera_name: PNG bytes}.
+        # Latest render per camera: {camera_name: image bytes} and its
+        # content type (image/png for stills, image/webp for clips).
         self.renders: dict[str, bytes] = {}
+        self.content_types: dict[str, str] = {}
         self.last_rendered: Any = None
         self.status: str = STATUS_IDLE
         self.last_error: str | None = None
         self.render_count: int = 0
         self.last_render_ms: int | None = None
+
+        # User script (scene.js) status, from GET /script and each render
+        # response: {"present", "hash", "subscribe", "status", "error",
+        # "last_error", "error_count"}. Starts as "no script".
+        self.script_status: dict[str, Any] = {
+            "present": False,
+            "hash": None,
+            "subscribe": [],
+            "status": "none",
+            "error": None,
+            "last_error": None,
+            "error_count": 0,
+        }
+        self._script_hash: str | None = None
+        self._script_patterns: list[str] = []
+        # Entities the script reads (resolved from the subscribe patterns).
+        self._script_entities: set[str] = set()
 
         self._listeners: list[Callable[[], None]] = []
         self._unsubs: list[Callable[[], None]] = []
@@ -165,24 +227,94 @@ class SceneRenderCoordinator:
                 _LOGGER.warning("Could not list cameras, no cameras to render: %s", err)
             else:
                 self.cameras = [c["name"] for c in cameras if c.get("name")]
-        entities = set(self.mapping.values())
-        if self.sun_enabled:
-            entities.add(SUN_ENTITY_ID)
-        if entities:
-            self._unsubs.append(
-                async_track_state_change_event(
-                    self.hass, list(entities), self._async_state_changed
-                )
-            )
+        # Fetch the script's subscriptions before subscribing, so the
+        # initial render already carries the entities the script reads.
+        # A failure here is not fatal: the built-in set still renders,
+        # and the next render response carries the script status again.
+        try:
+            script_info = await self.service.async_script()
+        except RenderServiceError as err:
+            _LOGGER.warning("Could not fetch scene.js status, rendering without a script: %s", err)
+        else:
+            self._update_script_subscription(script_info)
+        self._subscribe_to_tracked_entities()
         # Snapshot the sun baseline BEFORE the initial render: otherwise the
         # first sun change after setup always re-renders (baseline None),
         # defeating the 5-degree quantization.
         self._snapshot_sun()
         await self.async_request_render()
 
-    def png_for(self, camera: str) -> bytes | None:
-        """Latest PNG bytes for a camera, or None if not rendered yet."""
+    def render_for(self, camera: str) -> bytes | None:
+        """Latest render bytes for a camera, or None if not rendered yet."""
         return self.renders.get(camera)
+
+    def content_type_for(self, camera: str) -> str:
+        """Content type of the latest render for a camera."""
+        return self.content_types.get(camera, "image/png")
+
+    # -- script subscriptions -------------------------------------------
+    def _resolve_script_patterns(self, patterns: list[str]) -> set[str]:
+        """Resolve subscribe patterns to entity IDs.
+
+        Exact entity IDs are kept unconditionally (the entity may not
+        exist yet — it is still worth tracking). Patterns containing
+        glob characters are matched against the current state machine
+        (``domain.*`` is just a glob here).
+        """
+        resolved: set[str] = set()
+        entity_ids = self.hass.states.async_entity_ids()
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern:
+                continue
+            if any(ch in pattern for ch in "*?["):
+                resolved.update(fnmatch.filter(entity_ids, pattern))
+            else:
+                resolved.add(pattern)
+        return resolved
+
+    @property
+    def _tracked_entities(self) -> set[str]:
+        """Every entity whose changes re-render: mapped lights + sun +
+        the script's resolved subscriptions."""
+        entities = set(self.mapping.values())
+        if self.sun_enabled:
+            entities.add(SUN_ENTITY_ID)
+        entities.update(self._script_entities)
+        return entities
+
+    def _subscribe_to_tracked_entities(self) -> None:
+        """(Re)subscribe to state changes of the tracked entities."""
+        for unsub in self._unsubs:
+            unsub()
+        self._unsubs.clear()
+        entities = self._tracked_entities
+        if entities:
+            self._unsubs.append(
+                async_track_state_change_event(
+                    self.hass, list(entities), self._async_state_changed
+                )
+            )
+
+    def _update_script_subscription(self, script_info: dict[str, Any]) -> bool:
+        """Apply a script status block. Returns True if the script's
+        subscriptions changed (caller re-subscribes and re-renders)."""
+        self.script_status = {
+            "present": script_info.get("present", False),
+            "hash": script_info.get("hash"),
+            "subscribe": list(script_info.get("subscribe") or []),
+            "status": script_info.get("status", "none"),
+            "error": script_info.get("error"),
+            "last_error": script_info.get("last_error"),
+            "error_count": script_info.get("error_count", 0),
+        }
+        new_hash = self.script_status["hash"]
+        patterns = self.script_status["subscribe"]
+        changed = new_hash != self._script_hash or patterns != self._script_patterns
+        self._script_hash = new_hash
+        self._script_patterns = patterns
+        if changed:
+            self._script_entities = self._resolve_script_patterns(patterns)
+        return changed
 
     async def async_unload(self) -> None:
         """Cancel subscriptions and pending renders."""
@@ -298,18 +430,26 @@ class SceneRenderCoordinator:
         payload = self._build_payload()
         started = time.monotonic()
         try:
-            renders = await self.service.async_render(payload)
+            renders, script_info = await self.service.async_render(payload)
         except RenderServiceError as err:
             self.status = STATUS_ERROR
             self.last_error = str(err)
         else:
-            self.renders = renders
+            self.renders = {name: data for name, (data, _) in renders.items()}
+            self.content_types = {name: ctype for name, (_, ctype) in renders.items()}
             self.last_rendered = dt_util.utcnow()
             self.status = STATUS_OK
             self.last_error = None
             self.render_count += 1
             self.last_render_ms = int((time.monotonic() - started) * 1000)
             self._last_render_at = time.monotonic()
+            # A new script hash means scene.js changed: re-resolve its
+            # subscriptions and re-render with the new entity set. (The
+            # re-render's response carries the same hash, so this does
+            # not loop.)
+            if script_info and self._update_script_subscription(script_info):
+                self._subscribe_to_tracked_entities()
+                self._render_pending = True
         self._notify()
 
     def _build_payload(self) -> dict[str, Any]:
@@ -325,4 +465,17 @@ class SceneRenderCoordinator:
                     "azimuth": sun_state.attributes.get("azimuth"),
                     "elevation": sun_state.attributes.get("elevation"),
                 }
-        return {"lights": lights, "sun": sun, "cameras": list(self.cameras)}
+        # Entity snapshot for the user script: mapped lights + sun + the
+        # script's subscriptions, sanitized to JSON-safe values. Entities
+        # that do not exist (yet) are omitted.
+        entities: dict[str, Any] = {}
+        for entity_id in sorted(self._tracked_entities):
+            snapshot = _entity_snapshot(self.hass.states.get(entity_id))
+            if snapshot is not None:
+                entities[entity_id] = snapshot
+        return {
+            "lights": lights,
+            "sun": sun,
+            "entities": entities,
+            "cameras": list(self.cameras),
+        }

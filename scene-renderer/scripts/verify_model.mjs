@@ -110,4 +110,51 @@ if (cameraNames.size !== cameras.length) {
   console.error("ERROR: duplicate camera names in model.");
   process.exit(1);
 }
+console.log(`  animations (${gltf.animations.length}):`);
+for (const clip of gltf.animations) {
+  console.log(`    - ${clip.name} (${clip.duration}s, ${clip.tracks.length} track(s))`);
+  // Every track must target a node that exists in the scene, and the
+  // keyframe times must start at 0 (the mixer samples from t=0).
+  for (const track of clip.tracks) {
+    const nodeName = track.name.split(".")[0];
+    const target = gltf.scene.getObjectByName(nodeName);
+    if (!target) {
+      console.error(`ERROR: animation "${clip.name}" targets missing node "${nodeName}".`);
+      process.exit(1);
+    }
+    if (track.times[0] !== 0) {
+      console.error(`ERROR: animation "${clip.name}" track "${track.name}" does not start at t=0.`);
+      process.exit(1);
+    }
+  }
+  // The fan spin must actually rotate: sample the mixer at t=0 and t=1.5
+  // (half a turn) and check the target's rotation changed by ~180 degrees.
+  if (clip.name === "ceiling_fan_spin") {
+    const mixer = new THREE.AnimationMixer(gltf.scene);
+    mixer.clipAction(clip).play();
+    const fan = gltf.scene.getObjectByName("ceiling_fan");
+    mixer.setTime(0);
+    const q0 = fan.quaternion.clone();
+    mixer.setTime(1.5);
+    const angle = 2 * Math.acos(Math.min(1, Math.abs(q0.dot(fan.quaternion))));
+    if (Math.abs(angle - Math.PI) > 0.05) {
+      console.error(`ERROR: ceiling_fan_spin rotates ${angle.toFixed(3)} rad in 1.5 s, expected pi (half a turn).`);
+      process.exit(1);
+    }
+    mixer.setTime(3.0);
+    const back = 2 * Math.acos(Math.min(1, Math.abs(q0.dot(fan.quaternion))));
+    if (back > 0.05) {
+      console.error(`ERROR: ceiling_fan_spin does not return to its start orientation after 3 s (off by ${back.toFixed(3)} rad) — the clip would not loop seamlessly.`);
+      process.exit(1);
+    }
+    console.log("    - fan spin verified: half turn at 1.5 s, back to start at 3.0 s");
+  }
+}
+// The scene.js example needs these nodes.
+for (const needed of ["ceiling_fan", "blinds"]) {
+  if (!gltf.scene.getObjectByName(needed)) {
+    console.error(`ERROR: sample model is missing the "${needed}" node (needed by scene.example.js).`);
+    process.exit(1);
+  }
+}
 console.log("OK: model loads, all lights and cameras named and unique.");

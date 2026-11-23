@@ -10,7 +10,7 @@ The render backend could not initialise (e.g. the model file is not a valid GLB,
 
 ## Integration setup says it cannot reach the render service
 
-Make sure the app is installed, started, and its log says `ready`. Install order is app first, then the integration — see [[Installation]].
+Make sure the app is installed, started, and its log says `ready`. Install order is app first, then the integration — see [[Installation]]. If the app runs outside the Supervisor, set `service_url` in the YAML block.
 
 ## App image won't pull
 
@@ -48,3 +48,7 @@ docker build --build-arg RENDER_BACKEND=puppeteer scene-renderer/
 ## Force a re-render
 
 Use the `button.<name>_re_render` diagnostic entity, or check the `sensor.<name>_render_status` diagnostic sensor for the last render time, render count, last render duration, and last error.
+
+## The sidebar panel is missing or shows an error
+
+See [[Panel]] — the short version: the panel registers when the integration is set up from YAML (restart Home Assistant and hard-refresh the browser if the entry is missing), "Not configured" means add the `scene_renderer` YAML block first, and "Render service unreachable" means the app is down or its URL changed.

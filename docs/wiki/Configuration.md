@@ -1,16 +1,44 @@
 # Configuration
 
-## The setup flow
+## YAML configuration
 
-Setup is three steps, no free text:
+The integration is YAML-only — there is no UI setup flow. Add a
+`scene_renderer` block to `configuration.yaml` and restart Home
+Assistant. Every key is optional:
 
-1. **Connect** — name, render service URL (usually pre-filled from the Supervisor: the app's internal hostname, something like `http://a1b2c3d4-scene-renderer:3000`), sun on/off. If the app is not reachable, setup stops here with an error telling you to install and start the app first.
-2. **Map lights** — one entity picker per light in the model, HA light entities only. Each picker is optional: a light left unmapped renders at its model default (full brightness, model color).
-3. **Choose cameras** — multi-select of the scene cameras, all selected by default. Each selected camera gets its own image entity; the step shows each camera's effective resolution.
+```yaml
+scene_renderer:
+  lights:
+    living_room_ceiling: light.living_room
+    kitchen_counter: light.kitchen
+```
 
-## The options flow
+| Key | Default | Notes |
+| --- | --- | --- |
+| `service_url` | discovered | Base URL of the render service. Only needed if Supervisor discovery fails (e.g. the app runs outside the Supervisor); usually something like `http://a1b2c3d4-scene-renderer:3000` |
+| `sun_entity` | `sun.sun` | Sun entity to follow; set to `null` to disable the sun |
+| `name` | `Scene Renderer` | Scene name, used for the device and entities |
+| `lights` | `{}` | Mapping of model light names (e.g. `living_room_ceiling`) to HA light entity ids |
+| `cameras` | all | Camera names to expose, one image entity each; omit to expose every camera the app offers |
 
-**Configure** on the integration shows the same mapping and camera UI and re-reads the light and camera lists from the app, so a changed model shows up there. Changing the camera selection adds or removes image entities (the entry reloads automatically).
+Only the lights you map follow live state; unmapped lights render at
+their model defaults (full brightness, model color), so the demo model
+needs no onboarding at all — a bare `scene_renderer:` line works, and
+the app is discovered automatically.
+
+Changing the YAML needs a Home Assistant restart (standard for
+YAML-only integrations). To remove the integration, delete the block
+and restart.
+
+### Upgrading from 0.2.x
+
+The config flow is gone in 0.3.0. Delete the old integration entry
+first (Settings → Devices & Services → HA Scene Renderer → ⋮ →
+Delete), then add the YAML block above with your light mapping and
+restart. Deleting first frees up the entity ids
+(`image.<name>_<camera>` etc.), so the YAML setup reuses them; if the
+old entry still exists when the YAML setup runs, the new entities get
+`_2` suffixes instead.
 
 ## How lights are rendered
 
@@ -31,6 +59,24 @@ The service applies the parameters on top of the **model's base values**: the mo
 - color = entity color, else Kelvin→RGB of `color_temp_k`, else model color
 
 Unmapped lights render at their model base values. One approximation to know about: in RGB color modes the brightness lives partly in the color itself (HA docs), so a natively-RGB light with a dark color renders slightly dimmer than its brightness value alone would suggest.
+
+## Light positions in the image
+
+Each image entity carries a `lights` attribute: the service projects every model light through that camera and the integration adds the mapped entity id and live state. One entry per model light:
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Model light name (e.g. `living_room_ceiling`) |
+| `entity_id` | Mapped HA entity, or `null` when unmapped |
+| `state` | The entity's live state (`on`, `off`, `unavailable`, …), or `null` |
+| `brightness` | The entity's live brightness, 0–1, or `null` |
+| `x_px` / `y_px` | Position in the image, in pixels at the camera's configured resolution |
+| `x_pct` / `y_pct` | Same position as percentages of the image size |
+| `visible` | `true` when the light is in front of the camera and inside the frame |
+
+The percentages are the stable values if the image is displayed scaled; the pixels refer to the image at its native resolution. A light in front of the camera but outside the frame reports its real projected position (outside 0–100%); a light behind the camera reports `null` coordinates. Positions are computed once per render (not per clip frame) from the camera the image was rendered with, including any `cameras.yaml` overrides. Occlusion is not detected: a light behind a wall from this camera still projects to its position in the image.
+
+Use it to overlay markers or controls on the render — e.g. a picture-elements card with a `state-icon` per light positioned with `top`/`left` from `x_pct`/`y_pct`, or a template that reads the attributes. The attributes update on every render, so an automation that needs them should trigger on the image entity's state change.
 
 ## The sun
 
@@ -71,7 +117,7 @@ living_room:
     fps: 10       # frames per second (1..30)
 ```
 
-All fields are optional. Merge precedence: **file value > model value** (FOV / near / far / position / target from the glTF camera or the computed virtual camera) **> global default** (width/height from the app options; background = scene default; exposure = 1.0). `GET /cameras` returns the effective merged config per camera, so the integration's camera step shows each camera's effective resolution.
+All fields are optional. Merge precedence: **file value > model value** (FOV / near / far / position / target from the glTF camera or the computed virtual camera) **> global default** (width/height from the app options; background = scene default; exposure = 1.0). `GET /cameras` returns the effective merged config per camera.
 
 The file is hot-reloaded: the app watches it and picks up changes without a restart (the log says whether the reload succeeded). It never breaks rendering: an unknown camera name is logged and ignored, invalid values for one camera fall back to defaults for that camera only, and a malformed file keeps the last good config. One exception: an invalid `clip:` entry (duration 0.5–30, fps 1–30 as an integer, 2–300 frames total) drops the **whole camera entry** to defaults — check the log for `cameras.yaml` errors if a clip camera renders a still.
 
@@ -85,7 +131,8 @@ The app listens on port 3000 inside the container (no host port mapping needed �
 - `GET /lights` — scene lights from the loaded model: `name`, `type` (`point` / `spot` / `directional`), `position`, `color` (hex), `intensity` (base, candela).
 - `GET /cameras` — scene cameras with their effective config (model + `cameras.yaml` + defaults merged): `name`, `type` (`perspective` / `orthographic`), `fov`, `near`, `far`, `position`, `target`, `width`, `height`, `background`, `exposure`, `clip` (`{duration, fps, frames}` or `null`), `source` (`model` / `builtin`).
 - `GET /script` — user-script status: `present`, `hash`, `subscribe`, `status` (`none` / `ok` / `error`), `error`, `last_error`, `error_count`.
-- `POST /render` — JSON body, returns one image per requested camera (PNG still, or animated WebP for clip cameras) plus the script status:
+- `GET /model` — the loaded model GLB bytes (used by the sidebar panel through the integration's proxy; alias of `/model.glb`, which the Puppeteer render page uses).
+- `POST /render` — JSON body, returns one image per requested camera (PNG still, or animated WebP for clip cameras) plus the projected light positions per camera and the script status:
 
 ```json
 {
@@ -103,4 +150,4 @@ The app listens on port 3000 inside the container (no host port mapping needed �
 }
 ```
 
-Response: `{"renders": {"overview": {"data": "<base64>", "content_type": "image/png"}, "living_room": {"data": "<base64>", "content_type": "image/webp"}}, "script": {...}}`. Any of `lights`, `sun`, `entities`, `cameras` may be omitted; omitting `cameras` renders all cameras. `sun: null` disables the sun for that render. Unknown camera names are ignored; a request with no known cameras returns HTTP 400. Per-camera size, FOV, position, background, exposure, and clip come from the effective camera config (see `cameras.yaml` above), not the request.
+Response: `{"renders": {"overview": {"data": "<base64>", "content_type": "image/png", "lights": [{"name": "living_room_ceiling", "x_px": 606, "y_px": 212, "x_pct": 47.3, "y_pct": 29.4, "visible": true}]}, "living_room": {"data": "<base64>", "content_type": "image/webp", "lights": [...]}}, "script": {...}}`. `lights` is the per-camera projection of the model lights into image coordinates (see Light positions above): computed once per render, `visible` when the light is in frame, `null` coordinates when it is behind the camera. Any of `lights`, `sun`, `entities`, `cameras` may be omitted; omitting `cameras` renders all cameras. `sun: null` disables the sun for that render. Unknown camera names are ignored; a request with no known cameras returns HTTP 400. Per-camera size, FOV, position, background, exposure, and clip come from the effective camera config (see `cameras.yaml` above), not the request.

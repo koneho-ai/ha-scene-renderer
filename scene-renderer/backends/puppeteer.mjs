@@ -10,7 +10,9 @@
 // (lockdown in render-page.html); this module only forwards source and
 // status across page.evaluate.
 //
-// Render output: a map cameraName -> { data: Buffer, contentType }.
+// Render output: a map cameraName -> { data: Buffer, contentType, lights }.
+// `lights` is the per-camera projection of the model lights into image
+// coordinates (see scene.mjs projectLights), computed once per camera.
 // Cameras with a clip: entry in cameras.yaml render a duration×fps frame
 // sequence (one page.evaluate per frame, so the loop can abort between
 // frames) and are encoded to animated WebP in this process via sharp;
@@ -149,6 +151,14 @@ export async function createBackend({ serverUrl, log }) {
           data: await encodeClip(frames, { width: cfg.width, height: cfg.height, fps: cfg.clip.fps }),
           contentType: "image/webp",
         };
+      }
+      // Projected light positions, once per rendered camera (not per clip
+      // frame — camera and lights are static within a request).
+      for (const name of Object.keys(out)) {
+        out[name].lights = await page.evaluate(
+          (args) => window.__projectLights(args),
+          { name, cfg: configs[name] },
+        );
       }
       return out;
     },

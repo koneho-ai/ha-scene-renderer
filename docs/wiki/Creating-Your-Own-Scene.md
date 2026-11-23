@@ -26,7 +26,7 @@ In Blender, punctual lights export as `KHR_lights_punctual` when the exporter op
 
 1. Put the `.glb` in `/share/scene-renderer/models/` on the HA host (create the folder if needed).
 2. Set the app's `model` option to the file name and restart the app. (The option also accepts a bundled model name or a literal path.)
-3. Re-run the integration's options flow (**Configure** on the integration) — it re-reads the light and camera lists from the app, so the new model's lights and cameras show up there.
+3. Update the `lights` mapping in the YAML block to the new model's light names (and the `cameras` list if you want to limit which cameras get image entities), then restart Home Assistant — the integration re-reads the light and camera lists from the app at startup.
 
 ## Tips
 

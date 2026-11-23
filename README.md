@@ -31,7 +31,7 @@ Home Assistant host
 > **Note:** Home Assistant renamed add-ons to apps in a recent release. If your Home Assistant still shows "Add-ons" / "Add-on Store", it's the same thing.
 
 **1. The app first.** The integration cannot be set up until the
-app is running — the setup flow reads the model's lights from it.
+app is running — it discovers the app through the Supervisor.
 
 - Settings → Apps → App Store → ⋮ → Repositories, add
   `https://github.com/koneho-ai/ha-scene-renderer`
@@ -44,33 +44,55 @@ app is running — the setup flow reads the model's lights from it.
   repositories, add `https://github.com/koneho-ai/ha-scene-renderer`
   (category: Integration), then install **HA Scene Renderer** and
   restart Home Assistant.
-- Settings → Devices & Services → Add Integration → **HA Scene Renderer**.
 
-Setup is three steps, no free text:
+**3. Configure it in YAML.** The integration is YAML-only — there is
+no UI setup flow. Add a `scene_renderer` block to
+`configuration.yaml` and restart Home Assistant:
 
-1. **Connect** — name, render service URL (usually pre-filled from the
-   Supervisor: the app's internal hostname, something like
-   `http://a1b2c3d4-scene-renderer:3000`), sun on/off. If the app is
-   not reachable, setup stops here with an error telling you to
-   install and start the app first.
-2. **Map lights** — one entity picker per light in the model, HA light
-   entities only. Each picker is optional: a light left unmapped renders
-   at its model default (full brightness, model color).
-3. **Choose cameras** — multi-select of the scene cameras, all selected
-   by default. Each selected camera gets its own image entity; the step
-   shows each camera's effective resolution.
+```yaml
+scene_renderer:
+  lights:
+    living_room_ceiling: light.living_room
+    kitchen_counter: light.kitchen
+```
 
-The options flow (Configure on the integration) shows the same mapping
-and camera UI and re-reads the light and camera lists from the app,
-so a changed model shows up there. Changing the camera selection
-adds or removes image entities (the entry reloads automatically).
+Every key is optional — a bare `scene_renderer:` line works, and the
+app is discovered automatically. Only the lights you map follow live
+state; unmapped lights render at their model defaults (full
+brightness, model color), so the demo model needs no onboarding at
+all.
+
+| Key | Default | Notes |
+| --- | --- | --- |
+| `service_url` | discovered | Base URL of the render service. Only needed if Supervisor discovery fails (e.g. the app runs outside the Supervisor); usually something like `http://a1b2c3d4-scene-renderer:3000` |
+| `sun_entity` | `sun.sun` | Sun entity to follow; set to `null` to disable the sun |
+| `name` | `Scene Renderer` | Scene name, used for the device and entities |
+| `lights` | `{}` | Mapping of model light names (e.g. `living_room_ceiling`) to HA light entity ids |
+| `cameras` | all | Camera names to expose, one image entity each; omit to expose every camera the app offers |
+
+Changing the YAML needs a Home Assistant restart (standard for
+YAML-only integrations). To remove the integration, delete the block
+and restart.
+
+> **Upgrading from 0.2.x?** The config flow is gone in 0.3.0: delete
+> the old integration entry first (Settings → Devices & Services → HA
+> Scene Renderer → ⋮ → Delete), then add the YAML block above with
+> your light mapping and restart. Deleting first frees up the entity
+> ids (`image.<name>_<camera>` etc.), so the YAML setup reuses them;
+> if the old entry still exists when the YAML setup runs, the new
+> entities get `_2` suffixes instead.
 
 ## What you get in Home Assistant
 
 - `image.<name>_<camera>` — one image entity per selected camera
   (e.g. `image.scene_renderer_overview`), each serving that camera's
   latest render — a PNG still, or a looping animated WebP clip for
-  cameras with a `clip:` entry in `cameras.yaml`.
+  cameras with a `clip:` entry in `cameras.yaml`. Each image entity
+  also carries a `lights` attribute: every model light's position in
+  that camera's image (pixels + percentages + in-frame flag), with the
+  mapped entity id and live state — see Light positions below.
+- **Scene Renderer** in the sidebar — an interactive 3D view of the
+  model with live light and camera markers (see Sidebar panel below).
 - `sensor.<name>_render_status` (diagnostic) — `idle`, `rendering`,
   `ok`, or `error`, with last render time, render count, last render
   duration, last error, service URL, cameras, mapped light count, and
@@ -85,6 +107,32 @@ on sunrise/sunset, or at most every 15 minutes while it is up. A
 camera with a `clip:` entry renders a looping animated WebP instead of
 a still (see Motion clips below); the old clip keeps looping while the
 new one renders.
+
+## Sidebar panel
+
+The integration adds a **Scene Renderer** entry to the sidebar: a
+full-page interactive 3D view of the model, rendered in your browser
+with three.js. No extra setup — it appears once the integration is
+configured (and disappears if the integration is removed).
+
+- **Orbit the model** — drag to rotate, scroll to zoom, right-drag to
+  pan. The model is the same GLB the app renders.
+- **Light markers** sit at each model light's position, colored by the
+  light's live state: on lights show their current color and
+  brightness, off/unavailable lights are dim gray, unmapped lights are
+  neutral white. The markers update live as entities change.
+- **Camera markers** show where each camera sits and where it points.
+  Click one to see that camera's latest render. The side list shows
+  every camera with its effective resolution.
+- **Sun marker** — the sun's position from `sun.sun`, hidden below the
+  horizon.
+- **Side list** — every light (model name, mapped entity, live state)
+  and every camera.
+
+The panel gets the model from the app (through the integration — the
+browser cannot reach the app directly) and the light mapping from the
+integration, which is the only place that knows it. If the app is
+unreachable the panel says so instead of showing a blank page.
 
 ## Light parametrization
 
@@ -157,8 +205,39 @@ image entity in Home Assistant.
   north up), and `front` (low front elevation), computed from the
   model's bounding box, so they adapt to any size.
 
-Which cameras render is chosen in the integration's setup (step 3) or
-options flow — all selected by default.
+Which cameras render is chosen in the YAML `cameras` list — all
+cameras by default.
+
+### Light positions in the image
+
+Each image entity carries a `lights` attribute: the service projects
+every model light through that camera and the integration adds the
+mapped entity id and live state. One entry per model light:
+
+| Field | Meaning |
+| --- | --- |
+| `name` | Model light name (e.g. `living_room_ceiling`) |
+| `entity_id` | Mapped HA entity, or `null` when unmapped |
+| `state` | The entity's live state (`on`, `off`, `unavailable`, …), or `null` |
+| `brightness` | The entity's live brightness, 0–1, or `null` |
+| `x_px` / `y_px` | Position in the image, in pixels at the camera's configured resolution |
+| `x_pct` / `y_pct` | Same position as percentages of the image size |
+| `visible` | `true` when the light is in front of the camera and inside the frame |
+
+The percentages are the stable values if the image is displayed scaled;
+the pixels refer to the image at its native resolution. A light in
+front of the camera but outside the frame reports its real projected
+position (outside 0–100%); a light behind the camera reports `null`
+coordinates. Positions are computed once per render (not per clip
+frame) from the camera the image was rendered with, including any
+`cameras.yaml` overrides. Occlusion is not detected: a light behind a
+wall from this camera still projects to its position in the image.
+
+Use it to overlay markers or controls on the render — e.g. a
+picture-elements card with a `state-icon` per light positioned with
+`top`/`left` from `x_pct`/`y_pct`, or a template that reads the
+attributes. (The attributes update on every render, so an automation
+that needs them should trigger on the image entity's state change.)
 
 ### Per-camera configuration (`cameras.yaml`)
 
@@ -191,8 +270,7 @@ All fields are optional. Merge precedence: **file value > model value**
 (FOV / near / far / position / target from the glTF camera or the
 computed virtual camera) **> global default** (width/height from the
 app options; background = scene default; exposure = 1.0).
-`GET /cameras` returns the effective merged config per camera, so the
-integration's camera step shows each camera's effective resolution.
+`GET /cameras` returns the effective merged config per camera.
 
 The file is hot-reloaded: the app watches it and picks up changes
 without a restart (the log says whether the reload succeeded). It
@@ -270,9 +348,12 @@ mapping needed — HA reaches it on the internal network).
 - `GET /script` — user-script status: `present`, `hash`, `subscribe`,
   `status` (`none` / `ok` / `error`), `error`, `last_error`,
   `error_count`.
+- `GET /model` — the loaded model GLB bytes (used by the sidebar panel
+  through the integration's proxy; alias of `/model.glb`, which the
+  Puppeteer render page uses).
 - `POST /render` — JSON body, returns one image per requested camera
-  (PNG still, or animated WebP for clip cameras) plus the script
-  status:
+  (PNG still, or animated WebP for clip cameras) plus the projected
+  light positions per camera and the script status:
   ```json
   {
     "lights": {
@@ -289,7 +370,11 @@ mapping needed — HA reaches it on the internal network).
   }
   ```
   Response:
-  `{"renders": {"overview": {"data": "<base64>", "content_type": "image/png"}, "living_room": {"data": "<base64>", "content_type": "image/webp"}}, "script": {...}}`.
+  `{"renders": {"overview": {"data": "<base64>", "content_type": "image/png", "lights": [{"name": "living_room_ceiling", "x_px": 606, "y_px": 212, "x_pct": 47.3, "y_pct": 29.4, "visible": true}]}, "living_room": {"data": "<base64>", "content_type": "image/webp", "lights": [...]}}, "script": {...}}`.
+  `lights` is the per-camera projection of the model lights into image
+  coordinates (see Light positions above): computed once per render,
+  `visible` when the light is in frame, `null` coordinates when it is
+  behind the camera.
   Any of `lights`, `sun`, `entities`, `cameras` may be omitted;
   omitting `cameras` renders all cameras. `sun: null` disables the sun
   for that render. Unknown camera names are ignored; a request with no
@@ -327,6 +412,9 @@ ha-scene-renderer/
 ├── hacs.json, repository.yaml     # HACS + add-on store metadata
 ├── .github/workflows/builder.yaml # CI: builds + publishes the add-on image
 ├── custom_components/scene_renderer/   # the HACS integration
+│   ├── brand/                              # integration icon + logo
+│   ├── panel.py, frontend/             # sidebar panel (registration,
+│   │                                   # model proxy, websocket API, viewer)
 ├── scene-renderer/                     # the add-on
 │   ├── config.yaml, Dockerfile, run.sh # Supervisor packaging
 │   ├── server.mjs, scene.mjs           # render service + shared three.js logic

@@ -1,33 +1,117 @@
-"""HA Scene Renderer integration."""
+"""HA Scene Renderer integration (YAML-only).
+
+There is no config flow: the integration is configured in
+``configuration.yaml`` under the ``scene_renderer`` key, and only the
+lights you map are linked — unmapped lights render at their model
+defaults, so the demo model needs no onboarding at all:
+
+.. code-block:: yaml
+
+    scene_renderer:
+      lights:
+        living_room_ceiling: light.living_room
+        kitchen_counter: light.kitchen
+
+Full reference (all keys optional):
+
+- ``service_url``: base URL of the render service. When omitted, the
+  add-on is discovered via the Supervisor API.
+- ``sun_entity``: sun entity to follow (default ``sun.sun``); set to
+  null to disable the sun.
+- ``name``: scene name, used for the device and entities
+  (default "Scene Renderer").
+- ``lights``: mapping of model light names to HA entity ids. Only
+  mapped lights follow live state; the rest render at base values.
+- ``cameras``: camera names to expose, one image entity each; when
+  omitted, all cameras the service offers.
+
+Changing the YAML needs a Home Assistant restart (standard for
+YAML-only integrations). There is no unload: remove the YAML block and
+restart to remove the integration.
+"""
 from __future__ import annotations
 
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import Platform
-from homeassistant.core import HomeAssistant
+import logging
+from typing import Any
 
-from .const import DOMAIN
+import voluptuous as vol
+
+from homeassistant.const import CONF_NAME, Platform
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers.discovery import async_load_platform
+
+from .const import (
+    CONF_CAMERAS,
+    CONF_LIGHTS,
+    CONF_SERVICE_URL,
+    CONF_SUN_ENTITY,
+    DEFAULT_NAME,
+    DOMAIN,
+    SUN_ENTITY_ID,
+    YAML_CONFIG_ID,
+)
 from .coordinator import SceneRenderCoordinator
+from .panel import async_register_panel
+from .supervisor import async_discover_addon_url
+
+_LOGGER = logging.getLogger(__name__)
+
+CONFIG_SCHEMA = vol.Schema(
+    {
+        vol.Optional(DOMAIN): vol.Any(
+            # A bare `scene_renderer:` line parses as None — that is a
+            # valid (empty) configuration.
+            None,
+            vol.Schema(
+                {
+                    vol.Optional(CONF_SERVICE_URL): cv.string,
+                    vol.Optional(
+                        CONF_SUN_ENTITY, default=SUN_ENTITY_ID
+                    ): vol.Any(cv.entity_id, None),
+                    vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+                    vol.Optional(CONF_LIGHTS, default={}): {
+                        cv.string: cv.entity_id
+                    },
+                    vol.Optional(CONF_CAMERAS): [cv.string],
+                }
+            ),
+        ),
+    },
+    extra=vol.ALLOW_EXTRA,
+)
 
 PLATFORMS = [Platform.IMAGE, Platform.SENSOR, Platform.BUTTON]
 
 
-async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Set up HA Scene Renderer from a config entry."""
-    coordinator = SceneRenderCoordinator(hass, entry)
+async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
+    """Set up HA Scene Renderer from YAML configuration."""
+    conf: dict[str, Any] = config.get(DOMAIN) or {}
+    service_url = conf.get(CONF_SERVICE_URL)
+    if not service_url:
+        service_url = await async_discover_addon_url(hass)
+    if not service_url:
+        _LOGGER.error(
+            "Scene Renderer: could not find the render service — install "
+            "and start the Scene Renderer app first, or set service_url "
+            "in the scene_renderer YAML block"
+        )
+        return False
+    coordinator = SceneRenderCoordinator(
+        hass,
+        service_url=service_url,
+        sun_entity_id=conf.get(CONF_SUN_ENTITY, SUN_ENTITY_ID),
+        mapping=conf.get(CONF_LIGHTS, {}),
+        cameras=conf.get(CONF_CAMERAS),
+        name=conf.get(CONF_NAME, DEFAULT_NAME),
+    )
     await coordinator.async_setup()
-    hass.data.setdefault(DOMAIN, {})[entry.entry_id] = coordinator
-    await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
-    entry.async_on_unload(entry.add_update_listener(async_update_options))
+    hass.data.setdefault(DOMAIN, {})[YAML_CONFIG_ID] = coordinator
+    await async_register_panel(hass)
+    # Platform loads go through tasks (the discovery helper's own advice:
+    # loading a base component can be slow, so setup does not wait).
+    for platform in PLATFORMS:
+        hass.async_create_task(
+            async_load_platform(hass, platform, DOMAIN, {}, config)
+        )
     return True
-
-
-async def async_update_options(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Reload when options change."""
-    await hass.config_entries.async_reload(entry.entry_id)
-
-
-async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    """Unload a config entry."""
-    coordinator: SceneRenderCoordinator = hass.data[DOMAIN].pop(entry.entry_id)
-    await coordinator.async_unload()
-    return await hass.config_entries.async_unload_platforms(entry, PLATFORMS)

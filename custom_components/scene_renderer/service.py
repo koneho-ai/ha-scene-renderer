@@ -85,19 +85,38 @@ class RenderServiceClient:
             raise RenderServiceError("render service returned an unexpected /script response")
         return script
 
+    async def async_model(self) -> bytes:
+        """GET /model. Returns the loaded model GLB bytes.
+
+        Used by the sidebar panel (via the integration's HTTP proxy —
+        the browser cannot reach the render service directly).
+        """
+        try:
+            async with asyncio.timeout(PROBE_TIMEOUT):
+                async with self._session.get(f"{self.base_url}/model") as resp:
+                    if resp.status != 200:
+                        raise RenderServiceError(f"model request failed: HTTP {resp.status}")
+                    return await resp.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise RenderServiceError(f"cannot reach render service: {err}") from err
+
     async def async_render(
         self, payload: dict[str, Any]
-    ) -> tuple[dict[str, tuple[bytes, str]], dict[str, Any]]:
+    ) -> tuple[dict[str, tuple[bytes, str, list[dict[str, Any]]]], dict[str, Any]]:
         """POST /render.
 
-        Returns ({camera_name: (bytes, content_type)}, script_info).
+        Returns ({camera_name: (bytes, content_type, lights)}, script_info).
         Stills come back as image/png; cameras with a clip: entry in
-        cameras.yaml come back as image/webp (animated). The script info
-        is the /script status block (present/hash/subscribe/status/...),
-        so the coordinator can re-subscribe when the script changes.
+        cameras.yaml come back as image/webp (animated). ``lights`` is the
+        per-camera projection of the model lights into image coordinates
+        ([{name, x_px, y_px, x_pct, y_pct, visible}], see scene.mjs
+        projectLights); [] when the service does not send it (older
+        versions). The script info is the /script status block
+        (present/hash/subscribe/status/...), so the coordinator can
+        re-subscribe when the script changes.
 
         Accepts the legacy v1 response shape too (renders as plain base64
-        strings), treating those as image/png.
+        strings), treating those as image/png with no light projections.
         """
 
         try:
@@ -116,22 +135,27 @@ class RenderServiceClient:
         renders = data.get("renders")
         if not isinstance(renders, dict):
             raise RenderServiceError("render service returned an unexpected /render response")
-        out: dict[str, tuple[bytes, str]] = {}
+        out: dict[str, tuple[bytes, str, list[dict[str, Any]]]] = {}
         for name, rendered in renders.items():
             if isinstance(rendered, str):
                 # Legacy v1 shape: plain base64 PNG.
-                encoded, content_type = rendered, "image/png"
+                encoded, content_type, lights = rendered, "image/png", []
             elif isinstance(rendered, dict):
                 encoded = rendered.get("data")
                 content_type = rendered.get("content_type", "image/png")
+                lights = rendered.get("lights", [])
                 if not isinstance(encoded, str) or not isinstance(content_type, str):
+                    raise RenderServiceError(
+                        "render service returned an unexpected /render response"
+                    )
+                if not isinstance(lights, list):
                     raise RenderServiceError(
                         "render service returned an unexpected /render response"
                     )
             else:
                 raise RenderServiceError("render service returned an unexpected /render response")
             try:
-                out[name] = (base64.b64decode(encoded, validate=True), content_type)
+                out[name] = (base64.b64decode(encoded, validate=True), content_type, lights)
             except ValueError as err:
                 raise RenderServiceError(f"render service returned invalid image data for camera {name!r}") from err
         script = data.get("script")

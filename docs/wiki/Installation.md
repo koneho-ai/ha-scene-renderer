@@ -10,7 +10,7 @@
 
 ## Install order matters: app first
 
-The integration's setup flow reads the model's lights from the render service, so the app must be installed and running **before** you add the integration. If it isn't, setup stops at step 1 with an error telling you to install and start the app first.
+The integration discovers the app through the Supervisor at startup, so the app must be installed and running **before** Home Assistant starts with the YAML block. If it isn't, setup fails with an error in the log telling you to install and start the app first (or set `service_url` in the YAML block).
 
 ## Step 1 — the app
 
@@ -33,9 +33,19 @@ The service listens on port 3000 inside the container. Home Assistant reaches it
 ## Step 2 — the integration
 
 1. HACS (or Settings → Marketplace on HA 2026.11+) → ⋮ → **Custom repositories**, add `https://github.com/koneho-ai/ha-scene-renderer` (category: **Integration**), then install **HA Scene Renderer** and restart Home Assistant.
-2. Settings → Devices & Services → **Add Integration** → **HA Scene Renderer**.
 
-Setup is three steps, no free text — see [[Configuration]].
+## Step 3 — YAML configuration
+
+The integration is YAML-only — there is no UI setup flow. Add a `scene_renderer` block to `configuration.yaml` and restart Home Assistant:
+
+```yaml
+scene_renderer:
+  lights:
+    living_room_ceiling: light.living_room
+    kitchen_counter: light.kitchen
+```
+
+Every key is optional — a bare `scene_renderer:` line works. See [[Configuration]] for the full reference and the 0.2.x migration notes.
 
 ## What you get in Home Assistant
 

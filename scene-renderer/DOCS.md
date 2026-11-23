@@ -29,8 +29,8 @@ node). The bundled sample apartment has two: `overview` and
 `living_room`. A model with no cameras gets three built-in virtual
 cameras computed from its bounding box: `overview` (isometric
 dollhouse), `topdown` (straight down), and `front` (low front
-elevation). Which cameras render is chosen in the integration's setup
-or options flow.
+elevation). Which cameras render is chosen in the integration's YAML
+`cameras` list (all by default).
 
 ### Per-camera configuration
 

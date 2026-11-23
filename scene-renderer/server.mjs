@@ -9,10 +9,16 @@
 //   GET  /script      user script (scene.js) status + subscriptions
 //   POST /render      { lights, sun, entities, cameras, width, height }
 //                     -> JSON { renders: { cameraName:
-//                     { data: base64, content_type } }, script: {...} }
+//                     { data: base64, content_type, lights: [...] } },
+//                     script: {...} }
 //                     Renders are PNG stills, or animated WebP clips for
 //                     cameras with a clip: entry in cameras.yaml.
-//   GET  /model.glb   the loaded model (used by the puppeteer render page)
+//                     `lights` is the per-camera projection of the model
+//                     lights into image coordinates (see scene.mjs
+//                     projectLights).
+//   GET  /model       the loaded model GLB bytes (for the HA sidebar
+//                     panel, via the integration's proxy; alias of
+//                     /model.glb)
 //   GET  /render-page the puppeteer render page
 //   GET  /static/*    three.js + scene.mjs + script.mjs + ses for the page
 //
@@ -259,7 +265,7 @@ const server = createServer(async (req, res) => {
         version: VERSION,
         backend: CONFIG.backend,
         ready,
-        endpoints: ["GET /health", "GET /lights", "GET /cameras", "GET /script", "POST /render"],
+        endpoints: ["GET /health", "GET /lights", "GET /cameras", "GET /script", "GET /model", "POST /render"],
       });
       return;
     }
@@ -373,6 +379,9 @@ const server = createServer(async (req, res) => {
           encoded[name] = {
             data: render.data.toString("base64"),
             content_type: render.contentType,
+            // Projected light positions for this camera (see scene.mjs
+            // projectLights): [{ name, x_px, y_px, x_pct, y_pct, visible }].
+            lights: render.lights || [],
           };
         }
         sendJson(res, 200, { renders: encoded, script: await scriptStatus() });
@@ -383,6 +392,15 @@ const server = createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && path === "/model.glb") {
+      serveFile(res, CONFIG.modelPath);
+      return;
+    }
+
+    // GET /model — the loaded model GLB bytes, for the HA sidebar panel
+    // (the integration proxies this; the browser cannot reach the
+    // service directly). Alias of /model.glb, which the puppeteer render
+    // page uses.
+    if (req.method === "GET" && path === "/model") {
       serveFile(res, CONFIG.modelPath);
       return;
     }

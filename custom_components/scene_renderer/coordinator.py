@@ -1,7 +1,8 @@
 """Coordinator: watches light + sun state, drives renders.
 
 The coordinator subscribes to state changes of the mapped light entities
-and of ``sun.sun``. Light changes re-render on a 1-second trailing
+and of the configured sun entity (``sun.sun`` by default, or none when
+the sun is disabled in YAML). Light changes re-render on a 1-second trailing
 debounce — a burst of changes collapses into one render 1 s after the
 last change — with a 5-second max wait, so an entity that changes
 non-stop forces a render instead of starving one. The sun re-renders
@@ -15,7 +16,11 @@ the sun, the subscribed entity snapshot, and the selected cameras; the
 service returns one image per camera — a PNG still, or an animated WebP
 clip for cameras with a clip: entry in cameras.yaml — stored in
 :attr:`renders` (bytes) and :attr:`content_types`, and served by one
-image entity per camera.
+image entity per camera. The service also returns the projected position
+of every model light in each camera's image (pixels + percentages +
+in-frame flag, see scene.mjs projectLights), stored in
+:attr:`light_positions`; the image entities expose them as attributes
+with the mapped entity_id and live state added.
 
 Scripting (scene.js): the service exposes the script's ``subscribe``
 list via GET /script. The coordinator resolves those patterns (exact
@@ -46,7 +51,6 @@ from collections.abc import Callable
 from datetime import date, datetime
 from typing import Any
 
-from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import Event, HomeAssistant, State, callback
 from homeassistant.helpers.event import (
     async_call_later,
@@ -56,12 +60,9 @@ from homeassistant.util import color as color_util
 from homeassistant.util import dt as dt_util
 
 from .const import (
-    CONF_CAMERAS,
-    CONF_MAPPING,
-    CONF_SERVICE_URL,
-    CONF_SUN_ENABLED,
     DEBOUNCE_MAX_WAIT_SECONDS,
     DEBOUNCE_SECONDS,
+    DEFAULT_NAME,
     DOMAIN,
     MIN_RENDER_INTERVAL,
     SUN_ENTITY_ID,
@@ -167,26 +168,38 @@ def _entity_snapshot(state: State | None) -> dict[str, Any] | None:
 
 
 class SceneRenderCoordinator:
-    """Owns the render loop for one config entry."""
+    """Owns the render loop for the YAML-configured scene."""
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+    def __init__(
+        self,
+        hass: HomeAssistant,
+        *,
+        service_url: str,
+        sun_entity_id: str | None = SUN_ENTITY_ID,
+        mapping: dict[str, str] | None = None,
+        cameras: list[str] | None = None,
+        name: str = DEFAULT_NAME,
+    ) -> None:
         self.hass = hass
-        self.entry = entry
-        self.service_url: str = (
-            entry.options.get(CONF_SERVICE_URL)
-            or entry.data.get(CONF_SERVICE_URL, "")
-        )
-        self.sun_enabled: bool = entry.options.get(
-            CONF_SUN_ENABLED, entry.data.get(CONF_SUN_ENABLED, True)
-        )
-        self.mapping: dict[str, str] = dict(entry.options.get(CONF_MAPPING, {}))
-        self.cameras: list[str] = list(entry.options.get(CONF_CAMERAS, []))
+        self.name = name
+        self.service_url = service_url
+        # The sun entity to follow, or None to disable the sun.
+        self.sun_entity_id = sun_entity_id
+        self.sun_enabled: bool = sun_entity_id is not None
+        self.mapping: dict[str, str] = dict(mapping or {})
+        self.cameras: list[str] = list(cameras or [])
         self.service = RenderServiceClient(hass, self.service_url)
 
         # Latest render per camera: {camera_name: image bytes} and its
         # content type (image/png for stills, image/webp for clips).
         self.renders: dict[str, bytes] = {}
         self.content_types: dict[str, str] = {}
+        # Projected light positions per camera from the latest render:
+        # {camera_name: [{name, x_px, y_px, x_pct, y_pct, visible}]},
+        # as returned by the service (see scene.mjs projectLights).
+        # The image entities expose these as attributes, adding the
+        # mapped entity_id + live state.
+        self.light_positions: dict[str, list[dict[str, Any]]] = {}
         self.last_rendered: Any = None
         self.status: str = STATUS_IDLE
         self.last_error: str | None = None
@@ -263,6 +276,10 @@ class SceneRenderCoordinator:
         """Content type of the latest render for a camera."""
         return self.content_types.get(camera, "image/png")
 
+    def light_positions_for(self, camera: str) -> list[dict[str, Any]]:
+        """Projected light positions for a camera from the latest render."""
+        return self.light_positions.get(camera, [])
+
     # -- script subscriptions -------------------------------------------
     def _resolve_script_patterns(self, patterns: list[str]) -> set[str]:
         """Resolve subscribe patterns to entity IDs.
@@ -289,7 +306,7 @@ class SceneRenderCoordinator:
         the script's resolved subscriptions."""
         entities = set(self.mapping.values())
         if self.sun_enabled:
-            entities.add(SUN_ENTITY_ID)
+            entities.add(self.sun_entity_id)
         entities.update(self._script_entities)
         return entities
 
@@ -357,7 +374,7 @@ class SceneRenderCoordinator:
     @callback
     def _async_state_changed(self, event: Event) -> None:
         entity_id = event.data.get("entity_id")
-        if entity_id == SUN_ENTITY_ID:
+        if entity_id == self.sun_entity_id:
             self._handle_sun_change()
         else:
             self._schedule_debounced_render()
@@ -370,7 +387,7 @@ class SceneRenderCoordinator:
         """
         if not self.sun_enabled:
             return
-        state = self.hass.states.get(SUN_ENTITY_ID)
+        state = self.hass.states.get(self.sun_entity_id)
         if state is None:
             return
         elevation = state.attributes.get("elevation")
@@ -382,7 +399,9 @@ class SceneRenderCoordinator:
 
     def _handle_sun_change(self) -> None:
         """Decide whether a sun update warrants a re-render (quantized)."""
-        state = self.hass.states.get(SUN_ENTITY_ID)
+        if not self.sun_enabled:
+            return
+        state = self.hass.states.get(self.sun_entity_id)
         if state is None:
             return
         above = state.state == "above_horizon"
@@ -457,8 +476,9 @@ class SceneRenderCoordinator:
             self.status = STATUS_ERROR
             self.last_error = str(err)
         else:
-            self.renders = {name: data for name, (data, _) in renders.items()}
-            self.content_types = {name: ctype for name, (_, ctype) in renders.items()}
+            self.renders = {name: data for name, (data, _, _) in renders.items()}
+            self.content_types = {name: ctype for name, (_, ctype, _) in renders.items()}
+            self.light_positions = {name: lights for name, (_, _, lights) in renders.items()}
             self.last_rendered = dt_util.utcnow()
             self.status = STATUS_OK
             self.last_error = None
@@ -481,7 +501,7 @@ class SceneRenderCoordinator:
         }
         sun: dict[str, Any] | None = None
         if self.sun_enabled:
-            sun_state = self.hass.states.get(SUN_ENTITY_ID)
+            sun_state = self.hass.states.get(self.sun_entity_id)
             if sun_state is not None:
                 sun = {
                     "azimuth": sun_state.attributes.get("azimuth"),

@@ -1,29 +1,27 @@
 """Image entities: one per selected camera, each serving its latest render."""
 from __future__ import annotations
 
+from typing import Any
+
 from homeassistant.components.image import ImageEntity
-from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import CONF_NAME
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
-from .const import DOMAIN
+from .const import DOMAIN, YAML_CONFIG_ID
 from .coordinator import SceneRenderCoordinator
 
 
-async def async_setup_entry(
+async def async_setup_platform(
     hass: HomeAssistant,
-    entry: ConfigEntry,
+    config: dict[str, Any],
     async_add_entities: AddEntitiesCallback,
+    discovery_info: Any | None = None,
 ) -> None:
-    """Set up one image entity per selected camera."""
-    coordinator: SceneRenderCoordinator = hass.data[DOMAIN][entry.entry_id]
+    """Set up one image entity per selected camera (YAML setup)."""
+    coordinator: SceneRenderCoordinator = hass.data[DOMAIN][YAML_CONFIG_ID]
     async_add_entities(
-        [
-            SceneRenderImage(hass, coordinator, entry, camera)
-            for camera in coordinator.cameras
-        ]
+        [SceneRenderImage(hass, coordinator, camera) for camera in coordinator.cameras]
     )
 
 
@@ -37,18 +35,17 @@ class SceneRenderImage(ImageEntity):
         self,
         hass: HomeAssistant,
         coordinator: SceneRenderCoordinator,
-        entry: ConfigEntry,
         camera: str,
     ) -> None:
         super().__init__(hass)
         self.coordinator = coordinator
         self.camera = camera
-        self._attr_unique_id = f"{entry.entry_id}_render_{camera}"
+        self._attr_unique_id = f"{YAML_CONFIG_ID}_render_{camera}"
         # Snake_case camera name -> Title Case display name.
         self._attr_name = camera.replace("_", " ").title()
         self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, entry.entry_id)},
-            name=entry.data.get(CONF_NAME, "Scene Renderer"),
+            identifiers={(DOMAIN, YAML_CONFIG_ID)},
+            name=coordinator.name,
             manufacturer="HA Scene Renderer",
             model="3D scene render",
         )
@@ -75,9 +72,50 @@ class SceneRenderImage(ImageEntity):
         return self.coordinator.render_for(self.camera)
 
     @property
-    def extra_state_attributes(self) -> dict[str, str]:
-        """Return the camera this entity renders, and its image type."""
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Camera, image type, and the projected light positions.
+
+        ``lights`` is one entry per model light, with the position the
+        service projected it to in this camera's latest render (pixels at
+        the camera's configured resolution + percentages of the image,
+        ``visible`` when the light is in frame) plus the mapped entity_id
+        and that entity's live state/brightness — the pieces a dashboard
+        needs to overlay markers or controls on the render. Unmapped
+        lights carry entity_id/state/brightness None; a light behind the
+        camera carries null coordinates (see scene.mjs projectLights).
+        """
+        lights: list[dict[str, Any]] = []
+        hass = getattr(self, "hass", None)
+        for proj in self.coordinator.light_positions_for(self.camera):
+            name = proj.get("name")
+            entity_id = self.coordinator.mapping.get(name) if name else None
+            state: str | None = None
+            brightness: float | None = None
+            if entity_id is not None and hass is not None:
+                entity_state = hass.states.get(entity_id)
+                if entity_state is not None:
+                    state = entity_state.state
+                    raw = entity_state.attributes.get("brightness")
+                    brightness = (
+                        round(raw / 255, 2)
+                        if isinstance(raw, (int, float))
+                        else None
+                    )
+            lights.append(
+                {
+                    "name": name,
+                    "entity_id": entity_id,
+                    "state": state,
+                    "brightness": brightness,
+                    "x_px": proj.get("x_px"),
+                    "y_px": proj.get("y_px"),
+                    "x_pct": proj.get("x_pct"),
+                    "y_pct": proj.get("y_pct"),
+                    "visible": proj.get("visible", False),
+                }
+            )
         return {
             "camera": self.camera,
             "content_type": self.coordinator.content_type_for(self.camera),
+            "lights": lights,
         }

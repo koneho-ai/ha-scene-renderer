@@ -787,6 +787,76 @@ export function renderFrame({
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// Light projection (per-render light positions for image attributes)
+// ---------------------------------------------------------------------------
+// Project each model light's 3D world position through one camera into
+// image coordinates: pixel x/y at the camera's configured resolution and
+// the same as percentages of the image size, plus a `visible` flag (the
+// light is in front of the camera and inside the frame).
+//
+//   [{ name, x_px, y_px, x_pct, y_pct, visible }]
+//
+// Coordinate contract:
+// - `visible` is true only when the light is in front of the camera and
+//   its projected position is inside the frame (NDC x/y/z all in
+//   [-1, 1] — the z check excludes lights nearer than the near plane or
+//   beyond the far plane).
+// - A light in front of the camera but outside the frame still reports
+//   its real projected coordinates (they fall outside 0..100%) — useful
+//   for "just off-frame" indicators.
+// - A light behind the camera reports null coordinates: the projection
+//   of a behind-camera point is mirrored and meaningless.
+// - The camera used is the same render camera getRenderCamera builds
+//   (overrides applied), and it is reset afterwards, so projecting never
+//   leaks state into the next render. Projection is computed once per
+//   render request, not per clip frame (camera and lights are static
+//   within a request); the backends call it after rendering the camera
+//   so it reflects the scene as last rendered (including any
+//   scene.js light moves).
+// Occlusion (a light behind a wall from this camera) is NOT detected —
+// that needs a raycast and is deferred by design.
+export function projectLights(model, info, cfg) {
+  const camera = getRenderCamera(model, info, cfg);
+  // Refresh every world matrix (model cameras may sit under transformed
+  // parents) so the camera's matrixWorldInverse and the lights' world
+  // positions are current.
+  model.scene.updateMatrixWorld(true);
+  const out = [];
+  for (const [name, light] of model.lights) {
+    const worldPos = light.getWorldPosition(new THREE.Vector3());
+    const viewPos = worldPos.clone().applyMatrix4(camera.matrixWorldInverse);
+    const inFront = viewPos.z < 0;
+    if (!inFront) {
+      out.push({ name, x_px: null, y_px: null, x_pct: null, y_pct: null, visible: false });
+      continue;
+    }
+    const ndc = worldPos.clone().project(camera);
+    // Normalize -0 to 0 (Math.round can produce -0 at the frame edges,
+    // and strict consumers distinguish the two).
+    const xPx = Math.round((ndc.x * 0.5 + 0.5) * cfg.width) + 0;
+    const yPx = Math.round((-ndc.y * 0.5 + 0.5) * cfg.height) + 0;
+    // A small epsilon: a light exactly on the frame edge computes to
+    // NDC ±1.000000000x in floating point and would otherwise flicker
+    // between visible and not.
+    const EPS = 1e-6;
+    const visible =
+      ndc.x >= -1 - EPS && ndc.x <= 1 + EPS &&
+      ndc.y >= -1 - EPS && ndc.y <= 1 + EPS &&
+      ndc.z >= -1 - EPS && ndc.z <= 1 + EPS;
+    out.push({
+      name,
+      x_px: xPx,
+      y_px: yPx,
+      x_pct: +(((ndc.x * 0.5 + 0.5) * 100).toFixed(1)) + 0,
+      y_pct: +(((-ndc.y * 0.5 + 0.5) * 100).toFixed(1)) + 0,
+      visible,
+    });
+  }
+  resetRenderCamera(model, info, camera);
+  return out;
+}
+
 // Render a batch of still cameras against the already-loaded scene.
 //   setSize(width, height) — resize the drawing buffer for a camera.
 //   capture() — return the current frame (Buffer in Node, data URL in the

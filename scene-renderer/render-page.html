@@ -132,6 +132,14 @@ window.__render = ({ lights, sun, entities, cameras, width, height, fileConfig }
     capture: () => renderer.domElement.toDataURL("image/png"),
     log: pageLog,
   });
+// Project the model lights through one camera into image coordinates
+// (see scene.mjs projectLights). `cfg` is the resolved effective config
+// (from __cameras). Called once per camera after its render.
+window.__projectLights = ({ name, cfg }) => {
+  const info = sceneLib.getCameraInfo(model, name);
+  if (!info) throw new Error(`unknown camera "${name}"`);
+  return sceneLib.projectLights(model, info, cfg);
+};
 window.__sceneReady = true;
 </script>
 </body>

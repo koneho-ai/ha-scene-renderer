@@ -11,7 +11,9 @@
 // ses package is missing), scripting is disabled with a clear log line and
 // rendering continues without it — never break renders for scripting.
 //
-// Render output: a map cameraName -> { data: Buffer, contentType }.
+// Render output: a map cameraName -> { data: Buffer, contentType, lights }.
+// `lights` is the per-camera projection of the model lights into image
+// coordinates (see scene.mjs projectLights), computed once per camera.
 // Cameras with a clip: entry in cameras.yaml render a duration×fps frame
 // sequence and are encoded to animated WebP; the rest are PNG stills.
 // The frame loop checks shouldAbort between frames and throws an error
@@ -153,9 +155,14 @@ export async function createBackend({ modelPath, log }) {
         const cfg = sceneLib.resolveCameraConfig(info, fileConfig?.[name], defaults, log);
         if (!cfg.clip) {
           // Still: one frame at time 0, loop 0.
+          const data = sceneLib.renderFrame({ ...frameArgs, info, cfg, time: 0, loop: 0 });
           out[name] = {
-            data: sceneLib.renderFrame({ ...frameArgs, info, cfg, time: 0, loop: 0 }),
+            data,
             contentType: "image/png",
+            // Projected light positions, computed once per camera after
+            // the render (not per clip frame — camera and lights are
+            // static within a request).
+            lights: sceneLib.projectLights(model, info, cfg),
           };
           continue;
         }
@@ -172,6 +179,7 @@ export async function createBackend({ modelPath, log }) {
         out[name] = {
           data: await encodeClip(frames, { width: cfg.width, height: cfg.height, fps: cfg.clip.fps }),
           contentType: "image/webp",
+          lights: sceneLib.projectLights(model, info, cfg),
         };
       }
       return out;

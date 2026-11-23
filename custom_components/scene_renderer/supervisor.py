@@ -8,8 +8,8 @@ returns that hostname directly, so discovery reads it from there instead of
 guessing the format.
 
 Returns None when the hassio integration is absent (Container/Core installs
-have no Supervisor) or the add-on is not installed; the config flow then
-falls back to the manual URL field.
+have no Supervisor) or the add-on is not installed; async_setup then fails
+with a clear error unless the user set ``service_url`` in YAML.
 """
 from __future__ import annotations
 

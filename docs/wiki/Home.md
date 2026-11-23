@@ -18,11 +18,12 @@ The integration normalizes each mapped light entity into on/brightness/color/col
 ## Pages
 
 - [[Installation]] — app first, then the integration, in that order
-- [[Configuration]] — the three-step setup flow, the options flow, and `cameras.yaml`
+- [[Configuration]] — the YAML reference, light positions, and `cameras.yaml`
+- [[Panel]] — the sidebar 3D viewer: live light and camera markers
 - [[Sample Scene]] — the bundled apartment model: rooms, lights, cameras, fan, blinds
 - [[Creating Your Own Scene]] — build a GLB, name its lights and cameras, drop it in
 - [[Scene Scripting]] — drive the scene from any HA entity with `scene.js`
 - [[Motion Clips]] — looping animated WebP renders, per camera
 - [[Troubleshooting]] — the errors you'll actually hit, and what fixes them
 
-The repo README covers the same ground in condensed form; this wiki is the long version. Current version: **0.2.0**.
+The repo README covers the same ground in condensed form; this wiki is the long version. Current version: **0.3.0**.

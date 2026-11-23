@@ -54,11 +54,14 @@ COPY package.json package-lock.json ./
 # dependencies of sharp, and `--omit=optional` used to drop them, shipping
 # a sharp with no native binary (startup crash loop in 0.2.0). Puppeteer
 # is NOT in package.json at all; the puppeteer variant installs it
-# separately below (with its Chromium download).
-RUN npm ci \
+# separately below (with its Chromium download). The puppeteer cache dir
+# is created unconditionally: the runtime stage copies it from this stage
+# in both variants, and BuildKit fails the build if the source path does
+# not exist (broke the 0.2.1 CI run before this fix).
+RUN mkdir -p /root/.cache/puppeteer \
+    && npm ci \
     && if [ "${RENDER_BACKEND}" = "puppeteer" ]; then \
-        mkdir -p /root/.cache/puppeteer \
-        && npm install --no-save puppeteer@25.18.1; \
+        npm install --no-save puppeteer@25.18.1; \
     fi
 # Build-time smoke test: sharp must load here, or the image would crash
 # on the user's Home Assistant at startup. This class of bug fails CI.

@@ -1,14 +1,16 @@
-# HA Scene Renderer add-on
+# HA Scene Renderer app
 
 Renders a 3D model of your home, lit by your real Home Assistant lights
-and the real sun. The render service runs here, in this add-on; the
+and the real sun. The render service runs here, in this app; the
 [HA Scene Renderer integration](https://github.com/koneho-ai/ha-scene-renderer)
 (HACS) watches your lights, sends their state to this service, and
 exposes the render as an image entity.
 
-**Install order: this add-on first, then the integration.** The
+> **Note:** Home Assistant renamed add-ons to apps in a recent release. If your Home Assistant still shows "Add-ons" / "Add-on Store", it's the same thing.
+
+**Install order: this app first, then the integration.** The
 integration's setup reads the model's lights from this service, so the
-add-on must be installed and running before you add the integration.
+app must be installed and running before you add the integration.
 
 ## Options
 
@@ -53,11 +55,11 @@ living_room:
 ```
 
 Precedence: file value > model value > global default (width/height
-from the add-on options; background = scene default; exposure = 1.0).
+from the app options; background = scene default; exposure = 1.0).
 A commented example ships in the repo as
 `cameras.example.yaml` — copy it to `/share/scene-renderer/` and edit.
 
-The file is hot-reloaded: edit it and the add-on picks up the changes
+The file is hot-reloaded: edit it and the app picks up the changes
 without a restart (watch the log for a reload message). It never breaks
 rendering: an unknown camera name is logged and ignored, invalid values
 for one camera fall back to defaults for that camera only, and a
@@ -147,7 +149,7 @@ The scene API:
 
 Unknown names throw a clear error (which only skips the script for that
 frame — see above). `console.log` / `warn` / `error` in the script go
-to the add-on log, prefixed `[scene.js]`.
+to the app log, prefixed `[scene.js]`.
 
 Sandbox: the script runs in a SES Compartment (hardened JS) — no
 `process`, no `require`, no network, no imports, no `eval`. It can
@@ -159,7 +161,7 @@ hash, subscriptions, last error) is in `GET /health` and
 
 Put a `.glb` file in `/share/scene-renderer/models/` (create the folder
 if needed), set the `model` option to its file name, and restart the
-add-on. The model should use glTF `KHR_lights_punctual` lights with
+app. The model should use glTF `KHR_lights_punctual` lights with
 unique `snake_case` names (e.g. `living_room_ceiling`) — those names are
 what the integration maps to your light entities. The bundled sample
 apartment has 5 named lights across 4 rooms.
@@ -181,17 +183,17 @@ headless Chromium build is the fallback variant.
 
 ## Troubleshooting
 
-- **Add-on won't start, log says "Model not found":** the `model`
+- **App won't start, log says "Model not found":** the `model`
   option names a file that is neither bundled nor in
   `/share/scene-renderer/models/`. Fix the name or add the file.
-- **Add-on won't start, log says "failed to start render backend":**
+- **App won't start, log says "failed to start render backend":**
   the render backend could not initialise (e.g. the model file is not a
   valid GLB, or the WebGL backend failed on this hardware). Check the
   log lines above the error; try the sample model first.
 - **Integration setup says it cannot reach the render service:** make
-  sure the add-on is installed, started, and its log says `ready`.
+  sure the app is installed, started, and its log says `ready`.
 - **Renders are slow:** rendering is software (CPU) on hosts without a
-  GPU. Lower `width` / `height` in the add-on options.
+  GPU. Lower `width` / `height` in the app options.
 - **A clip camera renders a still:** the `clip:` entry is invalid
   (duration 0.5..30, fps 1..30 as an integer, 2..300 frames total) —
   an invalid entry is logged and the whole camera entry falls back to

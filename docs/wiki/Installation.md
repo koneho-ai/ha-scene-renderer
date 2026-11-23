@@ -1,24 +1,26 @@
 # Installation
 
+> **Note:** Home Assistant renamed add-ons to apps in a recent release. If your Home Assistant still shows "Add-ons" / "Add-on Store", it's the same thing.
+
 ## Requirements
 
-- Home Assistant with the **Supervisor** (Home Assistant OS or Supervised) — the render service runs as an add-on.
+- Home Assistant with the **Supervisor** (Home Assistant OS or Supervised) — the render service runs as an app.
 - **HACS** (or Settings → Marketplace on HA 2026.11+) for the integration.
 - Home Assistant **2025.1.0** or newer (per the integration manifest).
 
-## Install order matters: add-on first
+## Install order matters: app first
 
-The integration's setup flow reads the model's lights from the render service, so the add-on must be installed and running **before** you add the integration. If it isn't, setup stops at step 1 with an error telling you to install and start the add-on first.
+The integration's setup flow reads the model's lights from the render service, so the app must be installed and running **before** you add the integration. If it isn't, setup stops at step 1 with an error telling you to install and start the app first.
 
-## Step 1 — the add-on
+## Step 1 — the app
 
-1. Settings → Add-ons → Add-on Store → ⋮ → **Repositories**, add `https://github.com/koneho-ai/ha-scene-renderer`.
+1. Settings → Apps → App Store → ⋮ → **Repositories**, add `https://github.com/koneho-ai/ha-scene-renderer`.
 2. Install **HA Scene Renderer**, then **Start** it.
-3. The add-on log should say `ready (backend: node-webgl, 5 scene lights, 2 cameras)`.
+3. The app log should say `ready (backend: node-webgl, 5 scene lights, 2 cameras)`.
 
-The add-on image is `ghcr.io/koneho-ai/ha-scene-renderer` (multi-arch: amd64 + aarch64, Cosign-signed), published by CI on each release. The package is public, so the Supervisor pulls it without credentials.
+The app image is `ghcr.io/koneho-ai/ha-scene-renderer` (multi-arch: amd64 + aarch64, Cosign-signed), published by CI on each release. The package is public, so the Supervisor pulls it without credentials.
 
-Add-on options (all optional — the defaults render the sample apartment):
+App options (all optional — the defaults render the sample apartment):
 
 | Option | Default | Notes |
 | --- | --- | --- |
@@ -26,7 +28,7 @@ Add-on options (all optional — the defaults render the sample apartment):
 | `width` / `height` | `1280` / `720` | Default render size for all cameras (320–3840 × 240–2160); per-camera overrides in `cameras.yaml` |
 | `log_level` | `info` | `trace` … `fatal` |
 
-The service listens on port 3000 inside the container. Home Assistant reaches it on the internal network, so no host port mapping is needed — the port is offered in the Network panel for debugging only. The add-on maps `share:rw`, so it can read your files under `/share/scene-renderer/`.
+The service listens on port 3000 inside the container. Home Assistant reaches it on the internal network, so no host port mapping is needed — the port is offered in the Network panel for debugging only. The app maps `share:rw`, so it can read your files under `/share/scene-renderer/`.
 
 ## Step 2 — the integration
 

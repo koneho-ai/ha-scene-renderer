@@ -1,10 +1,14 @@
 """Coordinator: watches light + sun state, drives renders.
 
 The coordinator subscribes to state changes of the mapped light entities
-and of ``sun.sun``. Light changes re-render (debounced); the sun re-renders
+and of ``sun.sun``. Light changes re-render on a 1-second trailing
+debounce — a burst of changes collapses into one render 1 s after the
+last change — with a 5-second max wait, so an entity that changes
+non-stop forces a render instead of starving one. The sun re-renders
 when its elevation crosses a 5-degree step, on above/below-horizon
 transitions, or at most every 15 minutes while it is up. Renders are
-serialized with a minimum interval and coalesced (latest state wins).
+serialized with a 2-second minimum interval and coalesced (latest state
+wins).
 
 Each update is ONE batch render request carrying the light parameters,
 the sun, the subscribed entity snapshot, and the selected cameras; the
@@ -56,6 +60,7 @@ from .const import (
     CONF_MAPPING,
     CONF_SERVICE_URL,
     CONF_SUN_ENABLED,
+    DEBOUNCE_MAX_WAIT_SECONDS,
     DEBOUNCE_SECONDS,
     DOMAIN,
     MIN_RENDER_INTERVAL,
@@ -208,6 +213,12 @@ class SceneRenderCoordinator:
         self._listeners: list[Callable[[], None]] = []
         self._unsubs: list[Callable[[], None]] = []
         self._debounce_unsub: Callable[[], None] | None = None
+        # Monotonic time the current debounce window opened (None when no
+        # render is pending). A window that stays open past
+        # DEBOUNCE_MAX_WAIT_SECONDS renders immediately instead of
+        # rescheduling, so a constantly-changing entity cannot starve
+        # renders by resetting the timer forever.
+        self._debounce_since: float | None = None
         self._render_lock = asyncio.Lock()
         self._render_pending = False
         self._last_render_at = 0.0
@@ -321,6 +332,7 @@ class SceneRenderCoordinator:
         if self._debounce_unsub is not None:
             self._debounce_unsub()
             self._debounce_unsub = None
+        self._debounce_since = None
         for unsub in self._unsubs:
             unsub()
         self._unsubs.clear()
@@ -392,14 +404,24 @@ class SceneRenderCoordinator:
             self._schedule_debounced_render()
 
     def _schedule_debounced_render(self) -> None:
+        now = time.monotonic()
+        if self._debounce_since is None:
+            self._debounce_since = now
+        delay = DEBOUNCE_SECONDS
+        if now - self._debounce_since >= DEBOUNCE_MAX_WAIT_SECONDS:
+            # The window has been open too long: a constantly-changing
+            # entity would otherwise keep rescheduling the timer forever.
+            # Render now instead of debouncing again.
+            delay = 0
         if self._debounce_unsub is not None:
             self._debounce_unsub()
         self._debounce_unsub = async_call_later(
-            self.hass, DEBOUNCE_SECONDS, self._async_debounced_render
+            self.hass, delay, self._async_debounced_render
         )
 
     async def _async_debounced_render(self, _now: Any) -> None:
         self._debounce_unsub = None
+        self._debounce_since = None
         await self.async_request_render()
 
     # -- rendering ------------------------------------------------------

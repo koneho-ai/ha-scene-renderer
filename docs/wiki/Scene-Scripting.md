@@ -40,7 +40,7 @@ export default function update({ entities, scene, time, loop }) {
 | `scene.hasLight(name)` / `scene.hasObject(name)` | Guards for optional access. |
 | `scene.listLights()` / `scene.listObjects()` | Names in the model. |
 
-Unknown names throw a clear error (which only skips the script for that frame — see below). `console.log` / `warn` / `error` in the script go to the add-on log, prefixed `[scene.js]`.
+Unknown names throw a clear error (which only skips the script for that frame — see below). `console.log` / `warn` / `error` in the script go to the app log, prefixed `[scene.js]`.
 
 Note there is no separate sun parameter: `sun.sun` is an entity like any other, read from `entities`.
 

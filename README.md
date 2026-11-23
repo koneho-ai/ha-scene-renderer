@@ -9,8 +9,8 @@ Two parts, one repository:
 
 | Part | What it is | Installed via |
 | --- | --- | --- |
-| **Add-on** (`scene-renderer/`) | Node.js + three.js render service in a container, managed by the Supervisor like Node-RED | Add-on store (custom repository) |
-| **Integration** (`custom_components/scene_renderer/`) | Watches your lights + `sun.sun`, sends their state to the add-on, exposes the render | HACS / Marketplace (custom repository) |
+| **App** (`scene-renderer/`) | Node.js + three.js render service in a container, managed by the Supervisor like Node-RED | App store (custom repository) |
+| **Integration** (`custom_components/scene_renderer/`) | Watches your lights + `sun.sun`, sends their state to the app, exposes the render | HACS / Marketplace (custom repository) |
 
 ```
 Home Assistant host
@@ -28,10 +28,12 @@ Home Assistant host
 
 ## Install (in this order)
 
-**1. The add-on first.** The integration cannot be set up until the
-add-on is running — the setup flow reads the model's lights from it.
+> **Note:** Home Assistant renamed add-ons to apps in a recent release. If your Home Assistant still shows "Add-ons" / "Add-on Store", it's the same thing.
 
-- Settings → Add-ons → Add-on Store → ⋮ → Repositories, add
+**1. The app first.** The integration cannot be set up until the
+app is running — the setup flow reads the model's lights from it.
+
+- Settings → Apps → App Store → ⋮ → Repositories, add
   `https://github.com/koneho-ai/ha-scene-renderer`
 - Install **HA Scene Renderer**, then **Start** it. The log should say
   `ready (backend: node-webgl, 5 scene lights, 2 cameras)`.
@@ -47,10 +49,10 @@ add-on is running — the setup flow reads the model's lights from it.
 Setup is three steps, no free text:
 
 1. **Connect** — name, render service URL (usually pre-filled from the
-   Supervisor: the add-on's internal hostname, something like
-   `http://a1b2c3d4-scene-renderer:3000`), sun on/off. If the add-on is
+   Supervisor: the app's internal hostname, something like
+   `http://a1b2c3d4-scene-renderer:3000`), sun on/off. If the app is
    not reachable, setup stops here with an error telling you to
-   install and start the add-on first.
+   install and start the app first.
 2. **Map lights** — one entity picker per light in the model, HA light
    entities only. Each picker is optional: a light left unmapped renders
    at its model default (full brightness, model color).
@@ -59,7 +61,7 @@ Setup is three steps, no free text:
    shows each camera's effective resolution.
 
 The options flow (Configure on the integration) shows the same mapping
-and camera UI and re-reads the light and camera lists from the add-on,
+and camera UI and re-reads the light and camera lists from the app,
 so a changed model shows up there. Changing the camera selection
 adds or removes image entities (the entry reloads automatically).
 
@@ -135,8 +137,8 @@ The sun casts the shadows; the model's point lights do not (performance).
   Cameras are glTF cameras with a unique `snake_case` name on both the
   camera definition and its node (e.g. `overview`, `living_room`).
 - **Your own model:** put the `.glb` in `/share/scene-renderer/models/`
-  on the HA host and set the add-on's `model` option to its file name,
-  then restart the add-on. (The add-on maps `share:rw`.) Any GLB with
+  on the HA host and set the app's `model` option to its file name,
+  then restart the app. (The app maps `share:rw`.) Any GLB with
   named `KHR_lights_punctual` lights works; a model without cameras
   gets the three built-in virtual cameras (see below).
 - The bundled sample has no ceiling (dollhouse style) so the overview
@@ -188,11 +190,11 @@ living_room:
 All fields are optional. Merge precedence: **file value > model value**
 (FOV / near / far / position / target from the glTF camera or the
 computed virtual camera) **> global default** (width/height from the
-add-on options; background = scene default; exposure = 1.0).
+app options; background = scene default; exposure = 1.0).
 `GET /cameras` returns the effective merged config per camera, so the
 integration's camera step shows each camera's effective resolution.
 
-The file is hot-reloaded: the add-on watches it and picks up changes
+The file is hot-reloaded: the app watches it and picks up changes
 without a restart (the log says whether the reload succeeded). It
 never breaks rendering: an unknown camera name is logged and ignored,
 invalid values for one camera fall back to defaults for that camera
@@ -251,7 +253,7 @@ The scene API: `getLight(name)` (`visible`, `intensity`, `color`),
 
 ## Render service API
 
-The add-on listens on port 3000 inside the container (no host port
+The app listens on port 3000 inside the container (no host port
 mapping needed — HA reaches it on the internal network).
 
 - `GET /health` — status, backend, model, scene lights, cameras,
@@ -310,7 +312,7 @@ run):
   Heavier image, battle-tested fallback. Both backends run the same
   `scene.mjs`, so they render identically.
 
-## Add-on options
+## App options
 
 | Option | Default | Notes |
 | --- | --- | --- |
@@ -341,7 +343,7 @@ ha-scene-renderer/
 
 ## Releasing
 
-The add-on image is built and published by GitHub Actions
+The app image is built and published by GitHub Actions
 (`.github/workflows/builder.yaml`, home-assistant/builder actions) when a
 release is published. The image is `ghcr.io/koneho-ai/ha-scene-renderer`
 (multi-arch: amd64 + aarch64), Cosign-signed, tagged with the release
@@ -363,7 +365,7 @@ To cut a release:
 
 First release only: a new GHCR package starts **private** — make it public
 (package settings → Danger Zone → Change visibility) or nobody can pull
-the image. Also note `config.yaml` already declares `image:`, so add-on
+the image. Also note `config.yaml` already declares `image:`, so app
 installs will fail to pull until the first image is published — cut the
 first release as soon as the repo is live.
 
@@ -395,8 +397,8 @@ docker build --build-arg RENDER_BACKEND=puppeteer scene-renderer/
   mid-clip. The `cameras.yaml` merge/validation, hot-reload watch, and
   malformed-file handling were verified live too. The node-webgl
   backend (the default) could not be installed on the dev VM and is
-  validated by the add-on image build on real HA hardware.
-- The add-on image build itself (Docker) was not run here — no Docker
+  validated by the app image build on real HA hardware.
+- The app image build itself (Docker) was not run here — no Docker
   on the dev VM. The Dockerfile follows the current (post-April-2026
   BuildKit migration) conventions: base image pinned in the Dockerfile,
   no `build.yaml`, S6 service under `rootfs/`.

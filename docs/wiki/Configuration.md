@@ -4,13 +4,13 @@
 
 Setup is three steps, no free text:
 
-1. **Connect** — name, render service URL (usually pre-filled from the Supervisor: the add-on's internal hostname, something like `http://a1b2c3d4-scene-renderer:3000`), sun on/off. If the add-on is not reachable, setup stops here with an error telling you to install and start the add-on first.
+1. **Connect** — name, render service URL (usually pre-filled from the Supervisor: the app's internal hostname, something like `http://a1b2c3d4-scene-renderer:3000`), sun on/off. If the app is not reachable, setup stops here with an error telling you to install and start the app first.
 2. **Map lights** — one entity picker per light in the model, HA light entities only. Each picker is optional: a light left unmapped renders at its model default (full brightness, model color).
 3. **Choose cameras** — multi-select of the scene cameras, all selected by default. Each selected camera gets its own image entity; the step shows each camera's effective resolution.
 
 ## The options flow
 
-**Configure** on the integration shows the same mapping and camera UI and re-reads the light and camera lists from the add-on, so a changed model shows up there. Changing the camera selection adds or removes image entities (the entry reloads automatically).
+**Configure** on the integration shows the same mapping and camera UI and re-reads the light and camera lists from the app, so a changed model shows up there. Changing the camera selection adds or removes image entities (the entry reloads automatically).
 
 ## How lights are rendered
 
@@ -40,11 +40,11 @@ Renders are debounced (~1 s after a light change), serialized, and at most one e
 
 ## Where your files live
 
-All user files live under `/share/scene-renderer/` on the HA host (the add-on maps `share:rw`):
+All user files live under `/share/scene-renderer/` on the HA host (the app maps `share:rw`):
 
 | Path | What it is |
 | --- | --- |
-| `/share/scene-renderer/models/*.glb` | Your own models — set the add-on's `model` option to the file name |
+| `/share/scene-renderer/models/*.glb` | Your own models — set the app's `model` option to the file name |
 | `/share/scene-renderer/cameras.yaml` | Per-camera overrides (optional, hot-reloaded) |
 | `/share/scene-renderer/scene.js` | Your scene script (optional, hot-reloaded) |
 
@@ -71,15 +71,15 @@ living_room:
     fps: 10       # frames per second (1..30)
 ```
 
-All fields are optional. Merge precedence: **file value > model value** (FOV / near / far / position / target from the glTF camera or the computed virtual camera) **> global default** (width/height from the add-on options; background = scene default; exposure = 1.0). `GET /cameras` returns the effective merged config per camera, so the integration's camera step shows each camera's effective resolution.
+All fields are optional. Merge precedence: **file value > model value** (FOV / near / far / position / target from the glTF camera or the computed virtual camera) **> global default** (width/height from the app options; background = scene default; exposure = 1.0). `GET /cameras` returns the effective merged config per camera, so the integration's camera step shows each camera's effective resolution.
 
-The file is hot-reloaded: the add-on watches it and picks up changes without a restart (the log says whether the reload succeeded). It never breaks rendering: an unknown camera name is logged and ignored, invalid values for one camera fall back to defaults for that camera only, and a malformed file keeps the last good config. One exception: an invalid `clip:` entry (duration 0.5–30, fps 1–30 as an integer, 2–300 frames total) drops the **whole camera entry** to defaults — check the log for `cameras.yaml` errors if a clip camera renders a still.
+The file is hot-reloaded: the app watches it and picks up changes without a restart (the log says whether the reload succeeded). It never breaks rendering: an unknown camera name is logged and ignored, invalid values for one camera fall back to defaults for that camera only, and a malformed file keeps the last good config. One exception: an invalid `clip:` entry (duration 0.5–30, fps 1–30 as an integer, 2–300 frames total) drops the **whole camera entry** to defaults — check the log for `cameras.yaml` errors if a clip camera renders a still.
 
 See [[Motion Clips]] for what `clip:` does.
 
 ## Render service API
 
-The add-on listens on port 3000 inside the container (no host port mapping needed — HA reaches it on the internal network).
+The app listens on port 3000 inside the container (no host port mapping needed — HA reaches it on the internal network).
 
 - `GET /health` — status, backend, model, scene lights, cameras, animations, user-script status, uptime, render count.
 - `GET /lights` — scene lights from the loaded model: `name`, `type` (`point` / `spot` / `directional`), `position`, `color` (hex), `intensity` (base, candela).

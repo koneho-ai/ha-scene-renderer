@@ -6,14 +6,24 @@
 // per frame). sharp's animated-WebP path (stacked frames + pageHeight) is
 // documented and was verified against sharp 0.35.5: the output decodes
 // with the right page count, loop: 0, and per-frame delays.
-import sharp from "sharp";
-
+//
+// sharp is imported lazily inside encodeClip, never at module top level:
+// a missing or broken sharp must fail clip requests with a clear error,
+// not kill the whole service at startup — stills do not need sharp.
 export async function encodeClip(frames, { width, height, fps, quality = 80 }) {
   if (!Array.isArray(frames) || frames.length < 2) {
     throw new Error(`encodeClip needs at least 2 frames, got ${frames?.length ?? 0}`);
   }
   if (!Number.isInteger(width) || !Number.isInteger(height) || width <= 0 || height <= 0) {
     throw new Error(`encodeClip needs a valid frame size, got ${width}x${height}`);
+  }
+  let sharp;
+  try {
+    ({ default: sharp } = await import("sharp"));
+  } catch (err) {
+    throw new Error(
+      `clip encoding needs the sharp module, which failed to load: ${err.message}`,
+    );
   }
   const delayMs = Math.max(10, Math.round(1000 / fps));
   // One delay per frame: a single number applies only to the first frame

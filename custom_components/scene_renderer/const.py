@@ -21,6 +21,10 @@ SUN_ENTITY_ID = "sun.sun"
 
 # How long to wait after a light change before rendering (coalesces bursts).
 DEBOUNCE_SECONDS = 1.0
+# Longest a debounce window may stay open: a change arriving after the
+# window has been open this long renders immediately instead of
+# rescheduling, so a constantly-changing entity cannot starve renders.
+DEBOUNCE_MAX_WAIT_SECONDS = 5.0
 # Minimum time between two renders.
 MIN_RENDER_INTERVAL = timedelta(seconds=2)
 # The sun re-renders when its elevation crosses a step of this size, on

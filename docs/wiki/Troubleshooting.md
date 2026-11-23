@@ -1,24 +1,24 @@
 # Troubleshooting
 
-## Add-on won't start, log says "Model not found"
+## App won't start, log says "Model not found"
 
 The `model` option names a file that is neither bundled nor in `/share/scene-renderer/models/`. Fix the name or add the file.
 
-## Add-on won't start, log says "failed to start render backend"
+## App won't start, log says "failed to start render backend"
 
 The render backend could not initialise (e.g. the model file is not a valid GLB, or the WebGL backend failed on this hardware). Check the log lines above the error; try the sample model first.
 
 ## Integration setup says it cannot reach the render service
 
-Make sure the add-on is installed, started, and its log says `ready`. Install order is add-on first, then the integration — see [[Installation]].
+Make sure the app is installed, started, and its log says `ready`. Install order is app first, then the integration — see [[Installation]].
 
-## Add-on image won't pull
+## App image won't pull
 
-The GHCR package (`ghcr.io/koneho-ai/ha-scene-renderer`) is public, so the Supervisor pulls it without credentials. If a pull fails, check that the release exists and CI published the image for that tag (the Supervisor pulls the tag matching the add-on `version`).
+The GHCR package (`ghcr.io/koneho-ai/ha-scene-renderer`) is public, so the Supervisor pulls it without credentials. If a pull fails, check that the release exists and CI published the image for that tag (the Supervisor pulls the tag matching the app `version`).
 
 ## Renders are slow
 
-Rendering is software (CPU) on hosts without a GPU. Lower `width` / `height` in the add-on options, or per camera in `cameras.yaml`. Clips multiply the cost — a 3 s clip at 10 fps is 30 frame renders (~6 s at 720p on a Pi-class host). See [[Motion Clips]].
+Rendering is software (CPU) on hosts without a GPU. Lower `width` / `height` in the app options, or per camera in `cameras.yaml`. Clips multiply the cost — a 3 s clip at 10 fps is 30 frame renders (~6 s at 720p on a Pi-class host). See [[Motion Clips]].
 
 ## A clip camera renders a still
 
@@ -30,7 +30,7 @@ The file is hot-reloaded, but a malformed file keeps the last good config — ch
 
 ## My scene.js does nothing
 
-Check `GET /script` (or the integration's Render status sensor): `status: "error"` means the script failed to compile (the message says why) and the last good script — or no script — is running. `last_error` / `error_count` show runtime throws. Also check the script's `subscribe` list: an entity the script reads but does not subscribe to is never sent. Script errors also show in `/health` and in the add-on log (`[scene.js]` prefix). See [[Scene Scripting]].
+Check `GET /script` (or the integration's Render status sensor): `status: "error"` means the script failed to compile (the message says why) and the last good script — or no script — is running. `last_error` / `error_count` show runtime throws. Also check the script's `subscribe` list: an entity the script reads but does not subscribe to is never sent. Script errors also show in `/health` and in the app log (`[scene.js]` prefix). See [[Scene Scripting]].
 
 ## Node-webgl vs Puppeteer
 

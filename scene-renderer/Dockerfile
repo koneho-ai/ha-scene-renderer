@@ -50,10 +50,19 @@ RUN case "${BUILD_ARCH}" in \
 
 WORKDIR /app
 COPY package.json package-lock.json ./
-# The puppeteer variant installs the optional puppeteer dependency (and its
-# Chromium download); the node-webgl variant skips it.
-RUN mkdir -p /root/.cache/puppeteer \
-    && if [ "${RENDER_BACKEND}" = "puppeteer" ]; then npm ci; else npm ci --omit=optional; fi
+# Plain `npm ci` in both variants: sharp's platform binaries are optional
+# dependencies of sharp, and `--omit=optional` used to drop them, shipping
+# a sharp with no native binary (startup crash loop in 0.2.0). Puppeteer
+# is NOT in package.json at all; the puppeteer variant installs it
+# separately below (with its Chromium download).
+RUN npm ci \
+    && if [ "${RENDER_BACKEND}" = "puppeteer" ]; then \
+        mkdir -p /root/.cache/puppeteer \
+        && npm install --no-save puppeteer@25.18.1; \
+    fi
+# Build-time smoke test: sharp must load here, or the image would crash
+# on the user's Home Assistant at startup. This class of bug fails CI.
+RUN node --input-type=module -e "await import('sharp'); console.log('smoke: sharp loads')"
 
 COPY . ./
 

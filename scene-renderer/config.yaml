@@ -1,6 +1,6 @@
 name: HA Scene Renderer
 description: Renders a 3D model of your home lit by your real lights and the sun
-version: "0.2.0"
+version: "0.2.1"
 slug: scene-renderer
 url: https://github.com/koneho-ai/ha-scene-renderer
 # Multi-arch image published by CI (see .github/workflows/builder.yaml).

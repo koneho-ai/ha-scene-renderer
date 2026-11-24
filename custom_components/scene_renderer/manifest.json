@@ -1,1 +1,1 @@
-{"after_dependencies":["hassio"],"codeowners":["@koneho"],"dependencies":["frontend","websocket_api"],"documentation":"https://github.com/koneho-ai/ha-scene-renderer","domain":"scene_renderer","homeassistant":"2025.1.0","iot_class":"local_push","name":"HA Scene Renderer","version":"0.3.5"}
+{"after_dependencies":["hassio"],"codeowners":["@koneho"],"dependencies":["frontend","websocket_api"],"documentation":"https://github.com/koneho-ai/ha-scene-renderer","domain":"scene_renderer","homeassistant":"2025.1.0","iot_class":"local_push","name":"HA Scene Renderer","version":"0.3.4"}

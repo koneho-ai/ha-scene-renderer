@@ -78,7 +78,7 @@ lighting: the model's lights now follow their mapped HA entities
 the rendered images — previously the viewer showed every light at full
 base brightness under a strong fixed ambient, no matter what HA said.
 
-**0.3.5** makes every light cast shadows, in the rendered images and
+**0.3.6** makes every light cast shadows, in the rendered images and
 in the panel's 3D viewer: each model light renders a shadow map
 (point lights use cube maps), the sun casts too, and every model
 mesh casts and receives. Off lights cast nothing, so they cost no
@@ -88,15 +88,15 @@ them for the rest of the clip — re-rendering 14 cube maps every
 frame would be 84 extra scene renders per frame. Renders take
 longer with shadows on (a 1280×720 still with all 14 lights on is
 roughly 13 seconds on the test machine, up from under a second).
-0.3.5 also adds a `render_ms` attribute to each image entity: the
+0.3.6 also adds a `render_ms` attribute to each image entity: the
 wall-clock milliseconds the service spent rendering that camera's
 latest image (frames + encoding for clips), so you can see what the
-shadows cost per camera. And 0.3.5 replaces the sample model with a
+shadows cost per camera. And 0.3.6 replaces the sample model with a
 new 8-room house (14 lights, a TV driven by `scene.js`, one window
 per room) plus an invisible shadow-casting ceiling — a mesh whose
 material is named `ShadowOnly` renders as nothing but still casts
 shadows, so the sun enters only through the windows. Meshes whose
-materials are all transparent (glass) cast no shadow. 0.3.5 also
+materials are all transparent (glass) cast no shadow. 0.3.6 also
 lets you pin the sun with `sun_elevation` + `sun_azimuth` in the
 YAML — a fixed high sun instead of following `sun.sun`, handy in
 winter when the real sun never gets high — adds door openings and a

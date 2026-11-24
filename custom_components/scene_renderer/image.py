@@ -72,8 +72,11 @@ class SceneRenderImage(ImageEntity):
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Camera, image type, and the projected light positions.
+        """Camera, image type, render time, and the projected light positions.
 
+        ``render_ms`` is the wall-clock milliseconds the render service
+        spent rendering this camera's latest image (frames + encoding
+        for clips); None when the service did not report it.
         ``lights`` is one entry per model light, with the position the
         service projected it to in this camera's latest render (pixels at
         the camera's configured resolution + percentages of the image,
@@ -116,5 +119,6 @@ class SceneRenderImage(ImageEntity):
         return {
             "camera": self.camera,
             "content_type": self.coordinator.content_type_for(self.camera),
+            "render_ms": self.coordinator.render_ms_for(self.camera),
             "lights": lights,
         }

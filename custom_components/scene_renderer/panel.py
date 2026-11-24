@@ -246,5 +246,9 @@ async def websocket_panel_data(
             "mapping": dict(coordinator.mapping),
             "cameras": cameras,
             "image_entities": image_entities,
+            # The effective sun position (fixed override or live
+            # sun.sun), so the viewer agrees with the rendered images.
+            # None when the sun is disabled or has no state yet.
+            "sun": coordinator.sun_position(),
         },
     )

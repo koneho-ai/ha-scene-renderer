@@ -29,10 +29,16 @@ export const BACKEND_NAME = "node-webgl";
 // Lock SES down once, at module load: lockdown() installs the Compartment
 // global that script.mjs compiles user scripts into. If it fails, the
 // backend still renders — scripting is just unavailable.
+//
+// ses 2.x exports NOTHING from its ESM entry (index.js only imports the
+// shims for their side effects) — `const { lockdown } = await import("ses")`
+// destructures undefined and the lockdown never happens, which silently
+// disabled scene.js in this backend until 0.3.5. The import installs
+// lockdown/Compartment as globals; call the global.
 let sesAvailable = false;
 try {
-  const { lockdown } = await import("ses");
-  lockdown();
+  await import("ses");
+  globalThis.lockdown();
   sesAvailable = true;
 } catch (err) {
   console.error(`[ha-scene-renderer] SES lockdown failed (${err.message}) — scene.js scripting is disabled`);
@@ -154,11 +160,16 @@ export async function createBackend({ modelPath, log }) {
         }
         const cfg = sceneLib.resolveCameraConfig(info, fileConfig?.[name], defaults, log);
         if (!cfg.clip) {
-          // Still: one frame at time 0, loop 0.
+          // Still: one frame at time 0, loop 0. render_ms is the wall
+          // clock of the render itself (projection is metadata, not
+          // timed); the integration exposes it as the image entity's
+          // render_ms attribute.
+          const started = Date.now();
           const data = sceneLib.renderFrame({ ...frameArgs, info, cfg, time: 0, loop: 0 });
           out[name] = {
             data,
             contentType: "image/png",
+            render_ms: Date.now() - started,
             // Projected light positions, computed once per camera after
             // the render (not per clip frame — camera and lights are
             // static within a request).
@@ -174,6 +185,7 @@ export async function createBackend({ modelPath, log }) {
         // is barely visible. autoUpdate is restored in the finally so
         // an abort never leaves a later still with stale shadows.
         const frames = [];
+        const clipStarted = Date.now();
         renderer.shadowMap.autoUpdate = true;
         renderer.shadowMap.needsUpdate = true;
         try {
@@ -196,6 +208,9 @@ export async function createBackend({ modelPath, log }) {
         out[name] = {
           data: await encodeClip(frames, { width: cfg.width, height: cfg.height, fps: cfg.clip.fps }),
           contentType: "image/webp",
+          // Clip render_ms covers frames + WebP encoding: the whole
+          // cost of producing this image.
+          render_ms: Date.now() - clipStarted,
           lights: sceneLib.projectLights(model, info, cfg),
         };
       }

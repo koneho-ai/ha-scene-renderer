@@ -150,11 +150,19 @@ for (const clip of gltf.animations) {
     console.log("    - fan spin verified: half turn at 1.5 s, back to start at 3.0 s");
   }
 }
-// The scene.js example needs these nodes.
-for (const needed of ["ceiling_fan", "blinds"]) {
+// The scene.js example needs these nodes (the TV light + screen, and
+// the ceiling fan group the script spins).
+for (const needed of ["living_room_tv", "tv_screen", "ceiling_fan"]) {
   if (!gltf.scene.getObjectByName(needed)) {
     console.error(`ERROR: sample model is missing the "${needed}" node (needed by scene.example.js).`);
     process.exit(1);
   }
+}
+// The fan must be a group with parts to spin (hub + blades); a lone
+// empty node would rotate invisibly.
+const fan = gltf.scene.getObjectByName("ceiling_fan");
+if (fan.children.length < 2) {
+  console.error(`ERROR: "ceiling_fan" has ${fan.children.length} child(ren) — expected a hub + blades.`);
+  process.exit(1);
 }
 console.log("OK: model loads, all lights and cameras named and unique.");

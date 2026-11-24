@@ -20,7 +20,11 @@ image entity per camera. The service also returns the projected position
 of every model light in each camera's image (pixels + percentages +
 in-frame flag, see scene.mjs projectLights), stored in
 :attr:`light_positions`; the image entities expose them as attributes
-with the mapped entity_id and live state added.
+with the mapped entity_id and live state added. The service also
+reports the wall-clock milliseconds each camera's render took,
+stored in :attr:`render_ms` and exposed as the image entity's
+``render_ms`` attribute (``last_render_ms`` is the whole batch
+including the HTTP round trip, for the status sensor).
 
 Scripting (scene.js): the service exposes the script's ``subscribe``
 list via GET /script. The coordinator resolves those patterns (exact
@@ -176,6 +180,8 @@ class SceneRenderCoordinator:
         *,
         service_url: str,
         sun_entity_id: str | None = SUN_ENTITY_ID,
+        sun_elevation: float | None = None,
+        sun_azimuth: float | None = None,
         mapping: dict[str, str] | None = None,
         cameras: list[str] | None = None,
         name: str = DEFAULT_NAME,
@@ -186,6 +192,15 @@ class SceneRenderCoordinator:
         # The sun entity to follow, or None to disable the sun.
         self.sun_entity_id = sun_entity_id
         self.sun_enabled: bool = sun_entity_id is not None
+        # A fixed sun position (elevation, azimuth) from YAML, or None
+        # to follow the sun entity. Both coordinates together or
+        # neither — the config schema enforces that; a lone value here
+        # (direct construction) is ignored rather than half-applied.
+        self.sun_fixed: tuple[float, float] | None = (
+            (float(sun_elevation), float(sun_azimuth))
+            if sun_elevation is not None and sun_azimuth is not None
+            else None
+        )
         self.mapping: dict[str, str] = dict(mapping or {})
         self.cameras: list[str] = list(cameras or [])
         self.service = RenderServiceClient(hass, self.service_url)
@@ -200,6 +215,13 @@ class SceneRenderCoordinator:
         # The image entities expose these as attributes, adding the
         # mapped entity_id + live state.
         self.light_positions: dict[str, list[dict[str, Any]]] = {}
+        # Wall-clock milliseconds the service spent rendering each
+        # camera's latest image (frames + encoding for clips), as
+        # reported by the service; None when the service did not send
+        # it (older versions). The image entities expose this as the
+        # render_ms attribute. (last_render_ms below is the whole
+        # batch including the HTTP round trip, for the status sensor.)
+        self.render_ms: dict[str, int | None] = {}
         self.last_rendered: Any = None
         self.status: str = STATUS_IDLE
         self.last_error: str | None = None
@@ -280,6 +302,10 @@ class SceneRenderCoordinator:
         """Projected light positions for a camera from the latest render."""
         return self.light_positions.get(camera, [])
 
+    def render_ms_for(self, camera: str) -> int | None:
+        """Milliseconds the service spent rendering a camera's latest image."""
+        return self.render_ms.get(camera)
+
     # -- script subscriptions -------------------------------------------
     def _resolve_script_patterns(self, patterns: list[str]) -> set[str]:
         """Resolve subscribe patterns to entity IDs.
@@ -300,12 +326,33 @@ class SceneRenderCoordinator:
                 resolved.add(pattern)
         return resolved
 
+    def sun_position(self) -> dict[str, float] | None:
+        """The sun position the renders use: fixed override, else the
+        live sun entity's attributes, else None (sun disabled or no
+        state yet). The panel viewer uses this so it agrees with the
+        rendered images."""
+        if not self.sun_enabled:
+            return None
+        if self.sun_fixed is not None:
+            elevation, azimuth = self.sun_fixed
+            return {"elevation": elevation, "azimuth": azimuth}
+        state = self.hass.states.get(self.sun_entity_id)
+        if state is None:
+            return None
+        elevation = state.attributes.get("elevation")
+        azimuth = state.attributes.get("azimuth")
+        if not isinstance(elevation, (int, float)) or not isinstance(
+            azimuth, (int, float)
+        ):
+            return None
+        return {"elevation": elevation, "azimuth": azimuth}
+
     @property
     def _tracked_entities(self) -> set[str]:
         """Every entity whose changes re-render: mapped lights + sun +
         the script's resolved subscriptions."""
         entities = set(self.mapping.values())
-        if self.sun_enabled:
+        if self.sun_enabled and self.sun_fixed is None:
             entities.add(self.sun_entity_id)
         entities.update(self._script_entities)
         return entities
@@ -384,8 +431,10 @@ class SceneRenderCoordinator:
 
         Called at setup so the first sun change is compared against the
         state the initial render used, instead of always re-rendering.
+        No-op when the sun is disabled or fixed (a fixed sun never
+        changes).
         """
-        if not self.sun_enabled:
+        if not self.sun_enabled or self.sun_fixed is not None:
             return
         state = self.hass.states.get(self.sun_entity_id)
         if state is None:
@@ -399,7 +448,7 @@ class SceneRenderCoordinator:
 
     def _handle_sun_change(self) -> None:
         """Decide whether a sun update warrants a re-render (quantized)."""
-        if not self.sun_enabled:
+        if not self.sun_enabled or self.sun_fixed is not None:
             return
         state = self.hass.states.get(self.sun_entity_id)
         if state is None:
@@ -476,9 +525,10 @@ class SceneRenderCoordinator:
             self.status = STATUS_ERROR
             self.last_error = str(err)
         else:
-            self.renders = {name: data for name, (data, _, _) in renders.items()}
-            self.content_types = {name: ctype for name, (_, ctype, _) in renders.items()}
-            self.light_positions = {name: lights for name, (_, _, lights) in renders.items()}
+            self.renders = {name: data for name, (data, _, _, _) in renders.items()}
+            self.content_types = {name: ctype for name, (_, ctype, _, _) in renders.items()}
+            self.light_positions = {name: lights for name, (_, _, lights, _) in renders.items()}
+            self.render_ms = {name: ms for name, (_, _, _, ms) in renders.items()}
             self.last_rendered = dt_util.utcnow()
             self.status = STATUS_OK
             self.last_error = None
@@ -501,12 +551,16 @@ class SceneRenderCoordinator:
         }
         sun: dict[str, Any] | None = None
         if self.sun_enabled:
-            sun_state = self.hass.states.get(self.sun_entity_id)
-            if sun_state is not None:
-                sun = {
-                    "azimuth": sun_state.attributes.get("azimuth"),
-                    "elevation": sun_state.attributes.get("elevation"),
-                }
+            if self.sun_fixed is not None:
+                elevation, azimuth = self.sun_fixed
+                sun = {"azimuth": azimuth, "elevation": elevation}
+            else:
+                sun_state = self.hass.states.get(self.sun_entity_id)
+                if sun_state is not None:
+                    sun = {
+                        "azimuth": sun_state.attributes.get("azimuth"),
+                        "elevation": sun_state.attributes.get("elevation"),
+                    }
         # Entity snapshot for the user script: mapped lights + sun + the
         # script's subscriptions, sanitized to JSON-safe values. Entities
         # that do not exist (yet) are omitted.

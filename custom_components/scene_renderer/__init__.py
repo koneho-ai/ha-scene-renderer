@@ -9,8 +9,8 @@ defaults, so the demo model needs no onboarding at all:
 
     scene_renderer:
       lights:
-        living_room_ceiling: light.living_room
-        kitchen_counter: light.kitchen
+        living_room_1: light.living_room
+        kitchen_1: light.kitchen
 
 Full reference (all keys optional):
 
@@ -18,6 +18,11 @@ Full reference (all keys optional):
   add-on is discovered via the Supervisor API.
 - ``sun_entity``: sun entity to follow (default ``sun.sun``); set to
   null to disable the sun.
+- ``sun_elevation`` / ``sun_azimuth``: fix the sun at a position
+  (degrees, 0–90 / 0–360) instead of following ``sun_entity`` — e.g.
+  a high noon sun in winter, when the real sun never gets above the
+  rooftops. Both keys together or neither; the sun entity is then
+  only used by scene.js, if the script reads it.
 - ``name``: scene name, used for the device and entities
   (default "Scene Renderer").
 - ``lights``: mapping of model light names to HA entity ids. Only
@@ -47,6 +52,8 @@ from .const import (
     CONF_CAMERAS,
     CONF_LIGHTS,
     CONF_SERVICE_URL,
+    CONF_SUN_AZIMUTH,
+    CONF_SUN_ELEVATION,
     CONF_SUN_ENTITY,
     DEFAULT_NAME,
     DOMAIN,
@@ -59,24 +66,49 @@ from .supervisor import async_discover_addon_url
 
 _LOGGER = logging.getLogger(__name__)
 
+def _validate_sun_override(conf: dict[str, Any]) -> dict[str, Any]:
+    """Require sun_elevation and sun_azimuth together or neither.
+
+    A fixed sun needs both coordinates; one without the other is a
+    typo, not a partial override, so fail the config check loudly.
+    """
+    has_el = CONF_SUN_ELEVATION in conf
+    has_az = CONF_SUN_AZIMUTH in conf
+    if has_el != has_az:
+        raise vol.Invalid(
+            "Scene Renderer: sun_elevation and sun_azimuth must be "
+            "set together (or neither) — the sun needs both coordinates"
+        )
+    return conf
+
+
 CONFIG_SCHEMA = vol.Schema(
     {
         vol.Optional(DOMAIN): vol.Any(
             # A bare `scene_renderer:` line parses as None — that is a
             # valid (empty) configuration.
             None,
-            vol.Schema(
-                {
-                    vol.Optional(CONF_SERVICE_URL): cv.string,
-                    vol.Optional(
-                        CONF_SUN_ENTITY, default=SUN_ENTITY_ID
-                    ): vol.Any(cv.entity_id, None),
-                    vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
-                    vol.Optional(CONF_LIGHTS, default={}): {
-                        cv.string: cv.entity_id
-                    },
-                    vol.Optional(CONF_CAMERAS): [cv.string],
-                }
+            vol.All(
+                vol.Schema(
+                    {
+                        vol.Optional(CONF_SERVICE_URL): cv.string,
+                        vol.Optional(
+                            CONF_SUN_ENTITY, default=SUN_ENTITY_ID
+                        ): vol.Any(cv.entity_id, None),
+                        vol.Optional(CONF_SUN_ELEVATION): vol.All(
+                            vol.Coerce(float), vol.Range(min=0, max=90)
+                        ),
+                        vol.Optional(CONF_SUN_AZIMUTH): vol.All(
+                            vol.Coerce(float), vol.Range(min=0, max=360)
+                        ),
+                        vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+                        vol.Optional(CONF_LIGHTS, default={}): {
+                            cv.string: cv.entity_id
+                        },
+                        vol.Optional(CONF_CAMERAS): [cv.string],
+                    }
+                ),
+                _validate_sun_override,
             ),
         ),
     },
@@ -161,6 +193,8 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         hass,
         service_url=service_url,
         sun_entity_id=conf.get(CONF_SUN_ENTITY, SUN_ENTITY_ID),
+        sun_elevation=conf.get(CONF_SUN_ELEVATION),
+        sun_azimuth=conf.get(CONF_SUN_AZIMUTH),
         mapping=conf.get(CONF_LIGHTS, {}),
         cameras=conf.get(CONF_CAMERAS),
         name=conf.get(CONF_NAME, DEFAULT_NAME),

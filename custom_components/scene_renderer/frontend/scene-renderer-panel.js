@@ -23,6 +23,35 @@ const UNMAPPED_COLOR = 0xffffff; // model light with no HA entity
 const CAMERA_COLOR = 0x29b6f6;
 const SUN_COLOR = 0xffd54f;
 
+// Mesh shadow rules (mirror scene.mjs applyMeshShadowRules — the viewer
+// and the render service must treat a model identically):
+// - a mesh whose material is named "ShadowOnly" is invisible in the
+//   render but still casts shadows (the convention for a ceiling slab
+//   over a roofless dollhouse model, so the sun enters only through
+//   the windows while the top-down view stays open);
+// - a mesh whose materials are all transparent (glass) casts no shadow.
+const SHADOW_ONLY_MATERIAL = "ShadowOnly";
+
+function materialsOf(obj) {
+  if (Array.isArray(obj.material)) return obj.material;
+  return obj.material ? [obj.material] : [];
+}
+
+function applyMeshShadowRules(obj) {
+  const mats = materialsOf(obj);
+  if (mats.some((m) => m.name === SHADOW_ONLY_MATERIAL)) {
+    for (const m of mats) {
+      m.colorWrite = false;
+      m.depthWrite = false;
+    }
+    obj.castShadow = true;
+    obj.receiveShadow = false;
+    return;
+  }
+  obj.castShadow = !(mats.length > 0 && mats.every((m) => m.transparent));
+  obj.receiveShadow = true;
+}
+
 // --- color helpers (mirror the integration's normalize_light_state) ---
 
 /** Kelvin to [r, g, b] 0-255 (Tanner Helland approximation). */
@@ -98,7 +127,7 @@ class SceneRendererPanel extends HTMLElement {
     this._loadState = "loading"; // loading | ready | error | no-entries
     this._entries = [];
     this._entryId = null;
-    this._panelData = null; // { mapping, cameras, image_entities }
+    this._panelData = null; // { mapping, cameras, image_entities, sun }
     this._stateMap = new Map();
 
     // three.js objects (created once, model swapped per entry)
@@ -664,9 +693,10 @@ class SceneRendererPanel extends HTMLElement {
       if (obj.isCamera && obj.name) this._modelCameras.set(obj.name, obj);
       if (obj.isMesh) {
         // Model meshes cast and receive shadows (markers live in the
-        // group, not the model scene, so they stay shadow-free).
-        obj.castShadow = true;
-        obj.receiveShadow = true;
+        // group, not the model scene, so they stay shadow-free), except
+        // ShadowOnly meshes (invisible, still casting) and fully
+        // transparent ones (glass casts no shadow).
+        applyMeshShadowRules(obj);
       }
       if (!obj.isLight || !obj.name) return;
       // Every model light casts shadows (point lights: cube maps).
@@ -914,7 +944,34 @@ class SceneRendererPanel extends HTMLElement {
     return stops[stops.length - 1][1].map((v) => Math.round(v * 255));
   }
 
-  /** Drive the directional sun light + hemisphere from sun.sun.
+  // The sun position the renders use: the coordinator's effective sun
+  // from panel_data (fixed override, live sun.sun, or null when the
+  // sun is disabled) — so the viewer agrees with the images. When
+  // panel_data has no sun field yet (older integration), fall back to
+  // the sun.sun state. Returns { azimuth, elevation } or null.
+  _effectiveSun() {
+    if (this._panelData && "sun" in this._panelData) {
+      const panelSun = this._panelData.sun;
+      if (
+        panelSun &&
+        typeof panelSun.azimuth === "number" &&
+        typeof panelSun.elevation === "number"
+      ) {
+        return panelSun;
+      }
+      return null;
+    }
+    const sun = this._state("sun.sun");
+    if (!sun || !sun.attributes) return null;
+    const { azimuth, elevation } = sun.attributes;
+    if (typeof azimuth !== "number" || typeof elevation !== "number") {
+      return null;
+    }
+    return { azimuth, elevation };
+  }
+
+  /** Drive the directional sun light + hemisphere from the effective
+  sun (see _effectiveSun).
 
   Mirrors the render service's applySun: intensity ramps 0 at the
   horizon to 3.0 at 30 degrees, color warms toward the horizon, and
@@ -922,16 +979,16 @@ class SceneRendererPanel extends HTMLElement {
   sun state is available). Below the horizon the sun light is off. */
   _updateSunLight() {
     if (!this._sunLight || !this._hemi) return;
-    const sun = this._state("sun.sun");
-    if (!sun || !sun.attributes) {
+    const sun = this._effectiveSun();
+    if (!sun) {
       this._sunLight.intensity = 0;
       this._hemi.intensity = 0.5;
       this._requestShadowUpdate();
       return;
     }
-    const az = sun.attributes.azimuth;
-    const el = sun.attributes.elevation;
-    if (typeof az !== "number" || typeof el !== "number" || el < 0) {
+    const az = sun.azimuth;
+    const el = sun.elevation;
+    if (el < 0) {
       this._sunLight.intensity = 0;
       this._hemi.intensity = 0.06;
       this._requestShadowUpdate();
@@ -964,14 +1021,14 @@ class SceneRendererPanel extends HTMLElement {
 
   _updateSunMarker() {
     if (!this._sunMarker) return;
-    const sun = this._state("sun.sun");
-    if (!sun || !sun.attributes) {
+    const sun = this._effectiveSun();
+    if (!sun) {
       this._sunMarker.visible = false;
       return;
     }
-    const az = sun.attributes.azimuth;
-    const el = sun.attributes.elevation;
-    if (typeof az !== "number" || typeof el !== "number" || el < 0) {
+    const az = sun.azimuth;
+    const el = sun.elevation;
+    if (el < 0) {
       // Below the horizon (or no data): hide the sun.
       this._sunMarker.visible = false;
       return;

@@ -55,6 +55,48 @@ const POINT_SHADOW_MAP_SIZE = 1024;
 const POINT_SHADOW_BIAS = -0.004;
 const POINT_SHADOW_NORMAL_BIAS = 0.02;
 
+// A mesh whose material is named "ShadowOnly" is invisible in the render
+// but still casts shadows: the convention for a ceiling slab over a
+// roofless dollhouse model, so the sun enters only through the windows
+// while the top-down view stays open. (The panel viewer mirrors this;
+// see scene-renderer-panel.js.)
+const SHADOW_ONLY_MATERIAL = "ShadowOnly";
+
+function materialsOf(obj) {
+  if (Array.isArray(obj.material)) return obj.material;
+  return obj.material ? [obj.material] : [];
+}
+
+function hasShadowOnlyMaterial(obj) {
+  return materialsOf(obj).some((m) => m.name === SHADOW_ONLY_MATERIAL);
+}
+
+// A mesh whose materials are all transparent (glass) does not block
+// light: with castShadow it would throw a solid shadow, so it casts
+// none. A mesh with any opaque material still casts.
+function allMaterialsTransparent(obj) {
+  const mats = materialsOf(obj);
+  return mats.length > 0 && mats.every((m) => m.transparent);
+}
+
+// Apply the shadow/material rules to one model mesh at load: ShadowOnly
+// meshes write neither color nor depth (invisible, no occlusion) but
+// keep casting — the shadow pass uses its own depth material and is
+// unaffected by colorWrite/depthWrite. Exported for tests.
+export function applyMeshShadowRules(obj) {
+  if (hasShadowOnlyMaterial(obj)) {
+    for (const m of materialsOf(obj)) {
+      m.colorWrite = false;
+      m.depthWrite = false;
+    }
+    obj.castShadow = true;
+    obj.receiveShadow = false;
+    return;
+  }
+  obj.castShadow = !allMaterialsTransparent(obj);
+  obj.receiveShadow = true;
+}
+
 // ---------------------------------------------------------------------------
 // Kelvin -> RGB (Tanner / Charity approximation, as used by most tools).
 // Input kelvin, output [r, g, b] in 0..255.
@@ -117,8 +159,7 @@ export async function loadModel(arrayBuffer) {
   const cameras = new Map();
   scene.traverse((obj) => {
     if (obj.isMesh) {
-      obj.castShadow = true;
-      obj.receiveShadow = true;
+      applyMeshShadowRules(obj);
     }
     if (obj.isLight && obj.name) {
       obj.userData.baseIntensity = obj.intensity;
@@ -893,7 +934,11 @@ export function projectLights(model, info, cfg) {
 //   setSize(width, height) — resize the drawing buffer for a camera.
 //   capture() — return the current frame (Buffer in Node, data URL in the
 //     browser page).
-// Returns { cameraName: capture() } for every requested camera that exists.
+// Returns { images, render_ms }: { cameraName: capture() } for every
+// requested camera that exists, plus the wall-clock milliseconds each
+// camera's renderFrame took (the integration exposes it as the image
+// entity's render_ms attribute). Projection is not timed — it is
+// metadata about the image, not the render itself.
 // `script` is a compiled script handle (or null); `entities` is the frozen
 // entity snapshot the script reads.
 export function renderCameras({
@@ -913,6 +958,7 @@ export function renderCameras({
   log = () => {},
 }) {
   const out = {};
+  const renderMs = {};
   for (const name of cameras) {
     const info = getCameraInfo(model, name);
     if (!info) {
@@ -920,6 +966,7 @@ export function renderCameras({
       continue;
     }
     const cfg = resolveCameraConfig(info, fileConfig?.[name], { width, height }, log);
+    const started = Date.now();
     out[name] = renderFrame({
       renderer,
       model,
@@ -936,8 +983,9 @@ export function renderCameras({
       onScriptError,
       log,
     });
+    renderMs[name] = Date.now() - started;
   }
-  return out;
+  return { images: out, render_ms: renderMs };
 }
 
 // Restore a model camera to the base values captured at load time, so a

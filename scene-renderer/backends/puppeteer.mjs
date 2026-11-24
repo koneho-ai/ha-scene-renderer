@@ -109,7 +109,9 @@ export async function createBackend({ serverUrl, log }) {
       }
       const out = {};
       if (stillNames.length > 0) {
-        const dataUrls = await page.evaluate(
+        // __render returns { images, render_ms } (per-camera wall
+        // clock, see scene.mjs renderCameras).
+        const result = await page.evaluate(
           (args) => window.__render(args),
           {
             lights: lightStates || {},
@@ -121,12 +123,17 @@ export async function createBackend({ serverUrl, log }) {
             fileConfig: fileConfig || {},
           },
         );
-        for (const [name, dataUrl] of Object.entries(dataUrls)) {
-          out[name] = { data: dataUrlToBuffer(dataUrl), contentType: "image/png" };
+        for (const [name, dataUrl] of Object.entries(result.images)) {
+          out[name] = {
+            data: dataUrlToBuffer(dataUrl),
+            contentType: "image/png",
+            render_ms: result.render_ms?.[name] ?? null,
+          };
         }
       }
       for (const { name, cfg } of clipCameras) {
         const frames = [];
+        const clipStarted = Date.now();
         // Shadow maps render once (frame 0) and freeze for the rest of
         // the clip (see __renderFrame's freezeShadows): with 5 point
         // lights at 6 faces each, re-rendering shadows every frame
@@ -157,6 +164,9 @@ export async function createBackend({ serverUrl, log }) {
         out[name] = {
           data: await encodeClip(frames, { width: cfg.width, height: cfg.height, fps: cfg.clip.fps }),
           contentType: "image/webp",
+          // Clip render_ms covers frames + WebP encoding: the whole
+          // cost of producing this image.
+          render_ms: Date.now() - clipStarted,
         };
       }
       // Projected light positions, once per rendered camera (not per clip

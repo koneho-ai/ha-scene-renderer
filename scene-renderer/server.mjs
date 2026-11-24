@@ -379,6 +379,10 @@ const server = createServer(async (req, res) => {
           encoded[name] = {
             data: render.data.toString("base64"),
             content_type: render.contentType,
+            // Wall-clock milliseconds the render of this camera took
+            // (frames + encoding for clips); the integration exposes
+            // it as the image entity's render_ms attribute.
+            render_ms: render.render_ms ?? null,
             // Projected light positions for this camera (see scene.mjs
             // projectLights): [{ name, x_px, y_px, x_pct, y_pct, visible }].
             lights: render.lights || [],

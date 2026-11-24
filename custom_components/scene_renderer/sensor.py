@@ -52,6 +52,7 @@ class SceneRenderSensor(SensorEntity):
         """Return render diagnostics."""
         coordinator = self.coordinator
         script = coordinator.script_status
+        sun = coordinator.sun_position()
         return {
             "last_render": (
                 coordinator.last_rendered.isoformat()
@@ -64,6 +65,9 @@ class SceneRenderSensor(SensorEntity):
             "service_url": coordinator.service_url,
             "cameras": list(coordinator.cameras),
             "mapped_lights": len(coordinator.mapping),
+            "sun_elevation": sun["elevation"] if sun else None,
+            "sun_azimuth": sun["azimuth"] if sun else None,
+            "sun_fixed": coordinator.sun_fixed is not None,
             "script_status": script.get("status"),
             "script_hash": script.get("hash"),
             "script_subscriptions": list(script.get("subscribe") or []),

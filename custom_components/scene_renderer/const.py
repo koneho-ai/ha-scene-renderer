@@ -13,6 +13,8 @@ ADDON_PORT = 3000
 # The integration is YAML-only: there is no config flow.
 CONF_SERVICE_URL = "service_url"
 CONF_SUN_ENTITY = "sun_entity"
+CONF_SUN_ELEVATION = "sun_elevation"
+CONF_SUN_AZIMUTH = "sun_azimuth"
 CONF_LIGHTS = "lights"
 CONF_CAMERAS = "cameras"
 
@@ -21,10 +23,9 @@ SUN_ENTITY_ID = "sun.sun"
 DEFAULT_NAME = "Scene Renderer"
 
 # YAML-only setup has a single instance, identified as "yaml" everywhere
-# an id is needed: the hass.data key, entity unique_ids, device
-# identifiers, and the panel API's entry_id. The panel API keeps the
-# entry_id concept (one entry, id "yaml") so the panel needs no
-# special-casing for the single-instance setup.
+# an id is needed: the hass.data key, entity unique_ids, and the panel
+# API's entry_id. (There is no device: YAML-only setups have no config
+# entry, so no device attaches — see image.py.)
 YAML_CONFIG_ID = "yaml"
 
 # How long to wait after a light change before rendering (coalesces bursts).

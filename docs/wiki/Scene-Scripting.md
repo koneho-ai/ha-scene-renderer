@@ -46,11 +46,12 @@ Note there is no separate sun parameter: `sun.sun` is an entity like any other, 
 
 ## The bundled example
 
-`scene.example.js` does three things against the sample apartment (subscribing to `sun.sun`):
+`scene.example.js` drives the sample model's living room TV from the Samsung TV's Plex client (subscribing to `media_player.plex_plex_for_samsung_tv_2023`) and its ceiling fan from a light:
 
-1. **Spinning fan** — `ceiling_fan.rotation.y = loop * Math.PI * 2`, one whole turn per loop. This overrides the model's own `ceiling_fan_spin` glTF animation (the script runs after the glTF animation is sampled); delete the block to let the built-in animation spin the fan.
-2. **Flickering lamp** — scales the `living_room_lamp` intensity (already set from the entity state by the built-in mapping) by `0.88 + 0.12 * sin(loop * 2π * 3)`, three full sine periods per loop so it stays periodic. Only when the lamp is on.
-3. **Blinds follow the sun** — reads `sun.sun`'s elevation, maps 0–30° to 0–1, and sets the `blinds` group's `position.y` from 1.2 (low sun, blinds down) to 2.0 (high sun, blinds up).
+- **TV on/off** — when Plex is playing, paused, or idle, the TV is on: the `tv_screen` mesh becomes visible and the `living_room_tv` point light in front of the screen glows. When Plex is unavailable, the screen goes dark — but the light is left alone, because `living_room_tv` is mapped as a light in the YAML and its entity drives the glow when the TV is off. (Limitation: if the TV is on but Plex is not running, the client is unavailable and the glow stays off — swap in a better "TV is on" entity, e.g. a smart plug, if you have one.)
+- **Colorful glow** — while on, the light's color drifts slowly through the hues (one full cycle every 20 s) with a fast flicker on top, like a real screen. Absolute values from `time`, so frames stay independent; a still gets a fixed color, a clip shows the glow shifting.
+- **Ceiling fan** — the `ceiling_fan` group spins when `light.wizcolor1` is on (one full turn per loop, so clips loop seamlessly) and parks at 0 when it is off. Any light works here; the point is that a script can drive an object from any entity.
+- **Defensive** — each block bails out quietly (`hasLight`/`hasObject`) when the model lacks its parts, so the same file works against any model.
 
 ## Security model
 

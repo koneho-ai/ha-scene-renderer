@@ -102,21 +102,26 @@ class RenderServiceClient:
 
     async def async_render(
         self, payload: dict[str, Any]
-    ) -> tuple[dict[str, tuple[bytes, str, list[dict[str, Any]]]], dict[str, Any]]:
+    ) -> tuple[dict[str, tuple[bytes, str, list[dict[str, Any]], int | None]], dict[str, Any]]:
         """POST /render.
 
-        Returns ({camera_name: (bytes, content_type, lights)}, script_info).
+        Returns ({camera_name: (bytes, content_type, lights, render_ms)},
+        script_info).
         Stills come back as image/png; cameras with a clip: entry in
         cameras.yaml come back as image/webp (animated). ``lights`` is the
         per-camera projection of the model lights into image coordinates
         ([{name, x_px, y_px, x_pct, y_pct, visible}], see scene.mjs
         projectLights); [] when the service does not send it (older
-        versions). The script info is the /script status block
+        versions). ``render_ms`` is the wall-clock milliseconds the
+        service spent rendering that camera (frames + encoding for
+        clips); None when the service does not send it (older versions
+        or the legacy shape). The script info is the /script status block
         (present/hash/subscribe/status/...), so the coordinator can
         re-subscribe when the script changes.
 
         Accepts the legacy v1 response shape too (renders as plain base64
-        strings), treating those as image/png with no light projections.
+        strings), treating those as image/png with no light projections
+        and no render time.
         """
 
         try:
@@ -135,15 +140,17 @@ class RenderServiceClient:
         renders = data.get("renders")
         if not isinstance(renders, dict):
             raise RenderServiceError("render service returned an unexpected /render response")
-        out: dict[str, tuple[bytes, str, list[dict[str, Any]]]] = {}
+        out: dict[str, tuple[bytes, str, list[dict[str, Any]], int | None]] = {}
         for name, rendered in renders.items():
             if isinstance(rendered, str):
                 # Legacy v1 shape: plain base64 PNG.
                 encoded, content_type, lights = rendered, "image/png", []
+                render_ms = None
             elif isinstance(rendered, dict):
                 encoded = rendered.get("data")
                 content_type = rendered.get("content_type", "image/png")
                 lights = rendered.get("lights", [])
+                render_ms = rendered.get("render_ms")
                 if not isinstance(encoded, str) or not isinstance(content_type, str):
                     raise RenderServiceError(
                         "render service returned an unexpected /render response"
@@ -152,10 +159,15 @@ class RenderServiceClient:
                     raise RenderServiceError(
                         "render service returned an unexpected /render response"
                     )
+                if render_ms is not None and not isinstance(render_ms, (int, float)):
+                    raise RenderServiceError(
+                        "render service returned an unexpected /render response"
+                    )
+                render_ms = int(render_ms) if render_ms is not None else None
             else:
                 raise RenderServiceError("render service returned an unexpected /render response")
             try:
-                out[name] = (base64.b64decode(encoded, validate=True), content_type, lights)
+                out[name] = (base64.b64decode(encoded, validate=True), content_type, lights, render_ms)
             except ValueError as err:
                 raise RenderServiceError(f"render service returned invalid image data for camera {name!r}") from err
         script = data.get("script")

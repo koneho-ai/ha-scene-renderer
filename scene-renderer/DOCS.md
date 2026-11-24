@@ -162,7 +162,7 @@ hash, subscriptions, last error) is in `GET /health` and
 Put a `.glb` file in `/share/scene-renderer/models/` (create the folder
 if needed), set the `model` option to its file name, and restart the
 app. The model should use glTF `KHR_lights_punctual` lights with
-unique `snake_case` names (e.g. `living_room_ceiling`) — those names are
+unique `snake_case` names (e.g. `living_room_1`) — those names are
 what the integration maps to your light entities. The bundled sample
 apartment has 5 named lights across 4 rooms.
 

@@ -9,16 +9,18 @@ Assistant. Every key is optional:
 ```yaml
 scene_renderer:
   lights:
-    living_room_ceiling: light.living_room
-    kitchen_counter: light.kitchen
+    living_room_1: light.living_room
+    kitchen_1: light.kitchen
 ```
 
 | Key | Default | Notes |
 | --- | --- | --- |
 | `service_url` | discovered | Base URL of the render service. Only needed if Supervisor discovery fails (e.g. the app runs outside the Supervisor); usually something like `http://a1b2c3d4-scene-renderer:3000` |
 | `sun_entity` | `sun.sun` | Sun entity to follow; set to `null` to disable the sun |
+| `sun_elevation` | — | Fix the sun at this elevation (0–90°); requires `sun_azimuth` |
+| `sun_azimuth` | — | Fix the sun at this azimuth (0–360°); requires `sun_elevation` |
 | `name` | `Scene Renderer` | Scene name, used for the device and entities |
-| `lights` | `{}` | Mapping of model light names (e.g. `living_room_ceiling`) to HA light entity ids |
+| `lights` | `{}` | Mapping of model light names (e.g. `living_room_1`) to HA light entity ids |
 | `cameras` | all | Camera names to expose, one image entity each; omit to expose every camera the app offers |
 
 Only the lights you map follow live state; unmapped lights render at
@@ -82,10 +84,28 @@ in the panel's 3D viewer: each model light renders a shadow map
 mesh casts and receives. Off lights cast nothing, so they cost no
 shadow passes. Shadow maps in the viewer update only when a light
 or the sun changes, and motion clips render shadows once and freeze
-them for the rest of the clip — re-rendering 5 cube maps every
-frame would be 30 extra scene renders per frame. Renders take
-longer with shadows on (a 1280×720 still with all 5 lights on is
-roughly 5 seconds on the test machine, up from under a second).
+them for the rest of the clip — re-rendering 14 cube maps every
+frame would be 84 extra scene renders per frame. Renders take
+longer with shadows on (a 1280×720 still with all 14 lights on is
+roughly 13 seconds on the test machine, up from under a second).
+0.3.5 also adds a `render_ms` attribute to each image entity: the
+wall-clock milliseconds the service spent rendering that camera's
+latest image (frames + encoding for clips), so you can see what the
+shadows cost per camera. And 0.3.5 replaces the sample model with a
+new 8-room house (14 lights, a TV driven by `scene.js`, one window
+per room) plus an invisible shadow-casting ceiling — a mesh whose
+material is named `ShadowOnly` renders as nothing but still casts
+shadows, so the sun enters only through the windows. Meshes whose
+materials are all transparent (glass) cast no shadow. 0.3.5 also
+lets you pin the sun with `sun_elevation` + `sun_azimuth` in the
+YAML — a fixed high sun instead of following `sun.sun`, handy in
+winter when the real sun never gets high — adds door openings and a
+ceiling fan (script-driven, spins when its light is on) to the
+sample house, maps the TV as a light (`living_room_tv`, driven by
+its mapped entity when the TV is off and by `scene.js` when it is
+on), and fixes scene.js in the default backend: an SES import bug
+had silently disabled user scripts under node-webgl, so scene.js
+only ever ran under the Puppeteer fallback.
 
 ## How lights are rendered
 
@@ -113,7 +133,7 @@ Each image entity carries a `lights` attribute: the service projects every model
 
 | Field | Meaning |
 | --- | --- |
-| `name` | Model light name (e.g. `living_room_ceiling`) |
+| `name` | Model light name (e.g. `living_room_1`) |
 | `entity_id` | Mapped HA entity, or `null` when unmapped |
 | `state` | The entity's live state (`on`, `off`, `unavailable`, …), or `null` |
 | `brightness` | The entity's live brightness, 0–1, or `null` |
@@ -125,11 +145,32 @@ The percentages are the stable values if the image is displayed scaled; the pixe
 
 Use it to overlay markers or controls on the render — e.g. a picture-elements card with a `state-icon` per light positioned with `top`/`left` from `x_pct`/`y_pct`, or a template that reads the attributes. The attributes update on every render, so an automation that needs them should trigger on the image entity's state change.
 
+Each image entity also carries a `render_ms` attribute: the wall-clock milliseconds the render service spent rendering that camera's latest image (frames + WebP encoding for clips). Useful to see what the shadows cost, or to spot a camera that renders slowly.
+
 ## The sun
 
-With sun enabled, the service adds a directional light from `sun.sun`'s `azimuth` and `elevation` attributes: position, warm-to-neutral color by elevation, and intensity ramping in over the first 30° above the horizon. Below the horizon the sun is off and the interior lights carry the scene. The sun casts the shadows; the model's point lights do not (performance).
+With sun enabled, the service adds a directional light from `sun.sun`'s `azimuth` and `elevation` attributes: position, warm-to-neutral color by elevation, and intensity ramping in over the first 30° above the horizon. Below the horizon the sun is off and the interior lights carry the scene. Every light casts shadows — the sun and each model light (point lights use cube shadow maps); off lights cast nothing. Shadow maps in the panel viewer update only when a light or the sun changes, and motion clips render shadows once and freeze them for the rest of the clip.
 
 Renders are debounced (~1 s after a light change), serialized, and at most one every ~2 s. The sun re-renders when its elevation crosses a 5° step, on sunrise/sunset, or at most every 15 minutes while it is up.
+
+### Pinning the sun
+
+In winter the real sun stays low all day, which makes for long raking
+shadows and a dim interior. `sun_elevation` + `sun_azimuth` fix the
+sun at one position instead of following `sun.sun`:
+
+```yaml
+scene_renderer:
+  sun_elevation: 60
+  sun_azimuth: 180
+```
+
+Both keys together or neither (one alone fails the config check).
+Elevation is 0–90°, azimuth 0–360° (0 = north, 180 = south). A fixed
+sun never changes, so the integration stops re-rendering on sun
+updates; the panel viewer shows the same fixed sun, and the status
+sensor reports `sun_elevation`, `sun_azimuth` and `sun_fixed: true`.
+`sun.sun` is still sent to `scene.js` if the script reads it.
 
 ## Where your files live
 
@@ -184,7 +225,7 @@ The app listens on port 3000 inside the container (no host port mapping needed �
 ```json
 {
   "lights": {
-    "living_room_ceiling": {
+    "living_room_1": {
       "on": true, "brightness": 0.8,
       "color": [255, 180, 120], "color_temp_k": null
     }
@@ -197,4 +238,4 @@ The app listens on port 3000 inside the container (no host port mapping needed �
 }
 ```
 
-Response: `{"renders": {"overview": {"data": "<base64>", "content_type": "image/png", "lights": [{"name": "living_room_ceiling", "x_px": 606, "y_px": 212, "x_pct": 47.3, "y_pct": 29.4, "visible": true}]}, "living_room": {"data": "<base64>", "content_type": "image/webp", "lights": [...]}}, "script": {...}}`. `lights` is the per-camera projection of the model lights into image coordinates (see Light positions above): computed once per render, `visible` when the light is in frame, `null` coordinates when it is behind the camera. Any of `lights`, `sun`, `entities`, `cameras` may be omitted; omitting `cameras` renders all cameras. `sun: null` disables the sun for that render. Unknown camera names are ignored; a request with no known cameras returns HTTP 400. Per-camera size, FOV, position, background, exposure, and clip come from the effective camera config (see `cameras.yaml` above), not the request.
+Response: `{"renders": {"overview": {"data": "<base64>", "content_type": "image/png", "lights": [{"name": "living_room_1", "x_px": 606, "y_px": 212, "x_pct": 47.3, "y_pct": 29.4, "visible": true}]}, "living_room": {"data": "<base64>", "content_type": "image/webp", "lights": [...]}}, "script": {...}}`. `lights` is the per-camera projection of the model lights into image coordinates (see Light positions above): computed once per render, `visible` when the light is in frame, `null` coordinates when it is behind the camera. `render_ms` is the wall-clock milliseconds that camera's render took (frames + encoding for clips). Any of `lights`, `sun`, `entities`, `cameras` may be omitted; omitting `cameras` renders all cameras. `sun: null` disables the sun for that render. Unknown camera names are ignored; a request with no known cameras returns HTTP 400. Per-camera size, FOV, position, background, exposure, and clip come from the effective camera config (see `cameras.yaml` above), not the request.

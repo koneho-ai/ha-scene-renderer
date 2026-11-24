@@ -41,8 +41,8 @@ The integration is YAML-only — there is no UI setup flow. Add a `scene_rendere
 ```yaml
 scene_renderer:
   lights:
-    living_room_ceiling: light.living_room
-    kitchen_counter: light.kitchen
+    living_room_1: light.living_room
+    kitchen_1: light.kitchen
 ```
 
 Every key is optional — a bare `scene_renderer:` line works. See [[Configuration]] for the full reference and the 0.2.x migration notes.

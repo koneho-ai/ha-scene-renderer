@@ -94,13 +94,18 @@ def _migrate_bare_entity_ids(
     0.3.0 used ``has_entity_name`` + ``device_info``, but a YAML-only
     setup has no config entry, so no device ever attached and the
     entities registered as ``image.overview``,
-    ``sensor.render_status`` and ``button.re_render``. The entity
-    registry keeps a registered id even when the suggested name
-    changes, so the stale entries must be removed for the entities to
-    re-register under their new scene-prefixed names. Only entries
-    that still carry the exact bare id are removed — an entry the user
-    renamed, or one already migrated, is left alone, and the migration
-    is a no-op on fresh installs.
+    ``sensor.render_status`` and ``button.re_render``. The registry
+    keeps a registered id even when the suggested name changes, so
+    the entries are renamed in place to their scene-prefixed ids.
+
+    Rename, not remove + re-add: ``async_remove`` stashes the entry
+    in ``deleted_entities``, and ``async_get_or_create`` restores
+    the old entity_id when the entity is re-added moments later —
+    0.3.1/0.3.2 removed the entries and HA faithfully gave the bare
+    ids straight back. Only entries that still carry the exact bare
+    id are renamed — an entry the user renamed, or one already
+    migrated, is left alone, and the migration is a no-op on fresh
+    installs.
     """
     registry = er.async_get(hass)
     name = coordinator.name
@@ -122,11 +127,21 @@ def _migrate_bare_entity_ids(
         if old_id == new_id:
             continue
         entity_id = registry.async_get_entity_id(domain, DOMAIN, unique_id)
-        if entity_id == old_id:
-            _LOGGER.info(
-                "Scene Renderer: migrating %s to %s", entity_id, new_id
+        if entity_id != old_id:
+            continue
+        try:
+            registry.async_update_entity(entity_id, new_entity_id=new_id)
+        except ValueError:
+            _LOGGER.warning(
+                "Scene Renderer: could not migrate %s to %s "
+                "(new id already in use?)",
+                entity_id,
+                new_id,
             )
-            registry.async_remove(entity_id)
+            continue
+        _LOGGER.info(
+            "Scene Renderer: migrated %s to %s", entity_id, new_id
+        )
 
 
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:

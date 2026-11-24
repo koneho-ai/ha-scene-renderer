@@ -99,6 +99,12 @@ and restart.
 > `homeassistant.util`). If 0.3.1 left the entities unavailable and
 > the panel missing, update to 0.3.2 and restart — the migration runs
 > on setup and everything comes back under the new ids.
+>
+> **0.3.3** fixes the migration itself: 0.3.1/0.3.2 removed the bare
+> registry entries, but HA stashes removed entries in
+> `deleted_entities` and restores the old id when the entity is
+> re-added, so the bare ids came straight back. 0.3.3 renames the
+> entries in place instead, which sticks.
 
 ## What you get in Home Assistant
 

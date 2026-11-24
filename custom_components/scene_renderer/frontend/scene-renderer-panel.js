@@ -198,6 +198,29 @@ class SceneRendererPanel extends HTMLElement {
           overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
         }
         .row-state { font-size: 12px; color: var(--secondary-text-color, #727272); }
+        .switch {
+          position: relative; display: inline-block;
+          width: 36px; height: 20px; flex-shrink: 0;
+        }
+        .switch input { opacity: 0; width: 0; height: 0; }
+        .switch .slider {
+          position: absolute; cursor: pointer; inset: 0;
+          background-color: var(--divider-color, #ccc);
+          border-radius: 20px; transition: background-color 0.2s;
+        }
+        .switch .slider:before {
+          position: absolute; content: "";
+          height: 16px; width: 16px; left: 2px; top: 2px;
+          background-color: white; border-radius: 50%;
+          transition: transform 0.2s;
+        }
+        .switch input:checked + .slider {
+          background-color: var(--primary-color, #03a9f4);
+        }
+        .switch input:checked + .slider:before {
+          transform: translateX(16px);
+        }
+        .switch input:disabled + .slider { opacity: 0.5; cursor: default; }
         .preview img { max-width: 100%; border-radius: 4px; display: block; }
         .preview .none {
           font-size: 13px; color: var(--secondary-text-color, #727272);
@@ -286,11 +309,13 @@ class SceneRendererPanel extends HTMLElement {
 
   connectedCallback() {
     this._connected = true;
+    this._fixParentHeight();
     this._maybeInit();
   }
 
   disconnectedCallback() {
     this._connected = false;
+    this._restoreParentHeight();
     if (this._animationFrame !== null) {
       cancelAnimationFrame(this._animationFrame);
       this._animationFrame = null;
@@ -302,6 +327,31 @@ class SceneRendererPanel extends HTMLElement {
     if (this._controls) this._controls.dispose();
     if (this._renderer) this._renderer.dispose();
     if (this._previewUrl) URL.revokeObjectURL(this._previewUrl);
+  }
+
+  // --- parent height ---------------------------------------------------
+  // ha-panel-custom ships with no styles of its own (an inline element
+  // with auto height), so our :host { height: 100% } resolves against
+  // an auto-height parent and the panel collapses to content height,
+  // leaving a black gap at the bottom of the page. The rest of the
+  // chain is full-height (partial-panel-resolver is display:block,
+  // height:100% inside home-assistant-main), so giving the parent a
+  // definite height completes it. Only touches the real HA parent;
+  // harmless in any other host (tests, iframe embedding).
+  _fixParentHeight() {
+    const parent = this.parentElement;
+    if (!parent || parent.tagName !== "HA-PANEL-CUSTOM") return;
+    this._parentPrevDisplay = parent.style.display;
+    this._parentPrevHeight = parent.style.height;
+    parent.style.display = "block";
+    parent.style.height = "100%";
+  }
+
+  _restoreParentHeight() {
+    const parent = this.parentElement;
+    if (!parent || parent.tagName !== "HA-PANEL-CUSTOM") return;
+    parent.style.display = this._parentPrevDisplay || "";
+    parent.style.height = this._parentPrevHeight || "";
   }
 
   // --- state helpers ---------------------------------------------------
@@ -806,11 +856,51 @@ class SceneRendererPanel extends HTMLElement {
       li.appendChild(dot);
       li.appendChild(main);
       li.appendChild(stateEl);
+      // Toggle switch for mapped lights: flips the HA entity so the
+      // render can be tested from here. The row click still selects
+      // the light for details; the switch stops propagation so the
+      // two don't fight. Only light-domain entities get a switch.
+      let toggleInput = null;
+      if (entityId && entityId.startsWith("light.")) {
+        const label = document.createElement("label");
+        label.className = "switch";
+        toggleInput = document.createElement("input");
+        toggleInput.type = "checkbox";
+        toggleInput.setAttribute("aria-label", `Toggle ${marker.name}`);
+        const slider = document.createElement("span");
+        slider.className = "slider";
+        label.appendChild(toggleInput);
+        label.appendChild(slider);
+        label.addEventListener("click", (ev) => ev.stopPropagation());
+        toggleInput.addEventListener("change", () =>
+          this._toggleLight(entityId),
+        );
+        li.appendChild(label);
+      }
       li.addEventListener("click", () => this._selectLight(marker.name));
       list.appendChild(li);
-      this._lightRows.set(marker.name, { dot, stateEl });
+      this._lightRows.set(marker.name, { dot, stateEl, toggleInput });
     }
     this._updateLightList();
+  }
+
+  async _toggleLight(entityId) {
+    if (!this._hass || typeof this._hass.callService !== "function") return;
+    try {
+      await this._hass.callService("light", "toggle", {
+        entity_id: entityId,
+      });
+    } catch (err) {
+      // Snap the switch back: the state never changed, so the next
+      // hass update alone might take a while to correct it.
+      this._updateLightList();
+      this._setState(
+        "ready",
+        `Toggle failed: ${err && err.message ? err.message : err}`,
+        "",
+        false,
+      );
+    }
   }
 
   _updateLightList() {
@@ -820,6 +910,11 @@ class SceneRendererPanel extends HTMLElement {
       row.dot.style.backgroundColor = `rgb(${app.rgb[0]},${app.rgb[1]},${app.rgb[2]})`;
       row.dot.style.opacity = String(app.opacity);
       row.stateEl.textContent = app.state;
+      if (row.toggleInput) {
+        row.toggleInput.checked = app.state === "on";
+        row.toggleInput.disabled =
+          app.state === "unavailable" || app.state === "unknown";
+      }
     }
   }
 

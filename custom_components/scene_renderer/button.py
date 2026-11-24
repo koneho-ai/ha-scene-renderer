@@ -6,7 +6,6 @@ from typing import Any
 from homeassistant.components.button import ButtonEntity
 from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, YAML_CONFIG_ID
@@ -27,19 +26,15 @@ async def async_setup_platform(
 class SceneRenderButton(ButtonEntity):
     """Force a re-render of the scene."""
 
-    _attr_has_entity_name = True
     _attr_entity_category = EntityCategory.DIAGNOSTIC
 
     def __init__(self, coordinator: SceneRenderCoordinator) -> None:
         self.coordinator = coordinator
         self._attr_unique_id = f"{YAML_CONFIG_ID}_rerender"
-        self._attr_name = "Re-render"
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, YAML_CONFIG_ID)},
-            name=coordinator.name,
-            manufacturer="HA Scene Renderer",
-            model="3D scene render",
-        )
+        # Full name, scene included (see image.py: no device attaches
+        # for YAML-only setups, so a bare name would register as
+        # button.re_render).
+        self._attr_name = f"{coordinator.name} Re-render"
 
     async def async_press(self) -> None:
         """Request a render with the current state."""

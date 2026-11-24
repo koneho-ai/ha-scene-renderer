@@ -40,6 +40,19 @@ restart. Deleting first frees up the entity ids
 old entry still exists when the YAML setup runs, the new entities get
 `_2` suffixes instead.
 
+### Upgrading from 0.3.0
+
+0.3.0 registered bare entity ids (`image.overview`,
+`sensor.render_status`, `button.re_render`) because no device attaches
+to a YAML-only setup. 0.3.1 renames them to the scene-prefixed ids
+(`image.scene_renderer_overview`, …) automatically on the first
+restart after updating — no action needed, unless you built
+automations or dashboards on the bare ids, in which case update them
+to the new ids. 0.3.1 also fixes the sidebar panel leaving a black gap
+at the bottom of the page, and adds a toggle switch to each mapped
+light in the panel's light list so the render can be tested from the
+panel itself.
+
 ## How lights are rendered
 
 The integration normalizes each mapped entity into a parameter set:

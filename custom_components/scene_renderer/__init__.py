@@ -39,7 +39,9 @@ import voluptuous as vol
 from homeassistant.const import CONF_NAME, Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
+from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.discovery import async_load_platform
+from homeassistant.util.slugify import slugify
 
 from .const import (
     CONF_CAMERAS,
@@ -84,6 +86,49 @@ CONFIG_SCHEMA = vol.Schema(
 PLATFORMS = [Platform.IMAGE, Platform.SENSOR, Platform.BUTTON]
 
 
+def _migrate_bare_entity_ids(
+    hass: HomeAssistant, coordinator: SceneRenderCoordinator
+) -> None:
+    """One-time migration of the bare entity ids 0.3.0 registered.
+
+    0.3.0 used ``has_entity_name`` + ``device_info``, but a YAML-only
+    setup has no config entry, so no device ever attached and the
+    entities registered as ``image.overview``,
+    ``sensor.render_status`` and ``button.re_render``. The entity
+    registry keeps a registered id even when the suggested name
+    changes, so the stale entries must be removed for the entities to
+    re-register under their new scene-prefixed names. Only entries
+    that still carry the exact bare id are removed — an entry the user
+    renamed, or one already migrated, is left alone, and the migration
+    is a no-op on fresh installs.
+    """
+    registry = er.async_get(hass)
+    name = coordinator.name
+    candidates: list[tuple[str, str, str, str]] = [
+        ("sensor", f"{YAML_CONFIG_ID}_status", "Render status",
+         f"{name} Render status"),
+        ("button", f"{YAML_CONFIG_ID}_rerender", "Re-render",
+         f"{name} Re-render"),
+    ]
+    for camera in coordinator.cameras:
+        title = camera.replace("_", " ").title()
+        candidates.append(
+            ("image", f"{YAML_CONFIG_ID}_render_{camera}", title,
+             f"{name} {title}")
+        )
+    for domain, unique_id, old_name, new_name in candidates:
+        old_id = f"{domain}.{slugify(old_name)}"
+        new_id = f"{domain}.{slugify(new_name)}"
+        if old_id == new_id:
+            continue
+        entity_id = registry.async_get_entity_id(domain, DOMAIN, unique_id)
+        if entity_id == old_id:
+            _LOGGER.info(
+                "Scene Renderer: migrating %s to %s", entity_id, new_id
+            )
+            registry.async_remove(entity_id)
+
+
 async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     """Set up HA Scene Renderer from YAML configuration."""
     conf: dict[str, Any] = config.get(DOMAIN) or {}
@@ -107,6 +152,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
     )
     await coordinator.async_setup()
     hass.data.setdefault(DOMAIN, {})[YAML_CONFIG_ID] = coordinator
+    _migrate_bare_entity_ids(hass, coordinator)
     await async_register_panel(hass)
     # Platform loads go through tasks (the discovery helper's own advice:
     # loading a base component can be slow, so setup does not wait).

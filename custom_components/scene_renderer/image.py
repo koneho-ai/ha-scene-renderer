@@ -5,7 +5,6 @@ from typing import Any
 
 from homeassistant.components.image import ImageEntity
 from homeassistant.core import HomeAssistant
-from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from .const import DOMAIN, YAML_CONFIG_ID
@@ -29,7 +28,6 @@ class SceneRenderImage(ImageEntity):
     """The latest render for one camera as an image entity."""
 
     _attr_content_type = "image/png"
-    _attr_has_entity_name = True
 
     def __init__(
         self,
@@ -41,13 +39,14 @@ class SceneRenderImage(ImageEntity):
         self.coordinator = coordinator
         self.camera = camera
         self._attr_unique_id = f"{YAML_CONFIG_ID}_render_{camera}"
-        # Snake_case camera name -> Title Case display name.
-        self._attr_name = camera.replace("_", " ").title()
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, YAML_CONFIG_ID)},
-            name=coordinator.name,
-            manufacturer="HA Scene Renderer",
-            model="3D scene render",
+        # Full name, scene included: YAML-only setups have no config
+        # entry, so no device attaches (HA warns about it and drops
+        # device attachment entirely in 2027.8) — with has_entity_name
+        # the id would collapse to the bare camera name
+        # (image.overview). The full name yields
+        # image.scene_renderer_overview.
+        self._attr_name = (
+            f"{coordinator.name} {camera.replace('_', ' ').title()}"
         )
         if coordinator.last_rendered is not None:
             self._attr_image_last_updated = coordinator.last_rendered

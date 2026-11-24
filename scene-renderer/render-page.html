@@ -97,9 +97,20 @@ window.__scriptInfo = () => ({
 // __cameras); the page resolves the camera info by name. Returns a PNG
 // data URL. The backend loops this for clip frames so it can abort
 // between frames when a newer render request arrives.
-window.__renderFrame = ({ name, lights, sun, entities, cfg, time, loop }) => {
+// `freezeShadows` (clip frames after the first) keeps the shadow maps
+// from the previous frame: with 5 point lights at 6 faces each,
+// re-rendering shadows every frame would cost 30 extra scene renders
+// per frame. A still or a clip's first frame always renders fresh
+// shadows.
+window.__renderFrame = ({ name, lights, sun, entities, cfg, time, loop, freezeShadows }) => {
   const info = sceneLib.getCameraInfo(model, name);
   if (!info) throw new Error(`unknown camera "${name}"`);
+  if (freezeShadows) {
+    renderer.shadowMap.autoUpdate = false;
+  } else {
+    renderer.shadowMap.autoUpdate = true;
+    renderer.shadowMap.needsUpdate = true;
+  }
   return sceneLib.renderFrame({
     renderer,
     model,
@@ -116,8 +127,12 @@ window.__renderFrame = ({ name, lights, sun, entities, cfg, time, loop }) => {
     log: pageLog,
   });
 };
-window.__render = ({ lights, sun, entities, cameras, width, height, fileConfig }) =>
-  sceneLib.renderCameras({
+window.__render = ({ lights, sun, entities, cameras, width, height, fileConfig }) => {
+  // Stills always render fresh shadows (a clip may have left
+  // autoUpdate off).
+  renderer.shadowMap.autoUpdate = true;
+  renderer.shadowMap.needsUpdate = true;
+  return sceneLib.renderCameras({
     renderer,
     model,
     lights: lights || {},
@@ -132,6 +147,7 @@ window.__render = ({ lights, sun, entities, cameras, width, height, fileConfig }
     capture: () => renderer.domElement.toDataURL("image/png"),
     log: pageLog,
   });
+};
 // Project the model lights through one camera into image coordinates
 // (see scene.mjs projectLights). `cfg` is the resolved effective config
 // (from __cameras). Called once per camera after its render.

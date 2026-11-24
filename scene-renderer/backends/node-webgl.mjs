@@ -167,14 +167,31 @@ export async function createBackend({ modelPath, log }) {
           continue;
         }
         // Clip: one frame per (duration × fps), state snapshot frozen.
+        // Shadow maps render once (frame 0) and freeze for the rest of
+        // the clip: with 5 point lights at 6 faces each, re-rendering
+        // shadows every frame would cost 30 extra scene renders per
+        // frame. Only the fan shadow would move between frames, and it
+        // is barely visible. autoUpdate is restored in the finally so
+        // an abort never leaves a later still with stale shadows.
         const frames = [];
-        for (const { time, loop } of sceneLib.clipFrameTimes(cfg.clip.duration, cfg.clip.fps)) {
-          if (shouldAbort && shouldAbort()) {
-            const err = new Error(`render aborted: newer state arrived while rendering the clip for "${name}"`);
-            err.code = "RENDER_ABORTED";
-            throw err;
+        renderer.shadowMap.autoUpdate = true;
+        renderer.shadowMap.needsUpdate = true;
+        try {
+          let first = true;
+          for (const { time, loop } of sceneLib.clipFrameTimes(cfg.clip.duration, cfg.clip.fps)) {
+            if (shouldAbort && shouldAbort()) {
+              const err = new Error(`render aborted: newer state arrived while rendering the clip for "${name}"`);
+              err.code = "RENDER_ABORTED";
+              throw err;
+            }
+            frames.push(sceneLib.renderFrame({ ...frameArgs, info, cfg, time, loop }));
+            if (first) {
+              renderer.shadowMap.autoUpdate = false;
+              first = false;
+            }
           }
-          frames.push(sceneLib.renderFrame({ ...frameArgs, info, cfg, time, loop }));
+        } finally {
+          renderer.shadowMap.autoUpdate = true;
         }
         out[name] = {
           data: await encodeClip(frames, { width: cfg.width, height: cfg.height, fps: cfg.clip.fps }),

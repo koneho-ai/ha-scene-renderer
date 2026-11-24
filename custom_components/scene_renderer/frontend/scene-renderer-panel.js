@@ -519,6 +519,15 @@ class SceneRendererPanel extends HTMLElement {
       );
       return false;
     }
+    // Shadows: every model light and the sun cast (mirroring the render
+    // service). Shadow maps update only on demand (autoUpdate off):
+    // the scene is static except for light states, so re-rendering 5
+    // cube maps every animation frame would waste the GPU. Light and
+    // sun updates set needsUpdate (see _updateModelLights /
+    // _updateSunLight); orbiting the camera needs no shadow update.
+    renderer.shadowMap.enabled = true;
+    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.autoUpdate = false;
     this._renderer = renderer;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
     renderer.setClearColor(0x000000, 0); // transparent: HA theme shows through
@@ -533,9 +542,12 @@ class SceneRendererPanel extends HTMLElement {
     this._hemi = new THREE.HemisphereLight(0xffffff, 0x555566, 0.15);
     this._scene.add(this._hemi);
     // Directional sun, positioned and colored by _updateSunLight from
-    // sun.sun. No shadows in the interactive viewer (perf); the render
-    // service is the one that casts them.
+    // sun.sun. It casts shadows; the shadow camera is sized to the
+    // model in _buildScene once the radius is known.
     this._sunLight = new THREE.DirectionalLight(0xffffff, 0);
+    this._sunLight.castShadow = true;
+    this._sunLight.shadow.mapSize.set(2048, 2048);
+    this._sunLight.shadow.bias = -0.0005;
     this._scene.add(this._sunLight);
     this._scene.add(this._sunLight.target);
 
@@ -628,6 +640,18 @@ class SceneRendererPanel extends HTMLElement {
     this._camera.updateProjectionMatrix();
     this._controls.update();
 
+    // Sun shadow camera: the sun sits radius*4 out from the center
+    // (see _updateSunLight), so the far plane must clear 5 radii and
+    // the frustum must cover the whole model.
+    if (this._sunLight) {
+      this._sunLight.shadow.camera.near = 0.5;
+      this._sunLight.shadow.camera.far = radius * 8;
+      this._sunLight.shadow.camera.left = -radius * 1.5;
+      this._sunLight.shadow.camera.right = radius * 1.5;
+      this._sunLight.shadow.camera.top = radius * 1.5;
+      this._sunLight.shadow.camera.bottom = -radius * 1.5;
+    }
+
     const markerRadius = Math.max(0.05, Math.min(0.35, radius * 0.012));
 
     // Light markers: one sphere per named light in the model, at the
@@ -638,7 +662,24 @@ class SceneRendererPanel extends HTMLElement {
     // the model's base values.
     modelScene.traverse((obj) => {
       if (obj.isCamera && obj.name) this._modelCameras.set(obj.name, obj);
+      if (obj.isMesh) {
+        // Model meshes cast and receive shadows (markers live in the
+        // group, not the model scene, so they stay shadow-free).
+        obj.castShadow = true;
+        obj.receiveShadow = true;
+      }
       if (!obj.isLight || !obj.name) return;
+      // Every model light casts shadows (point lights: cube maps).
+      // 512px faces keep the browser's shadow memory modest
+      // (5 lights x 6 faces x 512^2); the render service uses 1024.
+      obj.castShadow = true;
+      if (obj.shadow) {
+        obj.shadow.mapSize.set(512, 512);
+        obj.shadow.camera.near = 0.1;
+        obj.shadow.camera.far = radius * 3;
+        obj.shadow.bias = -0.004;
+        obj.shadow.normalBias = 0.02;
+      }
       this._modelLights.push({
         name: obj.name,
         light: obj,
@@ -798,10 +839,15 @@ class SceneRendererPanel extends HTMLElement {
       if (app.state === "unmapped") {
         entry.light.intensity = entry.baseIntensity;
         entry.light.color.copy(entry.baseColor);
+        entry.light.castShadow = true;
       } else if (app.state !== "on") {
         entry.light.intensity = 0;
+        // An off light casts no shadow — and skipping its 6 cube faces
+        // keeps the manual shadow update cheap.
+        entry.light.castShadow = false;
       } else {
         entry.light.intensity = entry.baseIntensity * app.brightness;
+        entry.light.castShadow = true;
         entry.light.color.setRGB(
           app.rgb[0] / 255,
           app.rgb[1] / 255,
@@ -810,6 +856,8 @@ class SceneRendererPanel extends HTMLElement {
         );
       }
     }
+    // Light states changed: re-render the shadow maps on the next frame.
+    this._requestShadowUpdate();
   }
 
   _updateLightMarkers() {
@@ -878,6 +926,7 @@ class SceneRendererPanel extends HTMLElement {
     if (!sun || !sun.attributes) {
       this._sunLight.intensity = 0;
       this._hemi.intensity = 0.5;
+      this._requestShadowUpdate();
       return;
     }
     const az = sun.attributes.azimuth;
@@ -885,6 +934,7 @@ class SceneRendererPanel extends HTMLElement {
     if (typeof az !== "number" || typeof el !== "number" || el < 0) {
       this._sunLight.intensity = 0;
       this._hemi.intensity = 0.06;
+      this._requestShadowUpdate();
       return;
     }
     const dir = this._sunDirection(az, el);
@@ -903,6 +953,13 @@ class SceneRendererPanel extends HTMLElement {
     const dayFrac = Math.min(1, Math.max(0, el / 30));
     this._sunLight.intensity = 3.0 * dayFrac;
     this._hemi.intensity = 0.15 + 0.45 * dayFrac;
+    this._requestShadowUpdate();
+  }
+
+  // Shadow maps update on demand (autoUpdate is off): the sun moved,
+  // rose, or set, so the next frame re-renders them.
+  _requestShadowUpdate() {
+    if (this._renderer) this._renderer.shadowMap.needsUpdate = true;
   }
 
   _updateSunMarker() {

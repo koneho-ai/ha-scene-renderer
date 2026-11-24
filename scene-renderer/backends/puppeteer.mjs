@@ -127,7 +127,13 @@ export async function createBackend({ serverUrl, log }) {
       }
       for (const { name, cfg } of clipCameras) {
         const frames = [];
-        for (const { time, loop } of clipFrameTimes(cfg.clip.duration, cfg.clip.fps)) {
+        // Shadow maps render once (frame 0) and freeze for the rest of
+        // the clip (see __renderFrame's freezeShadows): with 5 point
+        // lights at 6 faces each, re-rendering shadows every frame
+        // would cost 30 extra scene renders per frame.
+        const frameTimes = clipFrameTimes(cfg.clip.duration, cfg.clip.fps);
+        for (let i = 0; i < frameTimes.length; i += 1) {
+          const { time, loop } = frameTimes[i];
           if (shouldAbort && shouldAbort()) {
             const err = new Error(`render aborted: newer state arrived while rendering the clip for "${name}"`);
             err.code = "RENDER_ABORTED";
@@ -143,6 +149,7 @@ export async function createBackend({ serverUrl, log }) {
               cfg,
               time,
               loop,
+              freezeShadows: i > 0,
             },
           );
           frames.push(dataUrlToBuffer(dataUrl));

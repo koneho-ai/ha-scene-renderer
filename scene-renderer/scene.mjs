@@ -46,6 +46,15 @@ export const BASE_EXPOSURE = 1.1;
 const DEFAULT_CLEAR_COLOR = 0x000000;
 const DEFAULT_CLEAR_ALPHA = 0;
 
+// Point/spot shadow maps: one cube map (6 faces) per point light, so
+// 1024px is the quality/perf balance for the service. Bias values are
+// tuned for the flat low-poly surfaces of interior models: too little
+// bias shows acne, too much detaches shadows from their casters
+// (peter-panning). The sun keeps its own -0.0005 (proven in production).
+const POINT_SHADOW_MAP_SIZE = 1024;
+const POINT_SHADOW_BIAS = -0.004;
+const POINT_SHADOW_NORMAL_BIAS = 0.02;
+
 // ---------------------------------------------------------------------------
 // Kelvin -> RGB (Tanner / Charity approximation, as used by most tools).
 // Input kelvin, output [r, g, b] in 0..255.
@@ -114,6 +123,16 @@ export async function loadModel(arrayBuffer) {
     if (obj.isLight && obj.name) {
       obj.userData.baseIntensity = obj.intensity;
       obj.userData.baseColor = obj.color.clone();
+      // Every model light casts shadows (point lights: cube maps, spot
+      // lights: 2D maps). Shadow camera near/far are set after the
+      // bounds are known, below. applyLightStates switches castShadow
+      // off with the light, so off lights cost no shadow passes.
+      obj.castShadow = true;
+      if (obj.shadow) {
+        obj.shadow.mapSize.set(POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE);
+        obj.shadow.bias = POINT_SHADOW_BIAS;
+        obj.shadow.normalBias = POINT_SHADOW_NORMAL_BIAS;
+      }
       lights.set(obj.name, obj);
     }
     if (obj.isCamera && obj.name && !cameras.has(obj.name)) {
@@ -139,6 +158,15 @@ export async function loadModel(arrayBuffer) {
   const center = bounds.getCenter(new THREE.Vector3());
   const size = bounds.getSize(new THREE.Vector3());
   const diag = Math.max(size.x, size.y, size.z, 1);
+
+  // Point/spot shadow cameras: near tight to the light, far covering
+  // the whole model (any surface is at most diag away from any light
+  // inside it). A tighter far means better depth precision.
+  for (const light of lights.values()) {
+    if (!light.shadow) continue;
+    light.shadow.camera.near = 0.1;
+    light.shadow.camera.far = diag * 1.5;
+  }
 
   // Sun (directional, added by the service, not part of the model) and a
   // hemisphere fill so unlit areas never go pure black.
@@ -206,6 +234,7 @@ export function applyLightStates(lights, params) {
     if (!p) {
       // Unmapped: render at the model's base values.
       light.visible = true;
+      light.castShadow = true;
       light.intensity = light.userData.baseIntensity;
       light.color.copy(light.userData.baseColor);
       continue;
@@ -213,6 +242,9 @@ export function applyLightStates(lights, params) {
     const on = p.on === true;
     const brightness = typeof p.brightness === "number" ? p.brightness : 1;
     light.visible = on;
+    // An off light casts no shadow — and skipping its 6 cube faces is
+    // the difference between 5 and 30 shadow passes per render.
+    light.castShadow = on;
     light.intensity = on ? light.userData.baseIntensity * brightness : 0;
     if (Array.isArray(p.color) && p.color.length === 3) {
       setLightColor(light, p.color);

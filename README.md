@@ -116,6 +116,17 @@ and restart.
 > follows `sun.sun`, mirroring the rendered images — previously the
 > viewer showed every light at full base brightness under a strong
 > fixed ambient, no matter what HA said.
+>
+> **0.3.5** makes every light cast shadows, in the rendered images and
+> in the panel's 3D viewer: each model light renders a shadow map
+> (point lights use cube maps), the sun casts too, and every model
+> mesh casts and receives. Off lights cast nothing, so they cost no
+> shadow passes. Shadow maps in the viewer update only when a light
+> or the sun changes, and motion clips render shadows once and freeze
+> them for the rest of the clip — re-rendering 5 cube maps every
+> frame would be 30 extra scene renders per frame. Renders take
+> longer with shadows on (a 1280×720 still with all 5 lights on is
+> roughly 5 seconds on the test machine, up from under a second).
 
 ## What you get in Home Assistant
 

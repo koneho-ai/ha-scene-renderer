@@ -30,6 +30,7 @@ value, so returning a payload would silently send nothing.
 """
 from __future__ import annotations
 
+import json
 import logging
 import os
 from typing import Any
@@ -52,7 +53,29 @@ PANEL_TITLE = "Scene Renderer"
 PANEL_ICON = "mdi:video-3d"
 PANEL_COMPONENT_NAME = "scene-renderer-panel"
 STATIC_URL_PATH = "/scene_renderer_static"
-PANEL_MODULE_URL = f"{STATIC_URL_PATH}/scene-renderer-panel.js"
+
+
+def _integration_version() -> str:
+    """Version from this integration's manifest.json (next to this file).
+
+    Falls back to "0" if the manifest is unreadable — the URL still
+    works, it just won't bust the cache on that install.
+    """
+    try:
+        with open(os.path.join(os.path.dirname(__file__), "manifest.json")) as f:
+            return json.load(f).get("version", "0")
+    except (OSError, ValueError):
+        return "0"
+
+
+# The module URL carries the integration version as a query string so
+# every release is a fresh URL for the browser. Without it the panel JS
+# is served at a fixed URL and browsers keep running a stale cached copy
+# across updates (0.3.1's toggles and gap fix never appeared until a
+# manual hard refresh). The static file handler ignores the query.
+PANEL_MODULE_URL = (
+    f"{STATIC_URL_PATH}/scene-renderer-panel.js?v={_integration_version()}"
+)
 
 # hass.data flag marking the panel as registered for this hass instance.
 # The panel is registered once no matter how many config entries exist.

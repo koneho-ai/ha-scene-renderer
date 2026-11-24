@@ -110,8 +110,11 @@ class SceneRendererPanel extends HTMLElement {
     this._modelCenter = new THREE.Vector3();
     this._modelRadius = 10;
     this._lightMarkers = []; // { name, mesh, baseRadius }
+    this._modelLights = []; // { name, light, baseIntensity, baseColor }
     this._cameraMarkers = []; // { name, group }
     this._sunMarker = null;
+    this._sunLight = null; // DirectionalLight driven by sun.sun
+    this._hemi = null; // HemisphereLight, dim floor driven by sun elevation
     this._modelCameras = new Map(); // name -> THREE camera object in the GLB
     this._raycaster = new THREE.Raycaster();
     this._pointerDown = null;
@@ -291,8 +294,10 @@ class SceneRendererPanel extends HTMLElement {
     // Live update: markers, sun and side lists only — never rebuilds
     // the scene.
     this._updateLightMarkers();
+    this._updateModelLights();
     this._updateLightList();
     this._updateSunMarker();
+    this._updateSunLight();
   }
 
   get hass() {
@@ -494,7 +499,9 @@ class SceneRendererPanel extends HTMLElement {
     this._renderLightList();
     this._renderCameraList();
     this._updateLightMarkers();
+    this._updateModelLights();
     this._updateSunMarker();
+    this._updateSunLight();
     this._setState("ready", "Ready", "", false);
   }
 
@@ -518,9 +525,19 @@ class SceneRendererPanel extends HTMLElement {
     this._els.viewer.appendChild(renderer.domElement);
 
     this._scene = new THREE.Scene();
-    // Soft base illumination so the model is readable even when every
-    // HA light is off; the model's own lights still do the real work.
-    this._scene.add(new THREE.HemisphereLight(0xffffff, 0x555566, 0.9));
+    // Dim base illumination so the model stays readable when every HA
+    // light is off; _updateSunLight drives its intensity from the sun
+    // elevation the same way the render service does. It must stay dim
+    // (0.06-0.6), or it washes out the state-driven lights entirely —
+    // the old fixed 0.9 made every room look lit no matter what.
+    this._hemi = new THREE.HemisphereLight(0xffffff, 0x555566, 0.15);
+    this._scene.add(this._hemi);
+    // Directional sun, positioned and colored by _updateSunLight from
+    // sun.sun. No shadows in the interactive viewer (perf); the render
+    // service is the one that casts them.
+    this._sunLight = new THREE.DirectionalLight(0xffffff, 0);
+    this._scene.add(this._sunLight);
+    this._scene.add(this._sunLight.target);
 
     this._camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
     this._controls = new OrbitControls(this._camera, renderer.domElement);
@@ -585,6 +602,7 @@ class SceneRendererPanel extends HTMLElement {
       this._disposeGroup(this._modelGroup);
     }
     this._lightMarkers = [];
+    this._modelLights = [];
     this._cameraMarkers = [];
     this._modelCameras = new Map();
     this._sunMarker = null;
@@ -614,9 +632,19 @@ class SceneRendererPanel extends HTMLElement {
 
     // Light markers: one sphere per named light in the model, at the
     // light's world position. Colors are applied by _updateLightMarkers.
+    // The real three.js lights are recorded too: _updateModelLights
+    // drives their intensity/color from the mapped HA entity, so the
+    // viewer shows the same lighting as the rendered images instead of
+    // the model's base values.
     modelScene.traverse((obj) => {
       if (obj.isCamera && obj.name) this._modelCameras.set(obj.name, obj);
       if (!obj.isLight || !obj.name) return;
+      this._modelLights.push({
+        name: obj.name,
+        light: obj,
+        baseIntensity: obj.intensity,
+        baseColor: obj.color.clone(),
+      });
       const pos = obj.getWorldPosition(new THREE.Vector3());
       const mesh = new THREE.Mesh(
         new THREE.SphereGeometry(markerRadius, 16, 12),
@@ -715,7 +743,13 @@ class SceneRendererPanel extends HTMLElement {
     const mapping = (this._panelData && this._panelData.mapping) || {};
     const entityId = mapping[modelName];
     if (!entityId) {
-      return { rgb: [255, 255, 255], opacity: 0.9, scale: 1, state: "unmapped" };
+      return {
+        rgb: [255, 255, 255],
+        opacity: 0.9,
+        scale: 1,
+        brightness: 1,
+        state: "unmapped",
+      };
     }
     const st = this._state(entityId);
     if (!st || st.state !== "on") {
@@ -723,6 +757,7 @@ class SceneRendererPanel extends HTMLElement {
         rgb: [0x3a, 0x3f, 0x44],
         opacity: 0.55,
         scale: 1,
+        brightness: 0,
         state: st ? st.state : "unknown",
       };
     }
@@ -745,8 +780,36 @@ class SceneRendererPanel extends HTMLElement {
       rgb,
       opacity: 0.35 + 0.65 * brightness,
       scale: 0.85 + 0.3 * brightness,
+      brightness,
       state: "on",
     };
+  }
+
+  /** Drive the model's real three.js lights from the mapped HA entities.
+
+  Mirrors the render service's built-in mapping (scene.mjs applyLights):
+  on -> intensity = model base x brightness, color = entity color (or
+  color temperature); off/unavailable -> intensity 0; unmapped -> model
+  base values. Without this the viewer showed every light at full base
+  brightness no matter what HA said. */
+  _updateModelLights() {
+    for (const entry of this._modelLights) {
+      const app = this._lightAppearance(entry.name);
+      if (app.state === "unmapped") {
+        entry.light.intensity = entry.baseIntensity;
+        entry.light.color.copy(entry.baseColor);
+      } else if (app.state !== "on") {
+        entry.light.intensity = 0;
+      } else {
+        entry.light.intensity = entry.baseIntensity * app.brightness;
+        entry.light.color.setRGB(
+          app.rgb[0] / 255,
+          app.rgb[1] / 255,
+          app.rgb[2] / 255,
+          THREE.SRGBColorSpace,
+        );
+      }
+    }
   }
 
   _updateLightMarkers() {
@@ -765,6 +828,83 @@ class SceneRendererPanel extends HTMLElement {
     }
   }
 
+  // HA azimuth: 0 = north, 90 = east. Model layout: +X = east,
+  // +Z = south, so north is -Z. Shared by the sun marker and the sun
+  // light so they always agree on where the sun is.
+  _sunDirection(az, el) {
+    const azR = (az * Math.PI) / 180;
+    const elR = (el * Math.PI) / 180;
+    return new THREE.Vector3(
+      Math.cos(elR) * Math.sin(azR),
+      Math.sin(elR),
+      -Math.cos(elR) * Math.cos(azR),
+    );
+  }
+
+  // Warm at the horizon, neutral at noon. Mirrors scene.mjs
+  // sunColorForElevation (same stops, sRGB).
+  _sunColorForElevation(elevation) {
+    const stops = [
+      [0, [1.0, 0.45, 0.18]],
+      [10, [1.0, 0.62, 0.35]],
+      [30, [1.0, 0.85, 0.68]],
+      [60, [1.0, 0.97, 0.92]],
+    ];
+    const e = Math.max(0, elevation);
+    for (let i = 0; i < stops.length - 1; i += 1) {
+      const [e0, c0] = stops[i];
+      const [e1, c1] = stops[i + 1];
+      if (e >= e0 && e <= e1) {
+        const t = (e - e0) / (e1 - e0);
+        return [
+          Math.round((c0[0] + (c1[0] - c0[0]) * t) * 255),
+          Math.round((c0[1] + (c1[1] - c0[1]) * t) * 255),
+          Math.round((c0[2] + (c1[2] - c0[2]) * t) * 255),
+        ];
+      }
+    }
+    return stops[stops.length - 1][1].map((v) => Math.round(v * 255));
+  }
+
+  /** Drive the directional sun light + hemisphere from sun.sun.
+
+  Mirrors the render service's applySun: intensity ramps 0 at the
+  horizon to 3.0 at 30 degrees, color warms toward the horizon, and
+  the hemisphere follows (0.06 at night, 0.15-0.6 by day, 0.5 when no
+  sun state is available). Below the horizon the sun light is off. */
+  _updateSunLight() {
+    if (!this._sunLight || !this._hemi) return;
+    const sun = this._state("sun.sun");
+    if (!sun || !sun.attributes) {
+      this._sunLight.intensity = 0;
+      this._hemi.intensity = 0.5;
+      return;
+    }
+    const az = sun.attributes.azimuth;
+    const el = sun.attributes.elevation;
+    if (typeof az !== "number" || typeof el !== "number" || el < 0) {
+      this._sunLight.intensity = 0;
+      this._hemi.intensity = 0.06;
+      return;
+    }
+    const dir = this._sunDirection(az, el);
+    this._sunLight.position
+      .copy(this._modelCenter)
+      .addScaledVector(dir, this._modelRadius * 4);
+    this._sunLight.target.position.copy(this._modelCenter);
+    this._sunLight.target.updateMatrixWorld();
+    const rgb = this._sunColorForElevation(el);
+    this._sunLight.color.setRGB(
+      rgb[0] / 255,
+      rgb[1] / 255,
+      rgb[2] / 255,
+      THREE.SRGBColorSpace,
+    );
+    const dayFrac = Math.min(1, Math.max(0, el / 30));
+    this._sunLight.intensity = 3.0 * dayFrac;
+    this._hemi.intensity = 0.15 + 0.45 * dayFrac;
+  }
+
   _updateSunMarker() {
     if (!this._sunMarker) return;
     const sun = this._state("sun.sun");
@@ -779,15 +919,7 @@ class SceneRendererPanel extends HTMLElement {
       this._sunMarker.visible = false;
       return;
     }
-    // HA azimuth: 0 = north, 90 = east. Model layout: +X = east,
-    // +Z = south, so north is -Z.
-    const azR = (az * Math.PI) / 180;
-    const elR = (el * Math.PI) / 180;
-    const dir = new THREE.Vector3(
-      Math.cos(elR) * Math.sin(azR),
-      Math.sin(elR),
-      -Math.cos(elR) * Math.cos(azR),
-    );
+    const dir = this._sunDirection(az, el);
     this._sunMarker.position
       .copy(this._modelCenter)
       .addScaledVector(dir, this._modelRadius * 1.1);

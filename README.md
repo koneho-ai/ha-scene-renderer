@@ -105,6 +105,17 @@ and restart.
 > `deleted_entities` and restores the old id when the entity is
 > re-added, so the bare ids came straight back. 0.3.3 renames the
 > entries in place instead, which sticks.
+>
+> **0.3.4** fixes the panel showing stale code after an update: the
+> panel JS was served at a fixed URL, so browsers kept running the
+> old cached copy (no toggles, black gap at the bottom) until a
+> manual hard refresh. The module URL now carries the integration
+> version, so every release loads fresh. 0.3.4 also makes the panel's
+> 3D viewer use the real lighting: the model's lights now follow
+> their mapped HA entities (on/off, brightness, color) and the sun
+> follows `sun.sun`, mirroring the rendered images — previously the
+> viewer showed every light at full base brightness under a strong
+> fixed ambient, no matter what HA said.
 
 ## What you get in Home Assistant
 

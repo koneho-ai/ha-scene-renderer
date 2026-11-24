@@ -33,7 +33,10 @@ to the resolved entities, and sends their state in every render request
 (``entities`` in the payload). When a render response carries a new
 script hash, the coordinator re-fetches the subscriptions, re-subscribes,
 and re-renders with the new entity set. No script -> the built-in set
-(mapped lights + sun) only.
+(mapped lights + sun) only. The script may also declare
+``objectDrivers`` (model object name -> driving entity ID); those
+entities are tracked the same way, and the panel shows the objects
+with their driving entity and a toggle.
 
 Light parametrization: each mapped entity is normalized into a render
 parameter set (see :func:`normalize_light_state`):
@@ -229,12 +232,16 @@ class SceneRenderCoordinator:
         self.last_render_ms: int | None = None
 
         # User script (scene.js) status, from GET /script and each render
-        # response: {"present", "hash", "subscribe", "status", "error",
-        # "last_error", "error_count"}. Starts as "no script".
+        # response: {"present", "hash", "subscribe", "object_drivers",
+        # "status", "error", "last_error", "error_count"}. Starts as
+        # "no script". object_drivers maps model object names to the
+        # entity driving each one (the script's `objectDrivers` export);
+        # the panel shows those objects with their entity and a toggle.
         self.script_status: dict[str, Any] = {
             "present": False,
             "hash": None,
             "subscribe": [],
+            "object_drivers": {},
             "status": "none",
             "error": None,
             "last_error": None,
@@ -242,7 +249,9 @@ class SceneRenderCoordinator:
         }
         self._script_hash: str | None = None
         self._script_patterns: list[str] = []
-        # Entities the script reads (resolved from the subscribe patterns).
+        self._script_object_drivers: dict[str, str] = {}
+        # Entities the script reads (resolved from the subscribe patterns
+        # plus the object driver entities).
         self._script_entities: set[str] = set()
 
         self._listeners: list[Callable[[], None]] = []
@@ -373,10 +382,19 @@ class SceneRenderCoordinator:
     def _update_script_subscription(self, script_info: dict[str, Any]) -> bool:
         """Apply a script status block. Returns True if the script's
         subscriptions changed (caller re-subscribes and re-renders)."""
+        drivers = script_info.get("object_drivers") or {}
+        if not isinstance(drivers, dict):
+            drivers = {}
+        drivers = {
+            k: v
+            for k, v in drivers.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
         self.script_status = {
             "present": script_info.get("present", False),
             "hash": script_info.get("hash"),
             "subscribe": list(script_info.get("subscribe") or []),
+            "object_drivers": dict(drivers),
             "status": script_info.get("status", "none"),
             "error": script_info.get("error"),
             "last_error": script_info.get("last_error"),
@@ -384,12 +402,35 @@ class SceneRenderCoordinator:
         }
         new_hash = self.script_status["hash"]
         patterns = self.script_status["subscribe"]
-        changed = new_hash != self._script_hash or patterns != self._script_patterns
+        changed = (
+            new_hash != self._script_hash
+            or patterns != self._script_patterns
+            or drivers != self._script_object_drivers
+        )
         self._script_hash = new_hash
         self._script_patterns = patterns
+        self._script_object_drivers = drivers
         if changed:
             self._script_entities = self._resolve_script_patterns(patterns)
+            # The driver entities are entities the script reads too:
+            # track them even when the author forgot to subscribe to
+            # them, so a change re-renders (and the panel toggle feels
+            # live) instead of silently doing nothing until the next
+            # unrelated render.
+            self._script_entities.update(drivers.values())
         return changed
+
+    @property
+    def script_entities(self) -> list[str]:
+        """Entity IDs the script reads (resolved subscribe patterns plus
+        object driver entities), sorted. For the panel."""
+        return sorted(self._script_entities)
+
+    @property
+    def script_object_drivers(self) -> dict[str, str]:
+        """Model object name -> driving entity ID, from the script's
+        `objectDrivers` export. For the panel's Objects section."""
+        return dict(self.script_status.get("object_drivers") or {})
 
     async def async_unload(self) -> None:
         """Cancel subscriptions and pending renders."""

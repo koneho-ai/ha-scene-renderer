@@ -250,5 +250,11 @@ async def websocket_panel_data(
             # sun.sun), so the viewer agrees with the rendered images.
             # None when the sun is disabled or has no state yet.
             "sun": coordinator.sun_position(),
+            # The script's subscriptions, resolved to entity IDs, and
+            # its object drivers (model object name -> the entity
+            # driving it), so the panel can list script-driven objects
+            # (fan, TV screen) with their entity and a toggle.
+            "script_entities": coordinator.script_entities,
+            "script_object_drivers": coordinator.script_object_drivers,
         },
     )

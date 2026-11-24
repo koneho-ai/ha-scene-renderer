@@ -69,8 +69,9 @@ class RenderServiceClient:
         """GET /script. Returns the user script (scene.js) status.
 
         Shape: {"script": {"present": bool, "hash": str | None,
-        "subscribe": [...], "status": "none"|"ok"|"error", "error": ...,
-        "last_error": ..., "error_count": int}}.
+        "subscribe": [...], "object_drivers": {object_name: entity_id},
+        "status": "none"|"ok"|"error", "error": ..., "last_error": ...,
+        "error_count": int}}.
         """
         try:
             async with asyncio.timeout(PROBE_TIMEOUT):

@@ -44,7 +44,10 @@ const response = await fetch("/model.glb");
 if (!response.ok) throw new Error(`failed to load model: HTTP ${response.status}`);
 const model = await sceneLib.loadModel(await response.arrayBuffer());
 
-const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true, alpha: true });
+// alpha: a camera with no `background` in cameras.yaml renders
+// transparent where no model geometry is visible (scene.mjs clears
+// with alpha 0) — without it the output would be opaque black.
 renderer.shadowMap.enabled = true;
 renderer.shadowMap.type = THREE.PCFSoftShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -73,12 +76,12 @@ function pageLog(level, message) {
 window.__cameras = ({ fileConfig, defaults }) =>
   sceneLib.listCameras(model, fileConfig || {}, defaults, pageLog);
 // Compile a new user script (or clear it with null). Returns only plain
-// data ({ ok, subscribe, error }) — the compiled handle holds a function
-// and cannot cross page.evaluate.
+// data ({ ok, subscribe, objectDrivers, error }) — the compiled handle
+// holds a function and cannot cross page.evaluate.
 window.__setScript = (source) => {
   if (source === null || source === undefined) {
     currentScript = null;
-    return { ok: true, subscribe: [] };
+    return { ok: true, subscribe: [], objectDrivers: {} };
   }
   if (!sesAvailable) {
     return { ok: false, error: "SES is not available in this page — scene.js cannot be loaded" };
@@ -86,7 +89,7 @@ window.__setScript = (source) => {
   const result = compileScript(source, { log: pageLog });
   if (!result.ok) return { ok: false, error: result.error };
   currentScript = result;
-  return { ok: true, subscribe: result.subscribe };
+  return { ok: true, subscribe: result.subscribe, objectDrivers: result.objectDrivers };
 };
 window.__scriptInfo = () => ({
   present: currentScript !== null,

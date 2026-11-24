@@ -33,7 +33,7 @@ export const BACKEND_NAME = "node-webgl";
 // ses 2.x exports NOTHING from its ESM entry (index.js only imports the
 // shims for their side effects) — `const { lockdown } = await import("ses")`
 // destructures undefined and the lockdown never happens, which silently
-// disabled scene.js in this backend until 0.3.5. The import installs
+// disabled scene.js in this backend until 0.3.6. The import installs
 // lockdown/Compartment as globals; call the global.
 let sesAvailable = false;
 try {
@@ -73,7 +73,10 @@ export async function createBackend({ modelPath, log }) {
   log("info", `model loaded: ${model.lights.size} named lights, ${cameraNames.length} cameras, ${model.animations.length} animation(s)`);
 
   const canvas = createCanvas(1280, 720);
-  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
+  // alpha: a camera with no `background` in cameras.yaml renders
+  // transparent where no model geometry is visible (scene.mjs clears
+  // with alpha 0) — without it the output would be opaque black.
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
   renderer.shadowMap.enabled = true;
   renderer.shadowMap.type = THREE.PCFSoftShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -112,12 +115,12 @@ export async function createBackend({ modelPath, log }) {
     },
 
     // Compile a new user script (or clear it with null). Returns
-    // { ok, subscribe, error }; a failed compile keeps the last good
-    // script running.
+    // { ok, subscribe, objectDrivers, error }; a failed compile keeps
+    // the last good script running.
     async setScript(source) {
       if (source === null || source === undefined) {
         script = null;
-        return { ok: true, subscribe: [] };
+        return { ok: true, subscribe: [], objectDrivers: {} };
       }
       if (!sesAvailable) {
         return { ok: false, error: "SES is not available in this process — scene.js cannot be loaded" };
@@ -127,7 +130,7 @@ export async function createBackend({ modelPath, log }) {
       });
       if (!result.ok) return result;
       script = result;
-      return { ok: true, subscribe: result.subscribe };
+      return { ok: true, subscribe: result.subscribe, objectDrivers: result.objectDrivers };
     },
 
     async getScriptInfo() {

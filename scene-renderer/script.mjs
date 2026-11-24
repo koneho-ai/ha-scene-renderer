@@ -1,9 +1,17 @@
 // User script (scene.js) runtime — shared by both render backends.
 //
-// The script is a small ESM-style module with exactly two supported exports:
+// The script is a small ESM-style module with three supported exports:
 //
 //   export const subscribe = [...]             (optional)
+//   export const objectDrivers = {...}         (optional)
 //   export default function update(...) {...}  (required)
+//
+// `objectDrivers` maps model object names to the entity that drives
+// them ({ ceiling_fan: "light.wizcolor1" }) — the sidebar panel shows
+// those objects with their driving entity and a toggle. It is a
+// declaration only: the script still reads the entities itself (via
+// `subscribe`); the panel uses the mapping to know which entity
+// belongs to which object, which the flat subscribe list cannot say.
 //
 // It runs inside a SES Compartment (Agoric hardened JS): no process, no
 // require, no fs/network, no imports at all. The compartment is created by
@@ -144,6 +152,7 @@ export function checkScriptSource(source) {
 // ---------------------------------------------------------------------------
 // Export transform. Supported forms (each at the start of a line):
 //   export const subscribe = [...]        -> const subscribe = [...]
+//   export const objectDrivers = {...}    -> const objectDrivers = {...}
 //   export default function update(...)   -> function update(...)
 //   export default function (...)         -> const __sceneDefault = function (...)
 //   export default update;                -> (removed; update is the default)
@@ -172,14 +181,19 @@ export function transformScript(stripped) {
       out.push(indent + trimmed.slice("export ".length));
       continue;
     }
+    m = trimmed.match(/^export\s+const\s+objectDrivers\s*=/);
+    if (m) {
+      out.push(indent + trimmed.slice("export ".length));
+      continue;
+    }
     if (/^export\s+const\s+/.test(trimmed)) {
-      return { ok: false, error: "scene.js may only export `subscribe` (as `export const subscribe = [...]`)" };
+      return { ok: false, error: "scene.js may only export `subscribe` and `objectDrivers` (as `export const subscribe = [...]` / `export const objectDrivers = {...}`)" };
     }
     if (/^export\s+(let|var|class|abstract|interface|type|enum|namespace)\b/.test(trimmed)) {
-      return { ok: false, error: "scene.js supports only `export const subscribe` and a default export — no other exports" };
+      return { ok: false, error: "scene.js supports only `export const subscribe`, `export const objectDrivers`, and a default export — no other exports" };
     }
     if (/^export\s*\{/.test(trimmed) || /^export\s*\*/.test(trimmed)) {
-      return { ok: false, error: "scene.js does not support `export { ... }` or `export *` — use `export const subscribe` and `export default function update`" };
+      return { ok: false, error: "scene.js does not support `export { ... }` or `export *` — use `export const subscribe`, `export const objectDrivers`, and `export default function update`" };
     }
     if (trimmed.startsWith("export default")) {
       defaultCount += 1;
@@ -209,12 +223,12 @@ export function transformScript(stripped) {
       out.push(indent + trimmed.replace(/^export\s+default\s+/, `const ${DEFAULT_ALIAS} = `));
       continue;
     }
-    return { ok: false, error: `unsupported export in scene.js: "${trimmed.slice(0, 60)}" — use \`export const subscribe\` and \`export default function update\`` };
+    return { ok: false, error: `unsupported export in scene.js: "${trimmed.slice(0, 60)}" — use \`export const subscribe\`, \`export const objectDrivers\`, and \`export default function update\`` };
   }
 
   const code = out.join("\n");
   if (/\bexport\b/.test(blankStrings(code))) {
-    return { ok: false, error: "unsupported export in scene.js — use `export const subscribe` and `export default function update`" };
+    return { ok: false, error: "unsupported export in scene.js — use `export const subscribe`, `export const objectDrivers`, and `export default function update`" };
   }
   if (defaultName === null) {
     return { ok: false, error: "scene.js must export a default update function (`export default function update({ entities, scene }) { ... }`)" };
@@ -224,8 +238,8 @@ export function transformScript(stripped) {
 
 // ---------------------------------------------------------------------------
 // Compilation: static checks + transform + compartment.evaluate.
-// Returns a handle { ok, update, subscribe, lastError, errorCount } or
-// { ok: false, error }.
+// Returns a handle { ok, update, subscribe, objectDrivers, lastError,
+// errorCount } or { ok: false, error }.
 // ---------------------------------------------------------------------------
 function formatLogArgs(args) {
   const parts = args.map((a) => {
@@ -270,7 +284,8 @@ export function compileScript(source, { log = () => {} } = {}) {
   const wrapped =
     `(() => {\n${transformed.code}\n` +
     `return { update: typeof ${transformed.defaultName} === "function" ? ${transformed.defaultName} : undefined, ` +
-    `subscribe: typeof subscribe !== "undefined" ? subscribe : undefined };\n})()`;
+    `subscribe: typeof subscribe !== "undefined" ? subscribe : undefined, ` +
+    `objectDrivers: typeof objectDrivers !== "undefined" ? objectDrivers : undefined };\n})()`;
 
   let result;
   try {
@@ -288,10 +303,34 @@ export function compileScript(source, { log = () => {} } = {}) {
     }
     subscribe = [...result.subscribe];
   }
+  let objectDrivers = {};
+  if (result.objectDrivers !== undefined) {
+    // Plain object only (no array, no null): { objectName: entityId }.
+    // The values are exact entity IDs, not patterns — a driver is one
+    // entity. Keys must be non-empty strings; unknown object names are
+    // fine (the panel skips objects the model does not have). No
+    // prototype check: the object comes from the compartment, whose
+    // Object.prototype is not the host realm's.
+    const drivers = result.objectDrivers;
+    const isPlainObject =
+      drivers !== null &&
+      typeof drivers === "object" &&
+      !Array.isArray(drivers);
+    if (
+      !isPlainObject ||
+      !Object.entries(drivers).every(
+        ([k, v]) => typeof k === "string" && k.length > 0 && typeof v === "string" && v.length > 0,
+      )
+    ) {
+      return { ok: false, error: "scene.js `objectDrivers` must be an object mapping model object names to entity IDs, e.g. { ceiling_fan: \"light.wizcolor1\" }" };
+    }
+    objectDrivers = { ...drivers };
+  }
   return {
     ok: true,
     update: result.update,
     subscribe,
+    objectDrivers,
     lastError: null,
     lastErrorAt: null,
     errorCount: 0,

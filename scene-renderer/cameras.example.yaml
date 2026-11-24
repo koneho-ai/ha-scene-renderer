@@ -25,6 +25,16 @@ overview:
   height: 720
   # Vertical field of view in degrees (perspective cameras only).
   fov: 50
+  # Projection: "perspective" (default) or "orthographic". An
+  # orthographic camera has no perspective distortion — good for a
+  # top-down plan view of the whole house. fov is ignored when the
+  # projection is orthographic.
+  # projection: orthographic
+  # Orthographic frustum height in metres (orthographic cameras only).
+  # The frustum width follows the render aspect ratio. Omit it to fit
+  # the whole model (its bounding sphere); a native orthographic model
+  # camera keeps its own frustum when this is omitted.
+  # ortho_size: 17
   # Near / far clip planes (model units, usually metres).
   near: 0.1
   far: 100

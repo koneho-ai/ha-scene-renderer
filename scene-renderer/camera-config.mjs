@@ -8,6 +8,8 @@
 //     width: 1280
 //     height: 720
 //     fov: 50              # perspective only
+//     projection: orthographic  # perspective (default) | orthographic
+//     ortho_size: 17       # orthographic only: frustum height in metres
 //     near: 0.1
 //     far: 100
 //     position: [6, 8, 10]

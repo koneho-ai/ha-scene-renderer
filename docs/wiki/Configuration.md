@@ -107,6 +107,42 @@ on), and fixes scene.js in the default backend: an SES import bug
 had silently disabled user scripts under node-webgl, so scene.js
 only ever ran under the Puppeteer fallback.
 
+**0.3.7** makes shadows per-light soft: each point
+light gets a shadow map size (512, 1024, or 2048) from a
+deterministic hash of its name, so some lights cast soft shadows
+and others crisp ones — stable across renders because the hash only
+depends on the name. The panel viewer does the same one step
+lighter (256/512/1024). 0.3.7 also fixes a shadow bug: a light the
+script lights on its own (the TV glow while its mapped entity is
+off) now shines and casts shadows — visibility and shadow casting
+follow the light's effective intensity after the script runs, not
+the mapped entity's on/off. Cameras can now be orthographic: `projection:
+orthographic` + `ortho_size` (frustum height in metres, default:
+fit the model) in `cameras.yaml`, and the panel viewer adopts the
+projection when you select the camera. A camera with no
+`background` now renders TRANSPARENT where no geometry is visible
+(alpha 0) instead of opaque black — a hex `background` still gives
+an opaque backdrop, and clips keep the transparency too. Sheer
+curtains behave like the real thing: a `SheerCurtain` mesh casts a
+dithered partial shadow (~45% of the sun gets through, broken up
+like a weave), glows warm when the sun is on its side, and
+`curtain_glow_*` lights (diffuse re-emission, never casting
+shadows) are driven from the sun by `scene.js`. Sunlight bouncing
+off the floor patch is emulated with one soft point light per
+sunlit window — models mark their windows with empty
+`window_<room>` nodes. The panel gains an Objects section (the fan
+and TV screen, with their driving entities from the script's
+`objectDrivers` export), clickable object markers in the 3D view, a
+spinning fan, and a TV screen that shows/hides with the TV — and
+the toggles are now emulation-only: flipping one sets a local
+preview override in the viewer (marked "(preview)", cleared by
+Reset preview) and never touches the real entity. A time-of-day
+sun slider moves the viewer's sun to any time (computed from your
+latitude/longitude), with a Live button to return to the real sun.
+The panel also re-fetches its data when the frontend reconnects
+after an HA restart, so a page loaded before the restart no longer
+keeps a stale mapping or sun forever.
+
 ## How lights are rendered
 
 The integration normalizes each mapped entity into a parameter set:
@@ -126,6 +162,8 @@ The service applies the parameters on top of the **model's base values**: the mo
 - color = entity color, else Kelvin→RGB of `color_temp_k`, else model color
 
 Unmapped lights render at their model base values. One approximation to know about: in RGB color modes the brightness lives partly in the color itself (HA docs), so a natively-RGB light with a dark color renders slightly dimmer than its brightness value alone would suggest.
+
+A light the user script lights on its own shines and casts shadows: after the script runs, each light's visibility and shadow casting follow its effective intensity (`visible = castShadow = intensity > 0`), not the mapped entity's on/off — so the TV glow shines and casts while its mapped entity is off (three.js skips invisible lights entirely, so syncing the shadow flag alone left a script-lit light dark). Each point light's shadow map size (512, 1024, or 2048) comes from a deterministic hash of its name, so some lights cast soft shadows and others crisp ones. `curtain_glow_*` lights never cast shadows — they are diffuse re-emission from a sheer curtain, not point sources — but they do become visible when lit.
 
 ## Light positions in the image
 
@@ -150,6 +188,8 @@ Each image entity also carries a `render_ms` attribute: the wall-clock milliseco
 ## The sun
 
 With sun enabled, the service adds a directional light from `sun.sun`'s `azimuth` and `elevation` attributes: position, warm-to-neutral color by elevation, and intensity ramping in over the first 30° above the horizon. Below the horizon the sun is off and the interior lights carry the scene. Every light casts shadows — the sun and each model light (point lights use cube shadow maps); off lights cast nothing. Shadow maps in the panel viewer update only when a light or the sun changes, and motion clips render shadows once and freeze them for the rest of the clip.
+
+Sheer curtains (`SheerCurtain` material) cast a dithered partial shadow — about 45% of the sun gets through, broken up like a weave — and glow warm when the sun is on their side. Sunlight bouncing off the floor patch is emulated with one soft point light per sunlit window (models mark their windows with empty `window_<room>` nodes); `curtain_glow_*` lights are the curtain's own re-emitted light, driven from the sun by `scene.js`. Neither casts shadows. See [[Creating Your Own Scene]] for the conventions.
 
 Renders are debounced (~1 s after a light change), serialized, and at most one every ~2 s. The sun re-renders when its elevation crosses a 5° step, on sunrise/sunset, or at most every 15 minutes while it is up.
 
@@ -191,6 +231,8 @@ overview:
   width: 1280
   height: 720
   fov: 50              # perspective only: override model's vertical FOV (degrees)
+  projection: perspective  # or orthographic (see below)
+  ortho_size: 17.18    # orthographic only: frustum height in metres (default: fit the model)
   near: 0.1            # override near clip plane
   far: 100             # override far clip plane
   position: [6, 8, 10] # override camera position (model units)
@@ -205,6 +247,17 @@ living_room:
     fps: 10       # frames per second (1..30)
 ```
 
+A camera with no `background` (null, or the key absent) renders
+TRANSPARENT where no geometry is visible — alpha 0 — instead of an
+opaque color; a hex value still gives an opaque backdrop, and clips
+keep the transparency too. An orthographic camera renders with a
+parallel projection: `ortho_size` is the frustum height in metres
+(the width follows from the aspect ratio), defaulting to the model's
+bounding-sphere diameter so the whole model fits. A native
+orthographic glTF camera keeps its own frustum unless `ortho_size`
+is set. The panel viewer adopts a camera's projection when you select
+it.
+
 All fields are optional. Merge precedence: **file value > model value** (FOV / near / far / position / target from the glTF camera or the computed virtual camera) **> global default** (width/height from the app options; background = scene default; exposure = 1.0). `GET /cameras` returns the effective merged config per camera.
 
 The file is hot-reloaded: the app watches it and picks up changes without a restart (the log says whether the reload succeeded). It never breaks rendering: an unknown camera name is logged and ignored, invalid values for one camera fall back to defaults for that camera only, and a malformed file keeps the last good config. One exception: an invalid `clip:` entry (duration 0.5–30, fps 1–30 as an integer, 2–300 frames total) drops the **whole camera entry** to defaults — check the log for `cameras.yaml` errors if a clip camera renders a still.
@@ -217,8 +270,8 @@ The app listens on port 3000 inside the container (no host port mapping needed �
 
 - `GET /health` — status, backend, model, scene lights, cameras, animations, user-script status, uptime, render count.
 - `GET /lights` — scene lights from the loaded model: `name`, `type` (`point` / `spot` / `directional`), `position`, `color` (hex), `intensity` (base, candela).
-- `GET /cameras` — scene cameras with their effective config (model + `cameras.yaml` + defaults merged): `name`, `type` (`perspective` / `orthographic`), `fov`, `near`, `far`, `position`, `target`, `width`, `height`, `background`, `exposure`, `clip` (`{duration, fps, frames}` or `null`), `source` (`model` / `builtin`).
-- `GET /script` — user-script status: `present`, `hash`, `subscribe`, `status` (`none` / `ok` / `error`), `error`, `last_error`, `error_count`.
+- `GET /cameras` — scene cameras with their effective config (model + `cameras.yaml` + defaults merged): `name`, `type` (`perspective` / `orthographic`), `fov`, `near`, `far`, `position`, `target`, `width`, `height`, `background`, `exposure`, `clip` (`{duration, fps, frames}` or `null`), `source` (`model` / `builtin`), `projection` (effective projection, `perspective` / `orthographic`), `ortho_size` (frustum height in metres for orthographic cameras, or `null`).
+- `GET /script` — user-script status: `present`, `hash`, `subscribe`, `object_drivers` (model object name → driving entity), `status` (`none` / `ok` / `error`), `error`, `last_error`, `error_count`.
 - `GET /model` — the loaded model GLB bytes (used by the sidebar panel through the integration's proxy; alias of `/model.glb`, which the Puppeteer render page uses).
 - `POST /render` — JSON body, returns one image per requested camera (PNG still, or animated WebP for clip cameras) plus the projected light positions per camera and the script status:
 

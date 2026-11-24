@@ -145,6 +145,42 @@ and restart.
 > on), and fixes scene.js in the default backend: an SES import bug
 > had silently disabled user scripts under node-webgl, so scene.js
 > only ever ran under the Puppeteer fallback.
+>
+> **0.3.7** makes shadows per-light soft: each point
+> light gets a shadow map size (512, 1024, or 2048) from a
+> deterministic hash of its name, so some lights cast soft shadows
+> and others crisp ones — stable across renders because the hash only
+> depends on the name. The panel viewer does the same one step
+> lighter (256/512/1024). 0.3.7 also fixes a shadow bug: a light the
+> script lights on its own (the TV glow while its mapped entity is
+> off) now shines and casts shadows — visibility and shadow casting
+> follow the light's effective intensity after the script runs, not
+> the mapped entity's on/off. Cameras can now be orthographic: `projection:
+> orthographic` + `ortho_size` (frustum height in metres, default:
+> fit the model) in `cameras.yaml`, and the panel viewer adopts the
+> projection when you select the camera. A camera with no
+> `background` now renders TRANSPARENT where no geometry is visible
+> (alpha 0) instead of opaque black — a hex `background` still gives
+> an opaque backdrop, and clips keep the transparency too. Sheer
+> curtains behave like the real thing: a `SheerCurtain` mesh casts a
+> dithered partial shadow (~45% of the sun gets through, broken up
+> like a weave), glows warm when the sun is on its side, and
+> `curtain_glow_*` lights (diffuse re-emission, never casting
+> shadows) are driven from the sun by `scene.js`. Sunlight bouncing
+> off the floor patch is emulated with one soft point light per
+> sunlit window — models mark their windows with empty
+> `window_<room>` nodes. The panel gains an Objects section (the fan
+> and TV screen, with their driving entities from the script's
+> `objectDrivers` export), clickable object markers in the 3D view, a
+> spinning fan, and a TV screen that shows/hides with the TV — and
+> the toggles are now emulation-only: flipping one sets a local
+> preview override in the viewer (marked "(preview)", cleared by
+> Reset preview) and never touches the real entity. A time-of-day
+> sun slider moves the viewer's sun to any time (computed from your
+> latitude/longitude), with a Live button to return to the real sun.
+> The panel also re-fetches its data when the frontend reconnects
+> after an HA restart, so a page loaded before the restart no longer
+> keeps a stale mapping or sun forever.
 
 ## What you get in Home Assistant
 
@@ -186,17 +222,40 @@ configured (and disappears if the integration is removed).
   brightness, off/unavailable lights are dim gray, unmapped lights are
   neutral white. The markers update live as entities change.
 - **Camera markers** show where each camera sits and where it points.
-  Click one to see that camera's latest render. The side list shows
-  every camera with its effective resolution.
+  Click one to jump the 3D viewer to that camera's viewpoint (adopting
+  its projection — an orthographic camera views orthographic) and see
+  its latest render. The side list shows every camera with its
+  effective resolution.
+- **Object markers** (purple) sit on the script-driven objects — the
+  ceiling fan and the TV screen — so they are findable in the viewer.
+  Click one for its driving entity and state.
 - **Sun marker** — the sun's position from `sun.sun`, hidden below the
   horizon.
-- **Side list** — every light (model name, mapped entity, live state)
-  and every camera.
+- **Side list** — every light (model name, mapped entity, live state),
+  every script-driven object (object name, driving entity, live
+  state), and every camera.
+- **Emulation-only toggles** — the light and object toggles do NOT
+  call any HA service: flipping one sets a local preview override in
+  the viewer only, so you can try "what if this light were on" without
+  touching the real house. Overridden rows are marked "(preview)";
+  **Reset preview** (next to the Lights heading) clears all overrides
+  and returns the viewer to the real entity states. Overrides are
+  session-local (gone on reload) and never affect the renders. The fan
+  spins in the viewer while its emulated state is on, and the TV toggle
+  shows/hides the TV screen plus its light.
+- **Time-of-day sun slider** — a Sun section with a 00:00–24:00 slider
+  moves the viewer's sun to the chosen time (computed from your
+  latitude/longitude, shown with its elevation/azimuth). **Live**
+  returns to the real sun. Viewer-only: it never affects the renders
+  or the real sun.
 
 The panel gets the model from the app (through the integration — the
 browser cannot reach the app directly) and the light mapping from the
 integration, which is the only place that knows it. If the app is
-unreachable the panel says so instead of showing a blank page.
+unreachable the panel says so instead of showing a blank page. The
+panel re-fetches its data (mapping, sun, cameras, script entities)
+when the frontend reconnects after an HA restart, so a page loaded
+before the restart picks up the new data without a manual reload.
 
 ## Light parametrization
 
@@ -233,9 +292,20 @@ With sun enabled, the service adds a directional light from `sun.sun`'s
 elevation, and intensity ramping in over the first 30° above the horizon.
 Below the horizon the sun is off and the interior lights carry the scene.
 Every light casts shadows — the sun and each model light (point lights
-use cube shadow maps); off lights cast nothing. Shadow maps in the panel
-viewer update only when a light or the sun changes, and motion clips
+use cube shadow maps); off lights cast nothing. Each point light's shadow
+map size (512, 1024, or 2048) comes from a deterministic hash of its name,
+so some lights cast soft shadows and others crisp ones. Shadow maps in the
+panel viewer update only when a light or the sun changes, and motion clips
 render shadows once and freeze them for the rest of the clip.
+
+Sheer curtains (`SheerCurtain` material) cast a dithered partial shadow —
+about 45% of the sun gets through, broken up like a weave — and glow warm
+when the sun is on their side. Sunlight bouncing off the floor patch is
+emulated with one soft point light per sunlit window (models mark their
+windows with empty `window_<room>` nodes); `curtain_glow_*` lights are the
+curtain's own re-emitted light, driven from the sun by `scene.js`. Neither
+casts shadows — both are diffuse re-emission, not point sources. See
+Creating Your Own Scene in the wiki for the conventions.
 
 ## Models
 
@@ -326,6 +396,8 @@ overview:
   width: 1280
   height: 720
   fov: 50              # perspective only: override model's vertical FOV (degrees)
+  projection: perspective  # or orthographic (see below)
+  ortho_size: 17.18    # orthographic only: frustum height in metres (default: fit the model)
   near: 0.1            # override near clip plane
   far: 100             # override far clip plane
   position: [6, 8, 10] # override camera position (model units)
@@ -339,6 +411,17 @@ living_room:
     duration: 3   # seconds per loop (0.5..30)
     fps: 10       # frames per second (1..30)
 ```
+
+A camera with no `background` (null, or the key absent) renders
+TRANSPARENT where no geometry is visible — alpha 0 — instead of an
+opaque color; a hex value still gives an opaque backdrop, and clips
+keep the transparency too. An orthographic camera renders with a
+parallel projection: `ortho_size` is the frustum height in metres
+(the width follows from the aspect ratio), defaulting to the model's
+bounding-sphere diameter so the whole model fits. A native
+orthographic glTF camera keeps its own frustum unless `ortho_size`
+is set. The panel viewer adopts a camera's projection when you select
+it.
 
 All fields are optional. Merge precedence: **file value > model value**
 (FOV / near / far / position / target from the glTF camera or the
@@ -381,6 +464,10 @@ status sensor.
 
 ```js
 export const subscribe = ["media_player.plex_plex_for_samsung_tv_2023"];
+export const objectDrivers = {
+  tv_screen: "media_player.plex_plex_for_samsung_tv_2023",
+  ceiling_fan: "light.wizcolor1",
+};
 export default function update({ entities, scene, time = 0 }) {
   const tv = entities["media_player.plex_plex_for_samsung_tv_2023"];
   const on = tv && (tv.state === "playing" || tv.state === "paused");
@@ -394,17 +481,27 @@ export default function update({ entities, scene, time = 0 }) {
 `subscribe` lists the entities the script reads (IDs, domains like
 `light.*`, globs like `sensor.*_temperature`); the integration sends
 only those (plus the mapped lights and `sun.sun`) and re-renders when
-one changes. `time` (seconds since the clip started) and `loop` (0..1
-across one loop) are optional — destructure only what you use. The
-script runs once per frame, after the built-in mapping, sun, and glTF
-animations, and sets **absolute** values (no `dt` parameter — a clip
-loops seamlessly when every animated value is periodic over the loop).
-The scene API: `getLight(name)` (`visible`, `intensity`, `color`),
+one changes. `objectDrivers` maps model object names to the entity
+driving each one — the panel lists those objects in its Objects section
+(with markers in the 3D view) and the integration re-renders when a
+driver entity changes, even if it is not in `subscribe`. `time`
+(seconds since the clip started) and `loop` (0..1 across one loop) are
+optional — destructure only what you use. The script runs once per
+frame, after the built-in mapping, sun, and glTF animations, and sets
+**absolute** values (no `dt` parameter — a clip loops seamlessly when
+every animated value is periodic over the loop). A light the script
+lights on its own shines and casts shadows: after the script runs,
+each light's visibility and shadow casting follow its effective
+intensity, so setting `intensity` alone is enough. The scene API:
+`getLight(name)` (`visible`, `intensity`, `color`),
 `getObject(name)` (`position`, `rotation`, `scale`, `visible`,
 `lookAt`), `getSun()`, `setMorph(object, morph, weight)`,
 `kelvinToRgb(k)`, plus `hasLight` / `hasObject` / `listLights` /
 `listObjects`. The script runs sandboxed in a SES Compartment: no
-`process`, no `require`, no network, no imports, no `eval`.
+`process`, no `require`, no network, no imports, no `eval`. The
+example script also drives the `curtain_glow_*` lights from the sun
+(see The sun above) — guarded with `hasLight`, so models without them
+run clean.
 
 ## Render service API
 
@@ -421,10 +518,12 @@ mapping needed — HA reaches it on the internal network).
   (`perspective` / `orthographic`), `fov`, `near`, `far`, `position`,
   `target`, `width`, `height`, `background`, `exposure`, `clip`
   (`{duration, fps, frames}` or `null`), `source`
-  (`model` / `builtin`).
+  (`model` / `builtin`), `projection` (effective projection,
+  `perspective` / `orthographic`), `ortho_size` (frustum height in
+  metres for orthographic cameras, or `null`).
 - `GET /script` — user-script status: `present`, `hash`, `subscribe`,
-  `status` (`none` / `ok` / `error`), `error`, `last_error`,
-  `error_count`.
+  `object_drivers` (model object name → driving entity), `status`
+  (`none` / `ok` / `error`), `error`, `last_error`, `error_count`.
 - `GET /model` — the loaded model GLB bytes (used by the sidebar panel
   through the integration's proxy; alias of `/model.glb`, which the
   Puppeteer render page uses).

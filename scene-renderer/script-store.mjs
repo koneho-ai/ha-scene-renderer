@@ -2,11 +2,11 @@
 // overridable with the SCENE_SCRIPT_PATH env var).
 //
 // The script is a small ESM-style module (see script.mjs): it must export
-// a default update function and may declare `export const subscribe`.
-// This module only loads and watches the file; compilation happens in the
-// render backend's realm (Node for node-webgl, the browser page for
-// puppeteer) via the injected `compile` function, which returns
-// { ok, subscribe, error }.
+// a default update function and may declare `export const subscribe` and
+// `export const objectDrivers`. This module only loads and watches the
+// file; compilation happens in the render backend's realm (Node for
+// node-webgl, the browser page for puppeteer) via the injected `compile`
+// function, which returns { ok, subscribe, objectDrivers, error }.
 //
 // Failure policy (never break rendering):
 //   - file missing -> no script (v1 behavior), not an error
@@ -27,9 +27,12 @@ const RELOAD_DEBOUNCE_MS = 200;
 export function createScriptStore({ filePath, log, compile }) {
   const fileName = basename(filePath);
   const dirPath = dirname(filePath);
-  // Status: { present, hash, subscribe, status, error }.
+  // Status: { present, hash, subscribe, object_drivers, status, error }.
   // status: 'none' (no file) | 'ok' (compiled) | 'error' (last compile failed).
-  let status = { present: false, hash: null, subscribe: [], status: "none", error: null };
+  // object_drivers maps model object names to their driving entity
+  // ({ ceiling_fan: "light.wizcolor1" }) — from the script's
+  // `export const objectDrivers`; the panel shows those objects.
+  let status = { present: false, hash: null, subscribe: [], object_drivers: {}, status: "none", error: null };
   let lastHash = null;
   let lastMtimeMs = 0;
   let lastExisted = false;
@@ -61,7 +64,7 @@ export function createScriptStore({ filePath, log, compile }) {
             log("error", `scene.js: failed to clear the script: ${compileErr.message}`);
           }
         }
-        status = { present: false, hash: null, subscribe: [], status: "none", error: null };
+        status = { present: false, hash: null, subscribe: [], object_drivers: {}, status: "none", error: null };
         lastHash = null;
         lastExisted = false;
         lastMtimeMs = 0;
@@ -90,6 +93,10 @@ export function createScriptStore({ filePath, log, compile }) {
         present: true,
         hash,
         subscribe: Array.isArray(result.subscribe) ? [...result.subscribe] : [],
+        object_drivers:
+          result.objectDrivers && typeof result.objectDrivers === "object"
+            ? { ...result.objectDrivers }
+            : {},
         status: "ok",
         error: null,
       };
@@ -132,7 +139,11 @@ export function createScriptStore({ filePath, log, compile }) {
     filePath,
 
     getStatus() {
-      return { ...status, subscribe: [...status.subscribe] };
+      return {
+        ...status,
+        subscribe: [...status.subscribe],
+        object_drivers: { ...status.object_drivers },
+      };
     },
 
     load,

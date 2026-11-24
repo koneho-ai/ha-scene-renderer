@@ -28,11 +28,30 @@
 //   - Per-camera overrides come from cameras.yaml (see camera-config.mjs):
 //     resolveCameraConfig() merges file > model > defaults, validating
 //     each entry; an invalid entry is dropped for that camera only.
+//     The file can also switch a camera's projection
+//     (perspective|orthographic) and set its ortho_size (frustum height
+//     in metres; default: fit the model's bounding sphere). When the
+//     effective projection differs from the model camera's type, a fresh
+//     camera of the wanted type is built at the same viewpoint for that
+//     render — the model camera itself is untouched.
 //   - renderCameras() renders a batch: light/sun state is applied once,
 //     then each requested camera renders against the already-loaded scene.
 //     Model cameras are shared objects, so overrides are applied per
 //     render and restored from the base values captured at load time —
 //     one camera's overrides never leak into the next camera's render.
+//
+// Shadows:
+//   - Every model light casts (point lights: cube maps). Each light's
+//     shadow map size (512/1024/2048) comes from a deterministic hash of
+//     its name, so some lights cast soft shadows and others crisp ones.
+//   - After the user script runs, castShadow is synced to the light's
+//     effective intensity (castShadow = intensity > 0), so a light the
+//     script lights on its own (the TV glow while its mapped entity is
+//     off) casts shadows too. Exception: curtain_glow_* lights never
+//     cast (diffuse re-emission, not point sources).
+//   - SheerCurtain meshes cast a partial, dithered shadow (~45% of the
+//     sun gets through, broken up like a weave) and glow warm when the
+//     sun is on their side (see updateCurtainGlow).
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
 import { runScriptCall } from "./script.mjs";
@@ -46,14 +65,34 @@ export const BASE_EXPOSURE = 1.1;
 const DEFAULT_CLEAR_COLOR = 0x000000;
 const DEFAULT_CLEAR_ALPHA = 0;
 
-// Point/spot shadow maps: one cube map (6 faces) per point light, so
-// 1024px is the quality/perf balance for the service. Bias values are
-// tuned for the flat low-poly surfaces of interior models: too little
-// bias shows acne, too much detaches shadows from their casters
-// (peter-panning). The sun keeps its own -0.0005 (proven in production).
-const POINT_SHADOW_MAP_SIZE = 1024;
+// Point/spot shadow maps: one cube map (6 faces) per point light.
+// Each light gets its map size from a deterministic hash of its name
+// (512, 1024 or 2048 px), so some lights cast soft/chunky shadows and
+// others crisp ones — three.js PCFSoftShadowMap ignores shadow.radius,
+// so map size is the only softness lever. Deterministic per name, so a
+// light's shadows look the same on every render. A 2048 cube map is
+// ~100 MB (6 faces x 2048^2 x 4 B), but only lights that are ON
+// allocate one, and the hash spreads the 14 sample lights 7/4/3 across
+// the sizes (worst case, all on: ~426 MB). Bias values are tuned for
+// the flat low-poly surfaces of interior models: too little bias shows
+// acne, too much detaches shadows from their casters (peter-panning).
+// The sun keeps its own -0.0005 (proven in production).
+export const POINT_SHADOW_MAP_SIZES = [512, 1024, 2048];
 const POINT_SHADOW_BIAS = -0.004;
 const POINT_SHADOW_NORMAL_BIAS = 0.02;
+
+// Shadow map size for one light, from a deterministic hash of its name
+// (FNV-1a, 32-bit). The panel viewer mirrors this with a lighter range
+// (256/512/1024); the hash itself is identical so the same light gets
+// the same relative softness in both. Exported for tests.
+export function shadowMapSizeForLight(name) {
+  let hash = 0x811c9dc5;
+  for (let i = 0; i < name.length; i += 1) {
+    hash ^= name.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return POINT_SHADOW_MAP_SIZES[(hash >>> 0) % POINT_SHADOW_MAP_SIZES.length];
+}
 
 // A mesh whose material is named "ShadowOnly" is invisible in the render
 // but still casts shadows: the convention for a ceiling slab over a
@@ -61,6 +100,138 @@ const POINT_SHADOW_NORMAL_BIAS = 0.02;
 // while the top-down view stays open. (The panel viewer mirrors this;
 // see scene-renderer-panel.js.)
 const SHADOW_ONLY_MATERIAL = "ShadowOnly";
+
+// Sheer curtains: a mesh whose material is named "SheerCurtain" is a
+// sheer curtain. Real sheer fabric lets roughly half the sunlight
+// through, broken up by the weave, and glows when the sun is behind
+// it. Two conventions implement that (the panel viewer mirrors both):
+//   - the mesh CASTS a partial shadow via a dithered depth material
+//     (fragments are discarded from the shadow map in a 2 cm
+//     world-space weave, so the sun gets through the discarded cells;
+//     CURTAIN_DITHER_DISCARD is the fraction discarded — measured
+//     ~45% transmission at 0.35 on the sample model, the sin-hash
+//     runs ~10 points hot for these cell coordinates; PCFSoft blurs
+//     the dither into a soft dimming instead of a hard window-shaped
+//     patch);
+//   - the mesh GLOWS (warm emissive) when the sun is on its side, with
+//     intensity proportional to sun intensity x alignment (see
+//     updateCurtainGlow). Each curtain mesh gets its own clone of the
+//     shared material so the two windows can glow independently.
+// Lights named curtain_glow_* are the curtain's re-emitted light (see
+// scene.example.js): diffuse re-emission, not point sources, so they
+// never cast shadows — see syncLightVisibilityAndShadow.
+const SHEER_CURTAIN_MATERIAL = "SheerCurtain";
+const CURTAIN_DITHER_DISCARD = 0.35;
+const CURTAIN_DITHER_CELL_M = 0.02;
+const CURTAIN_GLOW_COLOR = 0xfff2dd;
+const CURTAIN_GLOW_SCALE = 0.3;
+export const CURTAIN_GLOW_LIGHT_PREFIX = "curtain_glow_";
+
+// Bounce lights (emulated indirect illumination): when the sun shines
+// through a window, the bright patch on the floor re-illuminates the
+// room. A real bounce needs ray tracing; instead each sunlit window
+// gets one soft point light placed above the patch (see
+// updateBounceLights). The windows are marked by empty nodes named
+// window_<room> at the window centers — a model without markers gets
+// no bounce, silently. The panel viewer mirrors this.
+//   - transmission: how much sun the window's treatment lets through,
+//     by room (the bundled model has a fixed treatment per room;
+//     unknown rooms default to a bare window, 1.0). A curtained window
+//     gets BOTH a dim patch bounce and its curtain_glow_* light; a
+//     bare window gets a full bounce and no glow.
+//   - the bounce light never casts shadows (diffuse re-emission), has
+//     a short range (~room size), and peaks at ~20% of the direct
+//     sun's effect at 2 m (BOUNCE_SCALE), so the two re-emission
+//     paths never double-count into a blowout.
+export const WINDOW_MARKER_PREFIX = "window_";
+export const WINDOW_TRANSMISSION = {
+  living_room: 0.35, // sheer curtains
+  bedroom: 0.35, // sheer curtains
+  dining: 0.5, // horizontal blinds, semi-open
+  kids_bedroom: 0.5, // horizontal blinds, semi-open
+  kitchen: 0.5, // vertical blinds, semi-open
+  bathroom_1: 0.5, // vertical blinds, semi-open
+  // office, bathroom_2: bare windows (default 1.0)
+};
+const BOUNCE_FLOOR_ALBEDO = 0.5; // warm wood floor
+// 1.0 m above the patch, not 0.3 m: at 0.3 m the point light sits so
+// close to the floor that it burns a hot spot into the patch (peak
+// 233 in the live proof) while barely lifting the room — its light
+// hits the surrounding floor at a grazing angle (measured lift only
+// 8-13%, below the 15-25% target). At 1.0 m the hot spot is gone and
+// the room lift lands in the target band.
+const BOUNCE_HEIGHT_ABOVE_PATCH = 1.0;
+const BOUNCE_SCALE = 2.0;
+const BOUNCE_WARM = [1.0, 0.9, 0.75];
+
+// Inject a world-space dither discard into a depth material's shaders:
+// fragments in ~55% of the 2 cm cells are discarded, so the shadow is a
+// broken-up partial shadow instead of a solid one. The pattern is fixed
+// to the surface (world space, quantized to cells), so it is stable as
+// the sun moves — like a real weave. Exported for tests.
+export function injectCurtainDither(material, key) {
+  material.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nvarying vec3 vCurtainWorldPos;",
+      )
+      .replace(
+        "#include <begin_vertex>",
+        "#include <begin_vertex>\nvCurtainWorldPos = (modelMatrix * vec4(transformed, 1.0)).xyz;",
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        "#include <common>",
+        "#include <common>\nvarying vec3 vCurtainWorldPos;",
+      )
+      .replace(
+        "#include <clipping_planes_fragment>",
+        `#include <clipping_planes_fragment>
+        {
+          vec3 cell = floor(vCurtainWorldPos / ${CURTAIN_DITHER_CELL_M.toFixed(3)});
+          float h = fract(sin(dot(cell, vec3(12.9898, 78.233, 37.719))) * 43758.5453);
+          if (h < ${CURTAIN_DITHER_DISCARD.toFixed(2)}) discard;
+        }`,
+      );
+  };
+  // The program cache key must name the injection, or three.js may reuse
+  // a compiled program from an un-injected depth material.
+  material.customProgramCacheKey = () => key;
+  return material;
+}
+
+// Shared dithered depth materials (one per shadow type — the sun uses
+// the depth material, point lights the distance material). Stateless:
+// the dither pattern comes from the fragment's world position, so one
+// instance serves every curtain mesh. Exported for tests.
+let curtainDepthMaterial = null;
+let curtainDistanceMaterial = null;
+export function ditheredCurtainDepthMaterial() {
+  if (!curtainDepthMaterial) {
+    // DoubleSide: the curtain is a double-sided plane, and the sun can
+    // be on either side of it — a front-side-only depth material would
+    // cast no shadow when the sun is behind the plane's front face.
+    curtainDepthMaterial = injectCurtainDither(
+      new THREE.MeshDepthMaterial({ side: THREE.DoubleSide }),
+      "curtain-dither-depth",
+    );
+  }
+  return curtainDepthMaterial;
+}
+export function ditheredCurtainDistanceMaterial() {
+  if (!curtainDistanceMaterial) {
+    curtainDistanceMaterial = injectCurtainDither(
+      new THREE.MeshDistanceMaterial({ side: THREE.DoubleSide }),
+      "curtain-dither-distance",
+    );
+  }
+  return curtainDistanceMaterial;
+}
+
+function hasSheerCurtainMaterial(obj) {
+  return materialsOf(obj).some((m) => m.name === SHEER_CURTAIN_MATERIAL);
+}
 
 function materialsOf(obj) {
   if (Array.isArray(obj.material)) return obj.material;
@@ -82,7 +253,10 @@ function allMaterialsTransparent(obj) {
 // Apply the shadow/material rules to one model mesh at load: ShadowOnly
 // meshes write neither color nor depth (invisible, no occlusion) but
 // keep casting — the shadow pass uses its own depth material and is
-// unaffected by colorWrite/depthWrite. Exported for tests.
+// unaffected by colorWrite/depthWrite. SheerCurtain meshes cast a
+// PARTIAL shadow via the dithered depth materials (see above) instead
+// of the no-shadow the transparent rule would give them. Exported for
+// tests.
 export function applyMeshShadowRules(obj) {
   if (hasShadowOnlyMaterial(obj)) {
     for (const m of materialsOf(obj)) {
@@ -91,6 +265,18 @@ export function applyMeshShadowRules(obj) {
     }
     obj.castShadow = true;
     obj.receiveShadow = false;
+    return;
+  }
+  if (hasSheerCurtainMaterial(obj)) {
+    // A sheer curtain is transparent, so the rule below would give it
+    // no shadow at all and full sun would pass through like clear
+    // glass. Instead it casts a dithered partial shadow (both depth
+    // materials: the sun renders with the depth material, point lights
+    // with the distance material).
+    obj.castShadow = true;
+    obj.customDepthMaterial = ditheredCurtainDepthMaterial();
+    obj.customDistanceMaterial = ditheredCurtainDistanceMaterial();
+    obj.receiveShadow = true;
     return;
   }
   obj.castShadow = !allMaterialsTransparent(obj);
@@ -157,9 +343,24 @@ export async function loadModel(arrayBuffer) {
   // base values (captured once, so repeated renders never compound).
   const lights = new Map();
   const cameras = new Map();
+  const curtainMeshes = [];
+  const windowMarkers = [];
   scene.traverse((obj) => {
     if (obj.isMesh) {
       applyMeshShadowRules(obj);
+      if (hasSheerCurtainMaterial(obj)) curtainMeshes.push(obj);
+    }
+    // Window markers for bounce lights (see updateBounceLights):
+    // empty nodes named window_<room>. Meshes/lights/cameras with a
+    // window_ name are not markers.
+    if (
+      obj.name &&
+      obj.name.startsWith(WINDOW_MARKER_PREFIX) &&
+      !obj.isMesh &&
+      !obj.isLight &&
+      !obj.isCamera
+    ) {
+      windowMarkers.push(obj);
     }
     if (obj.isLight && obj.name) {
       obj.userData.baseIntensity = obj.intensity;
@@ -168,9 +369,15 @@ export async function loadModel(arrayBuffer) {
       // lights: 2D maps). Shadow camera near/far are set after the
       // bounds are known, below. applyLightStates switches castShadow
       // off with the light, so off lights cost no shadow passes.
-      obj.castShadow = true;
+      // Exception: curtain_glow_* lights are diffuse re-emission and
+      // never cast (see syncLightVisibilityAndShadow).
+      obj.castShadow = !obj.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX);
       if (obj.shadow) {
-        obj.shadow.mapSize.set(POINT_SHADOW_MAP_SIZE, POINT_SHADOW_MAP_SIZE);
+        // Per-light shadow softness: the map size comes from the light's
+        // name (see shadowMapSizeForLight). Set at load time, before the
+        // first render, so no map disposal is ever needed.
+        const mapSize = shadowMapSizeForLight(obj.name);
+        obj.shadow.mapSize.set(mapSize, mapSize);
         obj.shadow.bias = POINT_SHADOW_BIAS;
         obj.shadow.normalBias = POINT_SHADOW_NORMAL_BIAS;
       }
@@ -200,9 +407,60 @@ export async function loadModel(arrayBuffer) {
   const size = bounds.getSize(new THREE.Vector3());
   const diag = Math.max(size.x, size.y, size.z, 1);
 
-  // Point/spot shadow cameras: near tight to the light, far covering
-  // the whole model (any surface is at most diag away from any light
-  // inside it). A tighter far means better depth precision.
+  // Sheer curtains: each mesh gets its own clone of the shared material
+  // (so the two windows can glow independently) with a warm emissive
+  // that updateCurtainGlow drives per frame, and its outward normal
+  // (derived from the mesh, not hardcoded per room). World matrices
+  // must be current for the normal derivation.
+  scene.updateMatrixWorld(true);
+  const curtains = curtainMeshes.map((mesh) => {
+    const mats = materialsOf(mesh);
+    const sheer = mats.find((m) => m.name === SHEER_CURTAIN_MATERIAL);
+    let material = sheer;
+    if (sheer) {
+      material = sheer.clone();
+      material.emissive = new THREE.Color(CURTAIN_GLOW_COLOR);
+      material.emissiveIntensity = 0;
+      if (Array.isArray(mesh.material)) {
+        mesh.material = mesh.material.map((m) => (m === sheer ? material : m));
+      } else {
+        mesh.material = material;
+      }
+    }
+    return {
+      name: mesh.name,
+      mesh,
+      material,
+      outward: curtainOutwardNormal(mesh, center),
+    };
+  });
+
+  // Bounce-light windows: one renderer-owned point light per marker,
+  // created once here and repositioned per frame by
+  // updateBounceLights. Not part of `lights` (it is not a model light:
+  // no mapping, no projection, no shadow). The outward normal is
+  // derived like a curtain's (see curtainOutwardNormal): the marker's
+  // local +Z through its orientation, signed away from the model
+  // center — robust to the marker facing in or out. The floor plane
+  // is the bottom of the model's bounds (the floor slab's underside;
+  // a few centimetres low for a diffuse light 0.3 m above the patch
+  // is invisible). The range is ~room size, derived from the model.
+  const floorY = bounds.min.y;
+  const windows = windowMarkers.map((marker) => {
+    const room = marker.name.slice(WINDOW_MARKER_PREFIX.length);
+    const light = new THREE.PointLight(0xffffff, 0, diag * 0.4, 2);
+    light.castShadow = false;
+    light.name = `bounce_${room}`;
+    scene.add(light);
+    return {
+      name: marker.name,
+      room,
+      position: marker.getWorldPosition(new THREE.Vector3()),
+      outward: curtainOutwardNormal(marker, center),
+      transmission: WINDOW_TRANSMISSION[room] ?? 1.0,
+      light,
+    };
+  });
   for (const light of lights.values()) {
     if (!light.shadow) continue;
     light.shadow.camera.near = 0.1;
@@ -236,7 +494,7 @@ export async function loadModel(arrayBuffer) {
     animations.push({ name: clip.name, duration: clip.duration });
   }
 
-  return { scene, lights, cameras, bounds, center, size, diag, sun, hemi, mixer, animations, sunState: null };
+  return { scene, lights, cameras, curtains, windows, floorY, bounds, center, size, diag, sun, hemi, mixer, animations, sunState: null };
 }
 
 export function listLights(lights) {
@@ -295,6 +553,163 @@ export function applyLightStates(lights, params) {
       light.color.copy(light.userData.baseColor);
     }
   }
+}
+
+// Sync each light's visibility AND shadow casting to its EFFECTIVE
+// intensity, after the user script has run: visible = intensity > 0,
+// castShadow = intensity > 0. The built-in mapping above sets both
+// from the mapped entity's on/off, but the script can raise a light's
+// intensity on its own (the TV glow while light.lampy is off) —
+// without this sync that light would stay invisible (three.js skips
+// invisible lights entirely: no illumination, no shadow) and shine
+// without casting any shadow. A script that dims a mapped-on light
+// to 0 hides it and stops its shadow the same way. Exception:
+// curtain_glow_* lights are diffuse re-emission from a sheer curtain,
+// not point sources, so they NEVER cast shadows (no hard shadows
+// from a glow) — but they still become visible when lit. Exported
+// for tests.
+export function syncLightVisibilityAndShadow(lights) {
+  for (const [name, light] of lights) {
+    const lit = light.intensity > 0;
+    light.visible = lit;
+    light.castShadow =
+      lit && !name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX);
+  }
+}
+
+// Direction from the model toward the sun (HA convention: azimuth 0
+// = north, +X east, +Z south). Shared by updateCurtainGlow and
+// updateBounceLights.
+function sunDirection(sunState) {
+  const az = (sunState.azimuth * Math.PI) / 180;
+  const el = (sunState.elevation * Math.PI) / 180;
+  return new THREE.Vector3(
+    Math.cos(el) * Math.sin(az),
+    Math.sin(el),
+    -Math.cos(el) * Math.cos(az),
+  );
+}
+
+// Sheer-curtain glow: a curtain glows (warm emissive) when the sun is
+// on its side — backlit fabric. Intensity is proportional to sun
+// intensity x alignment (dot of the sun direction and the curtain's
+// outward normal); zero when the sun is on the other side or below
+// the horizon. Called per frame after the user script (the script can
+// move the sun). Exported for tests.
+export function updateCurtainGlow(model) {
+  const curtains = model.curtains || [];
+  if (curtains.length === 0) return;
+  const sun = model.sun;
+  const sunState = model.sunState;
+  if (!sun || !sunState || sunState.elevation <= 0 || sun.intensity <= 0) {
+    for (const c of curtains) c.material.emissiveIntensity = 0;
+    return;
+  }
+  const dirToSun = sunDirection(sunState);
+  for (const c of curtains) {
+    const alignment = Math.max(0, dirToSun.dot(c.outward));
+    c.material.emissiveIntensity =
+      CURTAIN_GLOW_SCALE * sun.intensity * alignment;
+  }
+}
+
+// Bounce lights (emulated indirect illumination): for each window
+// marker, when the sun is above the horizon and on the window's side,
+// place a soft point light just above the sun patch on the floor — the
+// patch re-illuminating the room. The patch is the analytic
+// intersection of the sunlight ray through the window center with the
+// floor plane (no scene raycast: cheap, deterministic, and the exact
+// patch shape does not matter for a diffuse light). A low sun throws
+// the patch far, so it is clamped inside the house — in reality the
+// patch would hit the far wall. Intensity is sun intensity x window
+// transmission x floor albedo x alignment (the window's projected
+// area) x BOUNCE_SCALE; color is the sun color warmed. The light is
+// created once at load and repositioned per frame, intensity 0 when
+// its window is dark. Called per frame after the user script (the
+// script can move the sun), next to updateCurtainGlow. Exported for
+// tests.
+export function updateBounceLights(model) {
+  const windows = model.windows || [];
+  if (windows.length === 0) return;
+  const sun = model.sun;
+  const sunState = model.sunState;
+  const dark =
+    !sun || !sunState || sunState.elevation <= 0 || sun.intensity <= 0;
+  const dirToSun = dark ? null : sunDirection(sunState);
+  // The sunlight travels toward the floor along -dirToSun.
+  const sunDir = dirToSun ? dirToSun.clone().negate() : null;
+  const bounds = model.bounds;
+  for (const w of windows) {
+    if (dark) {
+      w.light.intensity = 0;
+      continue;
+    }
+    // Sun on the window's side? (alignment is also the window's
+    // projected area, so it scales the intensity below.)
+    const alignment = dirToSun.dot(w.outward);
+    if (alignment <= 0) {
+      w.light.intensity = 0;
+      continue;
+    }
+    // Patch: window center + sun travel direction to the floor plane.
+    const t = (model.floorY - w.position.y) / sunDir.y;
+    if (!(t > 0)) {
+      w.light.intensity = 0;
+      continue;
+    }
+    const patch = w.position.clone().addScaledVector(sunDir, t);
+    if (bounds) {
+      patch.x = Math.min(
+        Math.max(patch.x, bounds.min.x + 0.2),
+        bounds.max.x - 0.2,
+      );
+      patch.z = Math.min(
+        Math.max(patch.z, bounds.min.z + 0.2),
+        bounds.max.z - 0.2,
+      );
+    }
+    patch.y = model.floorY + BOUNCE_HEIGHT_ABOVE_PATCH;
+    w.light.position.copy(patch);
+    w.light.intensity =
+      sun.intensity *
+      w.transmission *
+      BOUNCE_FLOOR_ALBEDO *
+      BOUNCE_SCALE *
+      alignment;
+    w.light.color
+      .copy(sun.color)
+      .multiply(new THREE.Color(BOUNCE_WARM[0], BOUNCE_WARM[1], BOUNCE_WARM[2]));
+  }
+}
+
+// A curtain's outward normal (the side the sun hits): the curtain is a
+// vertical plane facing local +Z; its world normal is that axis through
+// the node's orientation, with the sign from the model center — the
+// outward side points away from it (a curtain hangs in a window on an
+// exterior wall). The vertical component is dropped: a tilted mesh
+// still faces a compass direction. The position comes from the mesh's
+// bounding-box center, NOT the node's world position: Blender bakes
+// the curtain geometry in world coordinates, so the node itself sits
+// at the origin and its position says nothing about where the curtain
+// hangs. Empty nodes (window markers) have no geometry, so they fall
+// back to the node position. Exported for tests.
+export function curtainOutwardNormal(mesh, center) {
+  const normal = new THREE.Vector3(0, 0, 1).applyQuaternion(
+    mesh.getWorldQuaternion(new THREE.Quaternion()),
+  );
+  let position;
+  if (mesh.isMesh) {
+    position = new THREE.Box3().setFromObject(mesh).getCenter(
+      new THREE.Vector3(),
+    );
+  } else {
+    position = mesh.getWorldPosition(new THREE.Vector3());
+  }
+  const toMesh = position.sub(center);
+  if (normal.dot(toMesh) < 0) normal.negate();
+  normal.y = 0;
+  if (normal.lengthSq() < 1e-6) return new THREE.Vector3(0, 0, -1);
+  return normal.normalize();
 }
 
 // ---------------------------------------------------------------------------
@@ -485,13 +900,20 @@ function isHexColor(v) {
 // `defaults` is { width, height } (the add-on's global render size).
 // An invalid file entry is dropped wholesale for that camera (logged);
 // other cameras are unaffected. Returns the effective config:
-// { name, type, fov, near, far, position, target, width, height,
-//   background, exposure, source, clip } where clip is
-// { duration, fps, frames } or null (no clip key -> a still image).
+// { name, type, projection, ortho_size, fov, near, far, position,
+//   target, width, height, background, exposure, source, clip } where
+// type is the MODEL camera's type, projection is the EFFECTIVE
+// projection (file override, else the model type), ortho_size is the
+// orthographic frustum height in metres (null = fit the model's
+// bounding sphere, or the model camera's own frustum for a native
+// orthographic camera), and clip is { duration, fps, frames } or null
+// (no clip key -> a still image).
 export function resolveCameraConfig(info, fileEntry, defaults, log = () => {}) {
   const out = {
     name: info.name,
     type: info.type,
+    projection: info.type,
+    ortho_size: null,
     fov: info.fov,
     near: info.near,
     far: info.far,
@@ -515,6 +937,24 @@ export function resolveCameraConfig(info, fileEntry, defaults, log = () => {}) {
       `cameras.yaml: camera "${info.name}": invalid ${field} (${why}) — ignoring the whole entry, using defaults`,
     );
   };
+  // Effective projection first: the fov check below depends on it.
+  let projection = info.type;
+  if (fileEntry.projection !== undefined) {
+    if (fileEntry.projection !== "perspective" && fileEntry.projection !== "orthographic") {
+      invalid("projection", `want "perspective" or "orthographic", got ${JSON.stringify(fileEntry.projection)}`);
+      return out;
+    }
+    projection = fileEntry.projection;
+  }
+  if (fileEntry.ortho_size !== undefined) {
+    if (typeof fileEntry.ortho_size !== "number" || !Number.isFinite(fileEntry.ortho_size) || fileEntry.ortho_size <= 0) {
+      invalid("ortho_size", `want a number > 0 (frustum height in metres), got ${JSON.stringify(fileEntry.ortho_size)}`);
+      return out;
+    }
+    if (projection !== "orthographic") {
+      log("warning", `cameras.yaml: camera "${info.name}" is perspective — ortho_size is ignored`);
+    }
+  }
   // Validate everything first; a single bad field drops the entry.
   if (fileEntry.width !== undefined) {
     if (!Number.isInteger(fileEntry.width) || fileEntry.width < MIN_SIZE || fileEntry.width > MAX_WIDTH) {
@@ -529,7 +969,7 @@ export function resolveCameraConfig(info, fileEntry, defaults, log = () => {}) {
     }
   }
   if (fileEntry.fov !== undefined) {
-    if (info.type !== "perspective") {
+    if (projection !== "perspective") {
       log("warning", `cameras.yaml: camera "${info.name}" is orthographic — fov is ignored`);
     } else if (typeof fileEntry.fov !== "number" || !Number.isFinite(fileEntry.fov) || fileEntry.fov <= 0 || fileEntry.fov >= 180) {
       invalid("fov", `want a number 0..180, got ${JSON.stringify(fileEntry.fov)}`);
@@ -600,13 +1040,15 @@ export function resolveCameraConfig(info, fileEntry, defaults, log = () => {}) {
 
   if (fileEntry.width !== undefined) out.width = fileEntry.width;
   if (fileEntry.height !== undefined) out.height = fileEntry.height;
-  if (fileEntry.fov !== undefined && info.type === "perspective") out.fov = fileEntry.fov;
+  if (fileEntry.fov !== undefined && projection === "perspective") out.fov = fileEntry.fov;
   if (fileEntry.near !== undefined) out.near = fileEntry.near;
   if (fileEntry.far !== undefined) out.far = fileEntry.far;
   if (fileEntry.position !== undefined) out.position = fileEntry.position;
   if (fileEntry.target !== undefined) out.target = fileEntry.target;
   if (fileEntry.background !== undefined) out.background = fileEntry.background;
   if (fileEntry.exposure !== undefined) out.exposure = fileEntry.exposure;
+  out.projection = projection;
+  if (fileEntry.ortho_size !== undefined) out.ortho_size = fileEntry.ortho_size;
   out.clip = clip;
   return out;
 }
@@ -806,7 +1248,7 @@ export function createSceneApi(model) {
 // One frame of one camera. The pipeline (per frame):
 //   camera setup (reset to base + apply overrides) -> built-in light
 //   mapping -> sun -> glTF animations sampled at `time` -> user script
-//   -> render.
+//   -> shadow sync (castShadow follows effective intensity) -> render.
 // The built-in mapping is re-applied before every frame, so the script
 // always starts from the entity state and sets absolute values — frames
 // are independent and clips loop cleanly. A still is one frame at
@@ -844,6 +1286,16 @@ export function renderFrame({
       if (typeof onScriptError === "function") onScriptError(result.error);
     }
   }
+  // The script may have lit a light whose mapped entity is off (or
+  // dimmed one to 0): sync visibility and shadow casting to the
+  // effective intensity (see syncLightVisibilityAndShadow), so
+  // script-lit lights shine and cast shadows.
+  syncLightVisibilityAndShadow(model.lights);
+  // Sheer curtains glow from the FINAL sun state (the script may have
+  // moved the sun above).
+  updateCurtainGlow(model);
+  // Bounce lights track the sun patch per frame, same sun state.
+  updateBounceLights(model);
   setSize(cfg.width, cfg.height);
   if (cfg.background) {
     renderer.setClearColor(new THREE.Color(cfg.background), 1);
@@ -989,10 +1441,13 @@ export function renderCameras({
 }
 
 // Restore a model camera to the base values captured at load time, so a
-// previous render's overrides never leak into the next render.
+// previous render's overrides never leak into the next render. A fresh
+// camera (built for a projection switch) has no base — nothing to
+// restore, it is discarded after the render.
 function resetRenderCamera(model, info, camera) {
   if (info.source !== "model") return;
   const base = camera.userData.base;
+  if (!base) return;
   camera.position.copy(base.position);
   camera.quaternion.copy(base.quaternion);
   camera.near = base.near;
@@ -1009,11 +1464,89 @@ function resetRenderCamera(model, info, camera) {
   camera.updateProjectionMatrix();
 }
 
-// Build the camera to render with: a model camera with overrides applied
-// (restored to base first), or a fresh built-in camera.
-function getRenderCamera(model, info, cfg) {
+// The bounding sphere's diameter: the default ortho_size (an
+// orthographic camera with no ortho_size frames the whole model).
+// loadModel stores the bounding-box size; its diagonal is the sphere
+// diameter. Models without `size` (synthetic test models) fall back to
+// twice the largest extent. Exported for tests.
+export function boundingSphereDiameter(model) {
+  if (model.size) return model.size.length();
+  return (model.diag || 10) * 2;
+}
+
+// Frustum height for a freshly built orthographic camera: the
+// configured ortho_size, else the bounding sphere (fit the model).
+function freshOrthoHeight(model, cfg) {
+  if (typeof cfg.ortho_size === "number" && cfg.ortho_size > 0) return cfg.ortho_size;
+  return boundingSphereDiameter(model);
+}
+
+// Build a fresh camera of the wanted projection when the model camera's
+// type differs (a perspective model camera rendered orthographic, or a
+// native orthographic camera rendered perspective) or for a built-in
+// camera rendered orthographic. The fresh camera sits at the effective
+// position and aims along the model camera's forward direction (or at
+// the configured target), so switching projection never moves the
+// viewpoint. Fresh cameras are discarded after the render — the model
+// camera is untouched and needs no reset.
+function buildFreshCamera(model, info, cfg, projection) {
   const aspect = cfg.width / cfg.height;
+  const modelCamera = info.source === "model" ? model.cameras.get(info.name) : null;
+  let camera;
+  if (projection === "orthographic") {
+    const height = freshOrthoHeight(model, cfg);
+    const width = height * aspect;
+    camera = new THREE.OrthographicCamera(
+      -width / 2, width / 2, height / 2, -height / 2, cfg.near, cfg.far,
+    );
+  } else {
+    // A native orthographic camera carries no fov; 45° is the built-in
+    // virtual cameras' default.
+    camera = new THREE.PerspectiveCamera(cfg.fov ?? 45, aspect, cfg.near, cfg.far);
+  }
+  camera.position.set(...cfg.position);
+  if (modelCamera) camera.up.copy(modelCamera.up);
+  if (cfg.target !== null) {
+    // A target directly above/below the camera is parallel to the up
+    // vector and lookAt goes degenerate — use north-up, like the
+    // built-in topdown camera does.
+    const dir = new THREE.Vector3(...cfg.target).sub(camera.position).normalize();
+    if (Math.abs(dir.dot(camera.up)) > 0.999) camera.up.set(0, 0, -1);
+    camera.lookAt(new THREE.Vector3(...cfg.target));
+  } else if (modelCamera) {
+    // No target: keep the model camera's orientation (its node rotation
+    // is the framing the model author chose).
+    camera.quaternion.copy(modelCamera.getWorldQuaternion(new THREE.Quaternion()));
+  }
+  camera.updateProjectionMatrix();
+  return camera;
+}
+
+// Build the camera to render with: a model camera with overrides applied
+// (restored to base first), or a fresh built-in camera, or — when the
+// effective projection differs from the model camera's type — a fresh
+// camera of the wanted type at the same viewpoint. The matrices are
+// refreshed here (see getRenderCamera): a fresh camera is not in the
+// scene graph, so scene.updateMatrixWorld never reaches it, and lookAt
+// refreshes matrixWorldInverse BEFORE setting the orientation — a
+// camera built with a single lookAt would otherwise project with a
+// stale (translation-only) inverse.
+function getRenderCamera(model, info, cfg) {
+  const camera = buildRenderCamera(model, info, cfg);
+  camera.updateMatrixWorld();
+  return camera;
+}
+
+function buildRenderCamera(model, info, cfg) {
+  const aspect = cfg.width / cfg.height;
+  // Configs built before 0.3.7 have no projection field; the model
+  // camera's type is the default (projection: perspective|orthographic
+  // in cameras.yaml overrides it).
+  const projection = cfg.projection || info.type;
   if (info.source === "builtin") {
+    if (projection === "orthographic") {
+      return buildFreshCamera(model, info, cfg, "orthographic");
+    }
     const camera = createBuiltinCamera(info.name, model, aspect);
     if (cfg.fov !== null) camera.fov = cfg.fov;
     camera.near = cfg.near;
@@ -1027,19 +1560,36 @@ function getRenderCamera(model, info, cfg) {
   }
 
   const camera = model.cameras.get(info.name);
+  if (projection === "orthographic" && !camera.isOrthographicCamera) {
+    return buildFreshCamera(model, info, cfg, "orthographic");
+  }
+  if (projection === "perspective" && !camera.isPerspectiveCamera) {
+    return buildFreshCamera(model, info, cfg, "perspective");
+  }
   resetRenderCamera(model, info, camera);
   if (camera.isPerspectiveCamera) {
     camera.aspect = aspect;
     if (cfg.fov !== null) camera.fov = cfg.fov;
   } else {
-    // Orthographic cameras have no aspect: keep the horizontal frustum
-    // and fit the vertical one to the render aspect, so the image is not
-    // stretched when the render size differs from the model's frustum.
-    const base = camera.userData.base;
-    const frustumWidth = base.right - base.left;
-    const frustumHeight = frustumWidth / aspect;
-    camera.top = frustumHeight / 2;
-    camera.bottom = -frustumHeight / 2;
+    // Orthographic model camera, rendered orthographic.
+    if (typeof cfg.ortho_size === "number" && cfg.ortho_size > 0) {
+      // Explicit frustum height (width follows the render aspect).
+      const frustumHeight = cfg.ortho_size;
+      const frustumWidth = frustumHeight * aspect;
+      camera.left = -frustumWidth / 2;
+      camera.right = frustumWidth / 2;
+      camera.top = frustumHeight / 2;
+      camera.bottom = -frustumHeight / 2;
+    } else {
+      // No ortho_size: keep the model's horizontal frustum and fit the
+      // vertical one to the render aspect, so the image is not
+      // stretched when the render size differs from the model's frustum.
+      const base = camera.userData.base;
+      const frustumWidth = base.right - base.left;
+      const frustumHeight = frustumWidth / aspect;
+      camera.top = frustumHeight / 2;
+      camera.bottom = -frustumHeight / 2;
+    }
   }
   camera.near = cfg.near;
   camera.far = cfg.far;

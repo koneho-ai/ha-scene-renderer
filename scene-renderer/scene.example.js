@@ -2,8 +2,9 @@
 // /share/scene-renderer/scene.js (or the path in SCENE_SCRIPT_PATH) and
 // edit to taste. The file is hot-reloaded: save it and the next render
 // uses the new script. This example drives the sample model's living
-// room TV from the Samsung TV's Plex client, and its ceiling fan from
-// a light (for testing).
+// room TV from the Samsung TV's Plex client, its ceiling fan from a
+// light (for testing), and the sheer curtains' glow lights from the
+// sun.
 //
 // The script is a small ESM-style module:
 //   - export a default function update({ entities, scene, time, loop })
@@ -13,6 +14,10 @@
 //     entities (plus the mapped lights and sun.sun) and re-renders when
 //     one of them changes. No subscribe list -> the script only sees
 //     the mapped lights and sun.sun.
+//   - optionally export `const objectDrivers = {...}` mapping model
+//     object names to the entity that drives each one
+//     ({ ceiling_fan: "light.wizcolor1" }). The sidebar panel shows
+//     those objects with their driving entity and a toggle.
 //
 // Contract (important for clips):
 //   - The service re-applies the built-in light/sun mapping before every
@@ -44,7 +49,38 @@ const TV_SCREEN = "tv_screen"; // the screen mesh (bright emissive material)
 const FAN_ENTITY = "light.wizcolor1";
 const FAN_OBJECT = "ceiling_fan"; // group node: hub + 4 blades
 
+// Curtain glow lights: the sheer curtains re-emit the sunlight that
+// hits them as a soft diffuse glow just inside the window. The model
+// has one point light just inside each curtained window (base
+// intensity 0 — the renderer treats curtain_glow_* lights as
+// non-shadow-casting by name, since they are diffuse re-emission, not
+// point sources). Each light's window faces a compass direction (the
+// living room window faces north, the bedroom's south); the glow
+// follows the sun's alignment with that side: full when the sun is
+// square on the window, zero when it is behind the house or below the
+// horizon. Guarded with hasLight, so models without the glow lights
+// run clean.
+const CURTAIN_GLOW_LIGHTS = [
+  { light: "curtain_glow_living_room", windowAzimuth: 0 }, // north
+  { light: "curtain_glow_bedroom", windowAzimuth: 180 }, // south
+];
+const CURTAIN_GLOW_MAX = 10;
+const CURTAIN_GLOW_COLOR = [255, 240, 214]; // warm white
+
 export const subscribe = [TV_ENTITY, FAN_ENTITY];
+
+// Which entity drives which model object. The sidebar panel shows these
+// objects with their driving entity and a toggle — the flat subscribe
+// list above cannot say that the fan belongs to the light and the
+// screen belongs to the media player, so this mapping says it
+// explicitly. Keys are model object names (any named node, not just
+// meshes); values are exact entity IDs, not patterns. An object the
+// model does not have is skipped by the panel, so the same file works
+// against any model.
+export const objectDrivers = {
+  [FAN_OBJECT]: FAN_ENTITY,
+  [TV_SCREEN]: TV_ENTITY,
+};
 
 // Hue (0..1) -> sRGB [r, g, b] 0..255 at full saturation, lightness 0.6.
 function hueToRgb(h) {
@@ -101,5 +137,38 @@ export default function update({ entities, scene, time = 0, loop = 0 }) {
     // angle at loop 0 and loop 1); parked at 0 when it is off. A still
     // (loop 0) always shows the fan at rest.
     fan.rotation.y = spinning ? loop * Math.PI * 2 : 0;
+  }
+
+  // Curtain glow: re-emitted sunlight from the sheer curtains. No
+  // subscribe entry is needed — the sun is always sent to the script,
+  // and the integration re-renders as it moves.
+  const sun = scene.getSun();
+  const sunAz = sun.azimuth;
+  const sunEl = sun.elevation;
+  const sunI = sun.intensity;
+  for (const { light: name, windowAzimuth } of CURTAIN_GLOW_LIGHTS) {
+    if (!scene.hasLight(name)) continue;
+    const glow = scene.getLight(name);
+    let intensity = 0;
+    if (
+      typeof sunAz === "number" &&
+      typeof sunEl === "number" &&
+      typeof sunI === "number" &&
+      sunEl > 0 &&
+      sunI > 0
+    ) {
+      // Alignment of the sun with the window's side: 1 when the sun is
+      // square on the window, 0 at 90 deg or behind the house. The
+      // cos(elevation) term is the 3D dot product — a high sun shines
+      // through a vertical window less than a low one.
+      const alignment = Math.max(
+        0,
+        Math.cos(((sunAz - windowAzimuth) * Math.PI) / 180) *
+          Math.cos((sunEl * Math.PI) / 180),
+      );
+      intensity = CURTAIN_GLOW_MAX * (sunI / 3.0) * alignment;
+    }
+    glow.intensity = intensity;
+    glow.color = CURTAIN_GLOW_COLOR;
   }
 }

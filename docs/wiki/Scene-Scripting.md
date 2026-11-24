@@ -14,6 +14,16 @@ The script is a small module with one required export:
 // lights and the sun.
 export const subscribe = ["sun.sun"];
 
+// Which model objects each entity drives (object name -> entity id).
+// The panel lists these objects in its Objects section (with markers
+// in the 3D view), and the integration re-renders when a driver entity
+// changes, even if it is not in `subscribe`. Omit it if the script
+// drives no objects.
+export const objectDrivers = {
+  tv_screen: "media_player.plex_plex_for_samsung_tv_2023",
+  ceiling_fan: "light.wizcolor1",
+};
+
 export default function update({ entities, scene, time, loop }) {
   // entities: { "sun.sun": { state, attributes }, ... } — the snapshot
   //   for this render (frozen across a clip's frames).
@@ -24,7 +34,8 @@ export default function update({ entities, scene, time, loop }) {
 ```
 
 - **`subscribe`** lists the entities the script reads: entity IDs, domains like `light.*`, globs like `sensor.*_temperature`. The integration sends only those (plus the mapped lights and `sun.sun`) and re-renders when one changes. An entity the script reads but does not subscribe to is never sent. Omit the list if the script only uses the mapped lights and the sun.
-- **`update({ entities, scene, time, loop })`** runs once per frame, after the built-in light mapping, the sun, and the model's glTF animations are applied — so it always starts from the entity state and sets **absolute** values, never increments (there is deliberately no `dt` parameter).
+- **`objectDrivers`** maps model object names to the entity driving each one. The panel lists those objects in its Objects section (with markers in the 3D view), and the integration re-renders when a driver entity changes, even if it is not in `subscribe`. Only objects that exist in the model are listed — a driver for an object the model does not have is skipped quietly, so the same script works against any model. It must be a plain object of string → string; anything else fails compilation.
+- **`update({ entities, scene, time, loop })`** runs once per frame, after the built-in light mapping, the sun, and the model's glTF animations are applied — so it always starts from the entity state and sets **absolute** values, never increments (there is deliberately no `dt` parameter). A light the script lights on its own shines and casts shadows: after the script runs, each light's visibility and shadow casting follow its effective intensity, so setting `intensity` alone is enough — you do not need to set `visible` yourself.
 - **`time`** (seconds since the clip started) and **`loop`** (0..1 across one loop of the clip) are **optional** — destructure only what you use; there is no signature checking. A script that only maps entities never mentions them.
 - A clip loops seamlessly when every animated value is periodic over the loop (same value at `loop` 0 and 1) — e.g. `fan.rotation.y = loop * Math.PI * 2` is one whole turn per loop. A still is one frame at time 0.
 
@@ -51,6 +62,7 @@ Note there is no separate sun parameter: `sun.sun` is an entity like any other, 
 - **TV on/off** — when Plex is playing, paused, or idle, the TV is on: the `tv_screen` mesh becomes visible and the `living_room_tv` point light in front of the screen glows. When Plex is unavailable, the screen goes dark — but the light is left alone, because `living_room_tv` is mapped as a light in the YAML and its entity drives the glow when the TV is off. (Limitation: if the TV is on but Plex is not running, the client is unavailable and the glow stays off — swap in a better "TV is on" entity, e.g. a smart plug, if you have one.)
 - **Colorful glow** — while on, the light's color drifts slowly through the hues (one full cycle every 20 s) with a fast flicker on top, like a real screen. Absolute values from `time`, so frames stay independent; a still gets a fixed color, a clip shows the glow shifting.
 - **Ceiling fan** — the `ceiling_fan` group spins when `light.wizcolor1` is on (one full turn per loop, so clips loop seamlessly) and parks at 0 when it is off. Any light works here; the point is that a script can drive an object from any entity.
+- **Curtain glow** — the `curtain_glow_*` lights (the sheer curtains' re-emitted sunlight) are driven from the sun: intensity from the sun's elevation/azimuth alignment with each window's side, warm color, 0 at night. Guarded with `hasLight`, so models without them run clean.
 - **Defensive** — each block bails out quietly (`hasLight`/`hasObject`) when the model lacks its parts, so the same file works against any model.
 
 ## Security model

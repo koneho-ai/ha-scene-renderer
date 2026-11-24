@@ -1,42 +1,58 @@
-"""Coordinator: watches light + sun state, drives renders.
+"""Coordinator: watches entity + sun state, drives renders.
 
-The coordinator subscribes to state changes of the mapped light entities
+The coordinator subscribes to state changes of the YAML ``entities``
+list (plus the script's subscriptions and the YAML object drivers)
 and of the configured sun entity (``sun.sun`` by default, or none when
-the sun is disabled in YAML). Light changes re-render on a 1-second trailing
-debounce — a burst of changes collapses into one render 1 s after the
-last change — with a 5-second max wait, so an entity that changes
-non-stop forces a render instead of starving one. The sun re-renders
-when its elevation crosses a 5-degree step, on above/below-horizon
-transitions, or at most every 15 minutes while it is up. Renders are
-serialized with a 2-second minimum interval and coalesced (latest state
-wins).
+the sun is disabled in YAML). Entity changes re-render on a 1-second
+trailing debounce — a burst of changes collapses into one render 1 s
+after the last change — with a 5-second max wait, so an entity that
+changes non-stop forces a render instead of starving one. The sun
+re-renders when its elevation crosses a 5-degree step, on
+above/below-horizon transitions, or at most every 15 minutes while it
+is up. Renders are serialized with a 2-second minimum interval and
+coalesced (latest state wins).
 
-Each update is ONE batch render request carrying the light parameters,
-the sun, the subscribed entity snapshot, and the selected cameras; the
-service returns one image per camera — a PNG still, or an animated WebP
-clip for cameras with a clip: entry in cameras.yaml — stored in
-:attr:`renders` (bytes) and :attr:`content_types`, and served by one
-image entity per camera. The service also returns the projected position
-of every model light in each camera's image (pixels + percentages +
-in-frame flag, see scene.mjs projectLights), stored in
-:attr:`light_positions`; the image entities expose them as attributes
-with the mapped entity_id and live state added. The service also
+Each update is ONE batch render request carrying the subscribed entity
+snapshot, the sun, the moon (lunar ephemeris for the HA config lat/lon
+and now, so the night renders get moonlight; None when the sun is
+disabled), and the selected cameras; the service returns one image per
+camera — a PNG still, or an animated WebP clip for cameras with a
+clip: entry in cameras.yaml — stored in :attr:`renders` (bytes) and
+:attr:`content_types`, and served by one image entity per camera. The
+service also returns the projected position of every model light in
+each camera's image (pixels + percentages + in-frame flag, see
+scene.mjs projectLights), stored in :attr:`light_positions`; the image
+entities expose them as attributes with the entity_id from the
+script's ``lightMapping`` and live state added. The service also
 reports the wall-clock milliseconds each camera's render took,
 stored in :attr:`render_ms` and exposed as the image entity's
 ``render_ms`` attribute (``last_render_ms`` is the whole batch
 including the HTTP round trip, for the status sensor).
 
-Scripting (scene.js): the service exposes the script's ``subscribe``
-list via GET /script. The coordinator resolves those patterns (exact
-entity IDs, ``domain.*``, globs) against the state machine, subscribes
-to the resolved entities, and sends their state in every render request
+Scripting (scene.js): the light→entity mapping lives in the script,
+not in YAML — the script exports a ``lightMapping`` table (model light
+name -> entity id) and applies it every frame (on -> model base x
+brightness, color from the entity, color_temp supported; lights not
+in the table render off). The coordinator sends NO light parameters
+(the payload's ``lights`` is empty): it sends the subscribed entity
+states and the script maps them to lights. The service exposes the
+script's ``lightMapping`` in its script status (same pattern as
+``objectDrivers``); the coordinator reads it from there for the
+panel's Lights section and the image attributes, and warns when the
+table references an entity it does not subscribe to (the script
+would never see its state).
+
+The service also exposes the script's ``subscribe`` list via GET
+/script. The coordinator resolves those patterns (exact entity IDs,
+``domain.*``, globs) against the state machine, subscribes to the
+resolved entities, and sends their state in every render request
 (``entities`` in the payload). When a render response carries a new
 script hash, the coordinator re-fetches the subscriptions, re-subscribes,
-and re-renders with the new entity set. No script -> the built-in set
-(mapped lights + sun) only. The script may also declare
-``objectDrivers`` (model object name -> driving entity ID); those
-entities are tracked the same way, and the panel shows the objects
-with their driving entity and a toggle.
+and re-renders with the new entity set. No script -> the YAML entities
++ sun only. The script may also declare ``objectDrivers`` (model
+object name -> driving entity ID); those entities are tracked the same
+way, and the panel shows the objects with their driving entity and a
+toggle.
 
 The YAML ``objects`` mapping does the same for objects without a
 script: model object name -> driving entity ID (e.g. the ceiling fan
@@ -46,15 +62,11 @@ script's ``objectDrivers`` for the Objects section, YAML winning on
 conflict. The mapping only links object and entity — the script (or
 the panel viewer's own fan/TV handling) still does the animating.
 
-Light parametrization: each mapped entity is normalized into a render
-parameter set (see :func:`normalize_light_state`):
-
-    {"on": bool, "brightness": 0.0-1.0 | None,
-     "color": [r, g, b] | None, "color_temp_k": int | None}
-
-The render service applies these on top of the model's base light values
-(intensity = base x brightness; color = entity color, else Kelvin->RGB,
-else the model's base color).
+The YAML ``lights`` mapping is deprecated and ignored: if present,
+setup logs a warning with the equivalent ``lightMapping`` table (see
+``__init__``). The light parametrization the coordinator used to do
+(on/brightness/color/color_temp per mapped entity) now lives in the
+script — see ``scene.example.js`` ``applyLightMapping``.
 """
 from __future__ import annotations
 
@@ -71,7 +83,6 @@ from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
 )
-from homeassistant.util import color as color_util
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -84,6 +95,7 @@ from .const import (
     SUN_MAX_INTERVAL,
     SUN_STEP_DEGREES,
 )
+from .moon import moon_position as lunar_position
 from .service import RenderServiceClient, RenderServiceError
 
 _LOGGER = logging.getLogger(__name__)
@@ -92,64 +104,6 @@ STATUS_IDLE = "idle"
 STATUS_RENDERING = "rendering"
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
-
-
-def _rgb_color(attrs: dict[str, Any]) -> list[int] | None:
-    """Entity color as [r, g, b] 0-255, from rgb/hs/xy attributes."""
-    rgb = attrs.get("rgb_color")
-    if rgb is not None:
-        return [int(rgb[0]), int(rgb[1]), int(rgb[2])]
-    hs = attrs.get("hs_color")
-    if hs is not None:
-        return list(color_util.color_hs_to_RGB(hs[0], hs[1]))
-    xy = attrs.get("xy_color")
-    if xy is not None:
-        return list(color_util.color_xy_to_RGB(xy[0], xy[1]))
-    return None
-
-
-def _color_temp_kelvin(attrs: dict[str, Any]) -> int | None:
-    """Color temperature in kelvin, from the kelvin or legacy mireds attr."""
-    kelvin = attrs.get("color_temp_kelvin")
-    if isinstance(kelvin, (int, float)):
-        return int(kelvin)
-    # Legacy attribute (current HA uses color_temp_kelvin).
-    mireds = attrs.get("color_temp")
-    if isinstance(mireds, (int, float)) and mireds > 0:
-        return int(1_000_000 / mireds)
-    return None
-
-
-def normalize_light_state(state: State | None) -> dict[str, Any]:
-    """Normalize an HA light state into a render parameter set.
-
-    - on: only ``state == "on"``; unavailable/unknown/off all render as off.
-    - brightness: brightness attr / 255; None when the entity has no
-      brightness (on/off only) — the service treats that as 1.0.
-    - color / color_temp_k: color_mode decides the priority when both are
-      present (color_temp mode -> temperature, hs/xy/rgb modes -> color).
-    """
-    if state is None or state.state != "on":
-        return {"on": False, "brightness": None, "color": None, "color_temp_k": None}
-    attrs = state.attributes
-    brightness = attrs.get("brightness")
-    brightness = (
-        brightness / 255 if isinstance(brightness, (int, float)) else None
-    )
-    color: list[int] | None = None
-    color_temp_k: int | None = None
-    if attrs.get("color_mode") == "color_temp":
-        color_temp_k = _color_temp_kelvin(attrs)
-    else:
-        color = _rgb_color(attrs)
-        if color is None:
-            color_temp_k = _color_temp_kelvin(attrs)
-    return {
-        "on": True,
-        "brightness": brightness,
-        "color": color,
-        "color_temp_k": color_temp_k,
-    }
 
 
 def _jsonable(value: Any) -> Any:
@@ -193,7 +147,8 @@ class SceneRenderCoordinator:
         sun_entity_id: str | None = SUN_ENTITY_ID,
         sun_elevation: float | None = None,
         sun_azimuth: float | None = None,
-        mapping: dict[str, str] | None = None,
+        north_offset: float = 0,
+        entities: list[str] | None = None,
         objects: dict[str, str] | None = None,
         cameras: list[str] | None = None,
         name: str = DEFAULT_NAME,
@@ -213,7 +168,22 @@ class SceneRenderCoordinator:
             if sun_elevation is not None and sun_azimuth is not None
             else None
         )
-        self.mapping: dict[str, str] = dict(mapping or {})
+        # North offset (degrees, 0–360, normalized): the true-north
+        # azimuth the model's north side (-Z) faces. 0 = the model is
+        # laid out true-north-up. The coordinator does NOT apply it to
+        # the sun/moon itself — it forwards it in the render payload
+        # and panel_data, and the renderers (service scene.mjs, panel
+        # viewer) rotate the true-north azimuths into model frame
+        # (see scene.mjs modelAzimuth), so the sun, moon, fixed pin
+        # and panel slider all agree.
+        self.north_offset: float = float(north_offset) % 360
+        # The YAML `entities` list: the entities the integration
+        # subscribes to. Their states are sent to the render service
+        # in every render request, and the script maps them to model
+        # lights via its `lightMapping` table. Sorted + deduplicated.
+        # (The old YAML `lights` mapping is deprecated and ignored —
+        # see __init__.)
+        self.entities: list[str] = sorted(set(entities or []))
         # YAML `objects` mapping: model object name -> driving entity
         # id. Its entities are tracked like the script's object
         # drivers (see _tracked_entities), and panel_data exposes the
@@ -248,15 +218,21 @@ class SceneRenderCoordinator:
 
         # User script (scene.js) status, from GET /script and each render
         # response: {"present", "hash", "subscribe", "object_drivers",
-        # "status", "error", "last_error", "error_count"}. Starts as
-        # "no script". object_drivers maps model object names to the
-        # entity driving each one (the script's `objectDrivers` export);
-        # the panel shows those objects with their entity and a toggle.
+        # "light_mapping", "status", "error", "last_error",
+        # "error_count"}. Starts as "no script". object_drivers maps
+        # model object names to the entity driving each one (the
+        # script's `objectDrivers` export); the panel shows those
+        # objects with their entity and a toggle. light_mapping maps
+        # model light names to the entity driving each one (the
+        # script's `lightMapping` export) — it is THE light→entity
+        # mapping; the panel shows it in the Lights section and the
+        # image entities use it for their light attributes.
         self.script_status: dict[str, Any] = {
             "present": False,
             "hash": None,
             "subscribe": [],
             "object_drivers": {},
+            "light_mapping": {},
             "status": "none",
             "error": None,
             "last_error": None,
@@ -265,6 +241,7 @@ class SceneRenderCoordinator:
         self._script_hash: str | None = None
         self._script_patterns: list[str] = []
         self._script_object_drivers: dict[str, str] = {}
+        self._script_light_mapping: dict[str, str] = {}
         # Entities the script reads (resolved from the subscribe patterns
         # plus the object driver entities).
         self._script_entities: set[str] = set()
@@ -371,11 +348,35 @@ class SceneRenderCoordinator:
             return None
         return {"elevation": elevation, "azimuth": azimuth}
 
+    def moon_position(self) -> dict[str, float] | None:
+        """The moon position the renders use, from the lunar ephemeris
+        (moon.py) for the HA config lat/lon and now. None when the sun
+        is disabled (no day/night cycle, so no moon either) or the
+        location is unavailable. The position is always the real one;
+        the renderer keys the moonlight fade off the effective sun
+        elevation, so a pinned daytime sun keeps the moon off. No
+        separate moon re-render trigger: the sun's 5-degree
+        quantization already re-renders through the night (about
+        every 20 minutes), refreshing the moon, which moves only
+        ~0.5 degrees per hour."""
+        if not self.sun_enabled:
+            return None
+        config = getattr(self.hass, "config", None)
+        latitude = getattr(config, "latitude", None) if config else None
+        longitude = getattr(config, "longitude", None) if config else None
+        if not isinstance(latitude, (int, float)) or not isinstance(
+            longitude, (int, float)
+        ):
+            return None
+        pos = lunar_position(dt_util.utcnow(), latitude, longitude)
+        return {"elevation": pos["elevation"], "azimuth": pos["azimuth"]}
+
     @property
     def _tracked_entities(self) -> set[str]:
-        """Every entity whose changes re-render: mapped lights + sun +
-        the YAML object drivers + the script's resolved subscriptions."""
-        entities = set(self.mapping.values())
+        """Every entity whose changes re-render: the YAML entities list
+        + sun + the YAML object drivers + the script's resolved
+        subscriptions."""
+        entities = set(self.entities)
         if self.sun_enabled and self.sun_fixed is None:
             entities.add(self.sun_entity_id)
         entities.update(self.objects.values())
@@ -406,11 +407,20 @@ class SceneRenderCoordinator:
             for k, v in drivers.items()
             if isinstance(k, str) and isinstance(v, str)
         }
+        light_mapping = script_info.get("light_mapping") or {}
+        if not isinstance(light_mapping, dict):
+            light_mapping = {}
+        light_mapping = {
+            k: v
+            for k, v in light_mapping.items()
+            if isinstance(k, str) and isinstance(v, str)
+        }
         self.script_status = {
             "present": script_info.get("present", False),
             "hash": script_info.get("hash"),
             "subscribe": list(script_info.get("subscribe") or []),
             "object_drivers": dict(drivers),
+            "light_mapping": dict(light_mapping),
             "status": script_info.get("status", "none"),
             "error": script_info.get("error"),
             "last_error": script_info.get("last_error"),
@@ -422,10 +432,12 @@ class SceneRenderCoordinator:
             new_hash != self._script_hash
             or patterns != self._script_patterns
             or drivers != self._script_object_drivers
+            or light_mapping != self._script_light_mapping
         )
         self._script_hash = new_hash
         self._script_patterns = patterns
         self._script_object_drivers = drivers
+        self._script_light_mapping = light_mapping
         if changed:
             self._script_entities = self._resolve_script_patterns(patterns)
             # The driver entities are entities the script reads too:
@@ -434,6 +446,25 @@ class SceneRenderCoordinator:
             # live) instead of silently doing nothing until the next
             # unrelated render.
             self._script_entities.update(drivers.values())
+            # A lightMapping entity the integration does not subscribe
+            # to (neither in the YAML `entities` list nor in the
+            # script's own subscribe set) never reaches the script —
+            # its light would render off with no visible reason. Warn
+            # once per mapping change, naming the entities.
+            subscribed = set(self.entities) | self._script_entities
+            missing = sorted(
+                {entity for entity in light_mapping.values()}
+                - subscribed
+            )
+            if missing:
+                _LOGGER.warning(
+                    "Scene Renderer: scene.js lightMapping references "
+                    "entit%s that are not subscribed, so those lights "
+                    "will render off: %s — add them to the YAML "
+                    "`entities:` list (or to the script's `subscribe`)",
+                    "y" if len(missing) == 1 else "ies",
+                    ", ".join(missing),
+                )
         return changed
 
     @property
@@ -447,6 +478,29 @@ class SceneRenderCoordinator:
         """Model object name -> driving entity ID, from the script's
         `objectDrivers` export. For the panel's Objects section."""
         return dict(self.script_status.get("object_drivers") or {})
+
+    @property
+    def script_light_mapping(self) -> dict[str, str]:
+        """Model light name -> driving entity ID, from the script's
+        `lightMapping` export. THE light→entity mapping — for the
+        panel's Lights section and the image entities' light
+        attributes. Empty when no script is loaded (or the script
+        declares no mapping): the panel then shows every light as
+        unmapped."""
+        return dict(self.script_status.get("light_mapping") or {})
+
+    @property
+    def subscribed_entities(self) -> list[str]:
+        """Every entity the integration subscribes to for the script:
+        the YAML `entities` list, the script's resolved subscriptions,
+        and the YAML object drivers — sorted. For the panel's Entities
+        section. The sun is tracked separately (it has its own slider)
+        and is not listed here."""
+        return sorted(
+            set(self.entities)
+            | self._script_entities
+            | set(self.objects.values())
+        )
 
     async def async_unload(self) -> None:
         """Cancel subscriptions and pending renders."""
@@ -602,10 +656,12 @@ class SceneRenderCoordinator:
         self._notify()
 
     def _build_payload(self) -> dict[str, Any]:
-        lights = {
-            model_name: normalize_light_state(self.hass.states.get(entity_id))
-            for model_name, entity_id in self.mapping.items()
-        }
+        # The script owns the lights: the payload carries NO light
+        # parameters (an empty `lights` object — the service resets
+        # every light to its model base value and the script's
+        # lightMapping apply logic sets the absolute values each
+        # frame). The coordinator only sends the subscribed entity
+        # states the script reads.
         sun: dict[str, Any] | None = None
         if self.sun_enabled:
             if self.sun_fixed is not None:
@@ -618,17 +674,19 @@ class SceneRenderCoordinator:
                         "azimuth": sun_state.attributes.get("azimuth"),
                         "elevation": sun_state.attributes.get("elevation"),
                     }
-        # Entity snapshot for the user script: mapped lights + sun + the
-        # script's subscriptions, sanitized to JSON-safe values. Entities
-        # that do not exist (yet) are omitted.
+        # Entity snapshot for the user script: the YAML entities list +
+        # the sun + the script's subscriptions, sanitized to JSON-safe
+        # values. Entities that do not exist (yet) are omitted.
         entities: dict[str, Any] = {}
         for entity_id in sorted(self._tracked_entities):
             snapshot = _entity_snapshot(self.hass.states.get(entity_id))
             if snapshot is not None:
                 entities[entity_id] = snapshot
         return {
-            "lights": lights,
+            "lights": {},
             "sun": sun,
+            "moon": self.moon_position(),
+            "north_offset": self.north_offset,
             "entities": entities,
             "cameras": list(self.cameras),
         }

@@ -90,7 +90,7 @@ class SceneRenderImage(ImageEntity):
         hass = getattr(self, "hass", None)
         for proj in self.coordinator.light_positions_for(self.camera):
             name = proj.get("name")
-            entity_id = self.coordinator.mapping.get(name) if name else None
+            entity_id = self.coordinator.script_light_mapping.get(name) if name else None
             state: str | None = None
             brightness: float | None = None
             if entity_id is not None and hass is not None:

@@ -19,18 +19,37 @@
 // re-applied without rebuilding the scene, so a page loaded before a
 // restart never keeps stale data.
 //
-// The toggles and the sun slider are VIEWER-ONLY emulation: flipping a
-// toggle sets a local override for that entity in this viewer (never
-// calling any HA service), and the sun slider moves the viewer's sun to
-// the chosen time of day. Overridden rows are marked "(preview)"; the
-// Reset preview button clears all entity overrides and the sun
-// slider's Live button returns the sun to the real one. Overrides are
-// session-local (gone on reload) and never affect the renders.
+// The light→entity mapping lives in the scene script (`lightMapping`,
+// panel_data.light_mapping): the viewer applies it the same way the
+// script does — a mapped light follows its entity's on/off, brightness
+// and color; a light not in the table renders OFF. panel_data.entities
+// lists the subscribed entities; the Entities section shows them with
+// emulation toggles (and a brightness slider for lights that support
+// it), so the preview can be driven from the entities as well as from
+// the lights.
+//
+// The toggles, the sun slider, the season slider and the weather
+// select are VIEWER-ONLY emulation: flipping a toggle sets a local
+// override for that entity or light in this viewer (never calling any
+// HA service), the sun slider moves the viewer's sun to the chosen
+// time of day, the season slider moves it to the chosen day of the
+// year, and the weather select dims the sun and adds rain or snow —
+// all without touching the renders or the real entities. Precedence
+// for a light: a direct light toggle wins; otherwise the light
+// follows its mapped entity (whose state and brightness may
+// themselves be emulated from the Entities section); the TV glow is
+// a fallback only when neither is set. Overridden rows are marked
+// "(preview)"; the Reset preview button clears all entity, light and
+// brightness overrides and the sun slider's Live button returns the
+// sun (and the season) to the real ones. Overrides are session-local
+// (gone on reload) and never affect the renders.
 
 import * as THREE from "./three.module.js";
 import { OrbitControls } from "./OrbitControls.js";
 import { GLTFLoader } from "./GLTFLoader.js";
+import { RectAreaLightUniformsLib } from "./RectAreaLightUniformsLib.js";
 import { solarPosition } from "./solar-position.mjs";
+import { lunarPosition } from "./lunar-position.mjs";
 
 const OFF_COLOR = 0x3a3f44; // off / unavailable / unknown: dark gray
 const UNMAPPED_COLOR = 0xffffff; // model light with no HA entity
@@ -99,9 +118,164 @@ const BOUNCE_WARM = [1.0, 0.9, 0.75];
 const BOUNCE_MAX_PATCH_DISTANCE = 5;
 const BOUNCE_FADE_START_DISTANCE = 3;
 
+// Model-declared lights via glTF extras (PRIVATE convention — mirror
+// scene.mjs): glTF's KHR_lights_punctual only expresses
+// point/spot/directional, so the model declares anything else in
+// node extras, from Blender custom properties:
+// extras.ha_light = { type, ... }.
+//   Area:   { type: "area", follows: "<punctual light>", scale?: n }
+//           or { type: "area", intensity: n } — the mesh IS the
+//           emitter: a RectAreaLight fitted to the mesh bounds,
+//           facing the followed light, driven per frame from the
+//           followed light's effective intensity x scale.
+//   Ambient: { type: "ambient", color?: "#rrggbb", day?: n, night?: n }
+//           on a bare empty — an AmbientLight driven by sun elevation
+//           every frame (day at full daylight, night below the
+//           horizon — the moonlit-sky floor, so night is dimly
+//           visible rather than black). The directional moonlight
+//           itself is a separate viewer-owned light (see
+//           _updateMoonLight): the model declares only the floor.
+//           The model validator (scripts/verify_glb.py) is the strict
+//           gate; the viewer is lenient and skips an invalid entry.
+const HA_LIGHT_EXTRAS_KEY = "ha_light";
+const AREA_LIGHT_NAME_PREFIX = "area_";
+const AMBIENT_LIGHT_NAME_PREFIX = "ambient_";
+const AREA_LIGHT_OFFSET_M = 0.01;
+const AREA_DEFAULT_SCALE = 1.0;
+const AMBIENT_DEFAULT_DAY = 0.1;
+// Default night floor for an ambient marker without a `night` value:
+// 0.2 keeps rooms dimly visible at night (mirror scene.mjs).
+const AMBIENT_DEFAULT_NIGHT = 0.2;
+
+// Moonlight (mirror scene.mjs): a dim, cool directional light — a
+// second, much weaker sun for the night. Its position comes from
+// panel_data.moon (the coordinator's lunar ephemeris) or, while the
+// time-of-day slider is overridden, from lunar-position.mjs for the
+// slider's time; its intensity keys off the effective sun elevation
+// (0 while the sun is up, full once the sun is 12 deg below the
+// horizon, 0 when the moon itself is down). Keep these values in sync
+// with scene.mjs (MOON_INTENSITY 2.0 tuned 2026-11-24).
+const MOON_COLOR = 0xcfdcee;
+const MOON_INTENSITY = 2.0;
+
+// Weather presets (mirror scene.mjs WEATHER_PRESETS — the viewer and
+// the render service must agree; the panel is emulation-only, the
+// coordinator never sends a weather field, so renders stay sunny):
+//   sunny:    the current look, untouched.
+//   overcast: dim sun, flat bright hemisphere, grey clear tint.
+//   rainy:    overcast, darker, plus falling rain.
+//   snowy:    bright diffuse light (snow bounce), cool tint, snow.
+// The hemisphere override and the clear tint apply only while the
+// sun is up (or there is no sun state): an overcast night is still
+// dark. The moon is dimmed by the same sun factor.
+const WEATHER_PRESETS = {
+  sunny: { sun: 1.0, hemi: null, tint: null, particles: null },
+  overcast: { sun: 0.25, hemi: 0.6, tint: "#b8bec4", particles: null },
+  rainy: { sun: 0.15, hemi: 0.5, tint: "#9aa3ab", particles: "rain" },
+  snowy: { sun: 0.4, hemi: 0.7, tint: "#dfe8f0", particles: "snow" },
+};
+const WEATHER_PARTICLES = {
+  rain: { count: 900, size: 0.06, color: 0x9fb4c8, opacity: 0.55, speed: 9.0, seed: 1337 },
+  snow: { count: 600, size: 0.12, color: 0xffffff, opacity: 0.85, speed: 1.2, seed: 4242 },
+};
+// Month abbreviations for the season slider's date label (explicit,
+// so the label is the same in every browser locale).
+const MONTHS_SHORT = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
+
+// Seeded RNG (mulberry32, mirror scene.mjs): particle positions must
+// be deterministic so the viewer agrees with the service stills.
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Particle positions for one kind, seeded and deterministic (mirror
+// scene.mjs weatherParticlePositions): uniform in a volume around the
+// house (bounds expanded by ~6 m, floor to 7 m up), REJECTING any
+// point inside the building footprint (the bounds' x/z extent — for
+// the sample model that is the 15 x 8 m house, so no particle ever
+// lands inside a room).
+function weatherParticlePositions(kind, bounds, floorY) {
+  const spec = WEATHER_PARTICLES[kind];
+  const rand = mulberry32(spec.seed);
+  const xMin = bounds.min.x - 6;
+  const xMax = bounds.max.x + 6;
+  const zMin = bounds.min.z - 6;
+  const zMax = bounds.max.z + 6;
+  const yMin = floorY + 0.2;
+  const yMax = floorY + 7;
+  const out = new Float32Array(spec.count * 3);
+  let i = 0;
+  while (i < spec.count) {
+    const x = xMin + rand() * (xMax - xMin);
+    const z = zMin + rand() * (zMax - zMin);
+    if (x >= bounds.min.x && x <= bounds.max.x && z >= bounds.min.z && z <= bounds.max.z) {
+      continue;
+    }
+    const y = yMin + rand() * (yMax - yMin);
+    out[i * 3] = x;
+    out[i * 3 + 1] = y;
+    out[i * 3 + 2] = z;
+    i += 1;
+  }
+  return out;
+}
+
+// Fall one particle column (mirror scene.mjs weatherFallY): base y
+// minus speed*time, wrapped into the [yMin, yMax) band so the fall
+// loops forever. Pure function of time.
+function weatherFallY(baseY, time, speed, yMin, yMax) {
+  const height = yMax - yMin;
+  let y = (baseY - yMin - speed * time) % height;
+  if (y < 0) y += height;
+  return yMin + y;
+}
+
 function materialsOf(obj) {
   if (Array.isArray(obj.material)) return obj.material;
   return obj.material ? [obj.material] : [];
+}
+
+// Read the ha_light declaration off a loaded node (mirror scene.mjs
+// parseHaLightExtras): GLTFLoader copies node extras into userData,
+// so a Blender dict custom property arrives as an object; a JSON
+// string is parsed too. Anything else is ignored.
+function parseHaLightExtras(obj) {
+  const raw = obj.userData && obj.userData[HA_LIGHT_EXTRAS_KEY];
+  if (!raw) return null;
+  if (typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      console.warn(`scene-renderer: ha_light on "${obj.name}": not valid JSON — ignored`);
+      return null;
+    }
+  }
+  return null;
+}
+
+// Extras color: a "#rrggbb" string (sRGB) or a [r, g, b] 0..1 array.
+// Returns a THREE.Color or null.
+function parseHaColor(value) {
+  if (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)) {
+    return new THREE.Color(value);
+  }
+  if (
+    Array.isArray(value) &&
+    value.length === 3 &&
+    value.every((v) => typeof v === "number")
+  ) {
+    return new THREE.Color(value[0], value[1], value[2]);
+  }
+  return null;
 }
 
 // Inject a world-space dither discard into a depth material's shaders
@@ -228,6 +402,17 @@ function shadowMapSizeForLight(name) {
   return VIEWER_SHADOW_MAP_SIZES[(hash >>> 0) % VIEWER_SHADOW_MAP_SIZES.length];
 }
 
+// Shadow blur radius (mirror scene.mjs shadowRadiusForLight). Only
+// the TV gets a blur; every other light keeps the three.js default of
+// 1. The value is halved vs the service (8 vs 16): the viewer's maps
+// are half the service's (256 vs 512 for the TV), and the radius is
+// in texels, so half the value gives the same angular blur.
+const TV_SHADOW_RADIUS = 8;
+const DEFAULT_SHADOW_RADIUS = 1;
+function shadowRadiusForLight(name) {
+  return name === "living_room_tv" ? TV_SHADOW_RADIUS : DEFAULT_SHADOW_RADIUS;
+}
+
 // Domains with a `toggle` service (light.toggle, media_player.toggle,
 // ...). A script-driven object whose entity is in another domain (e.g.
 // a sensor) gets no switch — there is nothing to toggle.
@@ -350,6 +535,9 @@ class SceneRendererPanel extends HTMLElement {
     this._scriptObjects = []; // { name, entityId, object } — driven objects: the YAML `objects` mapping merged with the script's objectDrivers (YAML wins on conflict)
     this._curtains = []; // { name, mesh, material, outward } — sheer curtains, for the glow + dithered shadow
     this._windows = []; // { name, room, position, outward, transmission, light } — window markers, for the bounce lights
+    this._areaLights = []; // { name, mesh, light, followed, scale, baseIntensity, colorOverride, facing, width, height } — ha_light area entries (RectAreaLight fitted to the mesh, follows a punctual light)
+    this._ambientLights = []; // { name, light, day, night } — ha_light ambient entries (AmbientLight driven by sun elevation)
+    this._rectAreaLibReady = false; // RectAreaLightUniformsLib.init() once per page
     this._floorY = 0; // floor plane for the bounce patch (bottom of the model bounds)
     this._modelBounds = null; // Box3 of the model, for clamping the bounce patch inside the house
     this._objectMarkers = []; // { name, entityId, mesh } — 3D markers for the script-driven objects
@@ -357,15 +545,46 @@ class SceneRendererPanel extends HTMLElement {
     // -> emulated state ("on"/"off" for lights, "playing"/"off" for
     // media players). Toggles write here, never to HA. Session-local.
     this._overrides = new Map();
+    // Direct light toggles (Lights section): model light name ->
+    // "on"/"off". A set toggle wins over the mapped entity's state
+    // (and over the TV glow) for that light.
+    this._lightOverrides = new Map();
+    // Emulated brightness (Entities section slider): entity_id -> 0..1.
+    // Only the brightness is overridden; the on/off state still comes
+    // from the entity (or its toggle override).
+    this._brightnessOverrides = new Map();
     // Viewer-only sun override from the time-of-day slider: minutes
     // from midnight, or null for the live sun (panel_data / sun.sun).
     this._sunOverride = null;
+    // Viewer-only season override from the day-of-year slider: 1..365,
+    // or null for today's date (the live season). The NOAA solar calc
+    // takes the season date, so the sun's elevation/azimuth follow
+    // the season; the moon follows too (see _computedMoon). Like the
+    // sun override, viewer-local emulation — the renders always use
+    // the real date. The Live button clears both overrides.
+    this._seasonOverride = null;
+    // North offset in degrees (YAML `north_offset`, via panel_data):
+    // the true-north azimuth the model's north side (-Z) faces. The
+    // viewer rotates true-north sun/moon azimuths into model frame
+    // by it (see _sunDirection), so the panel agrees with the renders.
+    this._northOffset = 0;
+    // Viewer-only weather preset ("sunny"|"overcast"|"rainy"|"snowy"):
+    // emulation only, like the sun slider — the renders are always
+    // sunny. See WEATHER_PRESETS and _applyWeather.
+    this._weather = "sunny";
+    // Weather particle systems (THREE.Points), built lazily per model
+    // from the model bounds (see _ensureWeatherParticles); _weatherTime
+    // is the shared fall clock, advanced in the render loop.
+    this._weatherPoints = null; // kind -> THREE.Points
+    this._weatherBase = null; // kind -> Float32Array of seeded positions
+    this._weatherTime = 0;
     // Fan spin state: the ceiling_fan group's current angle, advanced
     // in the render loop while its emulated state is on.
     this._fanAngle = 0;
     this._clock = new THREE.Clock();
     this._sunMarker = null;
     this._sunLight = null; // DirectionalLight driven by sun.sun
+    this._moonLight = null; // DirectionalLight driven by the moon position (panel_data.moon or the sun slider's time)
     this._hemi = null; // HemisphereLight, dim floor driven by sun elevation
     this._modelCameras = new Map(); // name -> THREE camera object in the GLB
     this._raycaster = new THREE.Raycaster();
@@ -433,6 +652,13 @@ class SceneRendererPanel extends HTMLElement {
         .section-head h2 { margin-bottom: 8px; }
         .sun-row { display: flex; align-items: center; gap: 8px; }
         .sun-row input[type="range"] { flex: 1; min-width: 0; }
+        .sun-row select {
+          background: var(--card-background-color, #fff);
+          color: var(--primary-text-color, #212121);
+          border: 1px solid var(--divider-color, #e0e0e0);
+          border-radius: 4px; padding: 6px 8px; font-size: 14px;
+        }
+        .season-label { flex-shrink: 0; min-width: 52px; text-align: right; }
         aside {
           width: 300px; flex-shrink: 0; overflow-y: auto;
           border-left: 1px solid var(--divider-color, #e0e0e0);
@@ -496,6 +722,23 @@ class SceneRendererPanel extends HTMLElement {
           transform: translateX(16px);
         }
         .switch input:disabled + .slider { opacity: 0.5; cursor: default; }
+        .brightness-row {
+          display: flex; align-items: center; gap: 6px; margin-top: 2px;
+        }
+        .brightness-row input[type="range"] {
+          flex: 1; min-width: 0; height: 16px; cursor: pointer;
+        }
+        .brightness-row input[type="range"]:disabled {
+          opacity: 0.5; cursor: default;
+        }
+        .brightness-row span {
+          font-size: 11px; width: 32px; text-align: right; flex-shrink: 0;
+          color: var(--secondary-text-color, #727272);
+        }
+        .brightness-row span.preview {
+          color: var(--warning-color, #ff9800);
+          font-weight: 500;
+        }
         .preview img { max-width: 100%; border-radius: 4px; display: block; }
         .preview .none {
           font-size: 13px; color: var(--secondary-text-color, #727272);
@@ -530,6 +773,8 @@ class SceneRendererPanel extends HTMLElement {
               <button id="reset-preview" class="mini" disabled title="Clear all preview overrides and return to the real entity states">Reset preview</button>
             </div>
             <ul id="light-list"><li class="row-sub">Loading…</li></ul>
+            <h2>Entities</h2>
+            <ul id="entity-list"><li class="row-sub">Loading…</li></ul>
             <h2>Objects</h2>
             <ul id="object-list"><li class="row-sub">Loading…</li></ul>
             <h2>Cameras</h2>
@@ -538,9 +783,25 @@ class SceneRendererPanel extends HTMLElement {
               <h2>Sun</h2>
               <div class="sun-row">
                 <input type="range" id="sun-slider" min="0" max="1439" step="15" value="720" aria-label="Time of day">
-                <button id="sun-live" class="mini" disabled title="Return the viewer's sun to the live sun">Live</button>
+                <button id="sun-live" class="mini" disabled title="Return the viewer's sun and season to the live ones">Live</button>
+              </div>
+              <div class="sun-row">
+                <input type="range" id="season-slider" min="1" max="365" step="1" value="172" aria-label="Day of year">
+                <span class="row-sub season-label" id="season-label">21 Jun</span>
               </div>
               <div class="row-sub" id="sun-label">Live</div>
+            </div>
+            <div id="weather-section">
+              <h2>Weather</h2>
+              <div class="sun-row">
+                <select id="weather-select" aria-label="Weather">
+                  <option value="sunny">Sunny</option>
+                  <option value="overcast">Overcast</option>
+                  <option value="rainy">Rainy</option>
+                  <option value="snowy">Snowy</option>
+                </select>
+              </div>
+              <div class="row-sub">Preview only — the renders are always sunny.</div>
             </div>
             <h2>Preview</h2>
             <div class="preview" id="preview"><div class="none">Select a camera to preview its latest render.</div></div>
@@ -558,6 +819,7 @@ class SceneRendererPanel extends HTMLElement {
       viewer: this.shadowRoot.querySelector("#viewer"),
       entrySelect: this.shadowRoot.querySelector("#entry-select"),
       lightList: this.shadowRoot.querySelector("#light-list"),
+      entityList: this.shadowRoot.querySelector("#entity-list"),
       objectList: this.shadowRoot.querySelector("#object-list"),
       cameraList: this.shadowRoot.querySelector("#camera-list"),
       preview: this.shadowRoot.querySelector("#preview"),
@@ -565,8 +827,11 @@ class SceneRendererPanel extends HTMLElement {
       resetPreview: this.shadowRoot.querySelector("#reset-preview"),
       sunSection: this.shadowRoot.querySelector("#sun-section"),
       sunSlider: this.shadowRoot.querySelector("#sun-slider"),
+      seasonSlider: this.shadowRoot.querySelector("#season-slider"),
+      seasonLabel: this.shadowRoot.querySelector("#season-label"),
       sunLive: this.shadowRoot.querySelector("#sun-live"),
       sunLabel: this.shadowRoot.querySelector("#sun-label"),
+      weatherSelect: this.shadowRoot.querySelector("#weather-select"),
     };
     this._els.resetPreview.addEventListener("click", () => this._resetOverrides());
     this._els.sunSlider.addEventListener("input", (ev) => {
@@ -578,14 +843,28 @@ class SceneRendererPanel extends HTMLElement {
       this._updateModelLights();
       this._updateLightList();
     });
-    this._els.sunLive.addEventListener("click", () => {
-      this._sunOverride = null;
+    this._els.seasonSlider.addEventListener("input", (ev) => {
+      this._seasonOverride = Number(ev.target.value);
       this._updateSunSlider();
       this._updateSunMarker();
       this._updateSunLight();
       this._updateLightMarkers();
       this._updateModelLights();
       this._updateLightList();
+    });
+    this._els.sunLive.addEventListener("click", () => {
+      this._sunOverride = null;
+      this._seasonOverride = null;
+      this._updateSunSlider();
+      this._updateSunMarker();
+      this._updateSunLight();
+      this._updateLightMarkers();
+      this._updateModelLights();
+      this._updateLightList();
+    });
+    this._els.weatherSelect.addEventListener("change", (ev) => {
+      this._weather = ev.target.value;
+      this._updateSunLight();
     });
     this._els.retryButton.addEventListener("click", () => this._retry());
     this._els.entrySelect.addEventListener("change", (ev) => {
@@ -608,6 +887,7 @@ class SceneRendererPanel extends HTMLElement {
     this._updateLightMarkers();
     this._updateModelLights();
     this._updateLightList();
+    this._updateEntityList();
     this._updateObjectList();
     this._updateTvState();
     this._updateSunMarker();
@@ -744,25 +1024,122 @@ class SceneRendererPanel extends HTMLElement {
     this._updateLightMarkers();
     this._updateModelLights();
     this._updateLightList();
+    this._updateEntityList();
     this._updateObjectList();
     this._updateTvState();
   }
 
-  // Clear all entity overrides and return the viewer to the real
-  // entity states. (The sun slider has its own Live button.)
-  _resetOverrides() {
-    if (this._overrides.size === 0) return;
-    this._overrides.clear();
+  // Flip a light's direct toggle (Lights section): a LOCAL preview
+  // override for that one model light, never touching HA. It wins
+  // over the mapped entity's state (and over the TV glow) until Reset
+  // preview clears it. The color still comes from the mapped entity's
+  // attributes when there is one (see _lightAppearance).
+  _toggleLight(modelName) {
+    const current = this._lightOverrides.get(modelName);
+    const app = this._lightAppearance(modelName);
+    const isOn = current ? current === "on" : app.state === "on" || app.state === "tv";
+    this._lightOverrides.set(modelName, isOn ? "off" : "on");
     this._updateResetButton();
     this._updateLightMarkers();
     this._updateModelLights();
     this._updateLightList();
+    this._updateEntityList();
+  }
+
+  // Set a LOCAL preview brightness for an entity (Entities section
+  // slider, 0..1), never touching HA. A value equal to the entity's
+  // real brightness clears the override instead, so the slider
+  // returning to the real value removes the "(preview)" mark.
+  _setBrightnessOverride(entityId, value) {
+    const st = this._state(entityId);
+    const real =
+      st && typeof st.attributes?.brightness === "number"
+        ? st.attributes.brightness / 255
+        : 1;
+    if (Math.abs(value - real) < 0.005) {
+      this._brightnessOverrides.delete(entityId);
+    } else {
+      this._brightnessOverrides.set(entityId, value);
+    }
+    this._updateResetButton();
+    this._updateLightMarkers();
+    this._updateModelLights();
+    this._updateLightList();
+    this._updateEntityList();
+  }
+
+  // Clear all entity, light and brightness overrides and return the
+  // viewer to the real entity states. (The sun slider has its own
+  // Live button.)
+  _resetOverrides() {
+    if (
+      this._overrides.size === 0 &&
+      this._lightOverrides.size === 0 &&
+      this._brightnessOverrides.size === 0
+    )
+      return;
+    this._overrides.clear();
+    this._lightOverrides.clear();
+    this._brightnessOverrides.clear();
+    this._updateResetButton();
+    this._updateLightMarkers();
+    this._updateModelLights();
+    this._updateLightList();
+    this._updateEntityList();
     this._updateObjectList();
     this._updateTvState();
   }
 
   _updateResetButton() {
-    this._els.resetPreview.disabled = this._overrides.size === 0;
+    this._els.resetPreview.disabled =
+      this._overrides.size === 0 &&
+      this._lightOverrides.size === 0 &&
+      this._brightnessOverrides.size === 0;
+  }
+
+  // The light->entity mapping from the script (panel_data.light_mapping);
+  // older integrations sent it as `mapping` — accept that too so a
+  // stale integration still shows its lights.
+  _lightMapping() {
+    if (!this._panelData) return {};
+    return this._panelData.light_mapping || this._panelData.mapping || {};
+  }
+
+  // The entity's color as [r, g, b] (sRGB), following the same
+  // priority as the example script's apply logic: rgb, then hs, then
+  // xy, then color temperature (kelvin, else legacy mireds). Returns
+  // null when the entity has no color information at all.
+  _entityColor(st) {
+    if (!st) return null;
+    const attrs = st.attributes || {};
+    if (Array.isArray(attrs.rgb_color)) return attrs.rgb_color;
+    if (Array.isArray(attrs.hs_color)) {
+      return hsToRgb(attrs.hs_color[0], attrs.hs_color[1]);
+    }
+    if (Array.isArray(attrs.xy_color)) {
+      return xyToRgb(attrs.xy_color[0], attrs.xy_color[1]);
+    }
+    if (typeof attrs.color_temp_kelvin === "number") {
+      return kelvinToRgb(attrs.color_temp_kelvin);
+    }
+    if (typeof attrs.color_temp === "number" && attrs.color_temp > 0) {
+      return kelvinToRgb(1000000 / attrs.color_temp);
+    }
+    return null;
+  }
+
+  // The brightness (0..1) the viewer shows for an entity: the local
+  // slider override when one is set, else the real brightness
+  // attribute (1 for on/off-only entities).
+  _emulatedBrightness(entityId) {
+    if (this._brightnessOverrides.has(entityId)) {
+      return this._brightnessOverrides.get(entityId);
+    }
+    const st = this._state(entityId);
+    if (st && typeof st.attributes?.brightness === "number") {
+      return st.attributes.brightness / 255;
+    }
+    return 1;
   }
 
   // The sample model's fan is "on" when its driving entity's emulated
@@ -884,6 +1261,11 @@ class SceneRendererPanel extends HTMLElement {
       return;
     }
     this._panelData = data;
+    // North offset (YAML `north_offset`): the true-north azimuth the
+    // model's north side (-Z) faces. Older integrations send no field
+    // — default 0 (the model laid out true-north-up).
+    this._northOffset =
+      data && typeof data.north_offset === "number" ? data.north_offset : 0;
     this._setState("loading", "Loading…", "Loading 3D model…", false);
     let glb;
     try {
@@ -913,6 +1295,7 @@ class SceneRendererPanel extends HTMLElement {
     }
     this._buildScene(gltf.scene);
     this._renderLightList();
+    this._renderEntityList();
     this._renderObjectList();
     this._renderCameraList();
     this._updateLightMarkers();
@@ -945,8 +1328,11 @@ class SceneRendererPanel extends HTMLElement {
       return;
     }
     this._panelData = data;
+    this._northOffset =
+      data && typeof data.north_offset === "number" ? data.north_offset : 0;
     this._collectScriptObjects();
     this._renderLightList();
+    this._renderEntityList();
     this._renderObjectList();
     this._renderCameraList();
     this._buildCameraMarkers();
@@ -1015,7 +1401,7 @@ class SceneRendererPanel extends HTMLElement {
     // sun updates set needsUpdate (see _updateModelLights /
     // _updateSunLight); orbiting the camera needs no shadow update.
     renderer.shadowMap.enabled = true;
-    renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    renderer.shadowMap.type = THREE.PCFShadowMap;
     renderer.shadowMap.autoUpdate = false;
     this._renderer = renderer;
     renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
@@ -1025,20 +1411,32 @@ class SceneRendererPanel extends HTMLElement {
     this._scene = new THREE.Scene();
     // Dim base illumination so the model stays readable when every HA
     // light is off; _updateSunLight drives its intensity from the sun
-    // elevation the same way the render service does. It must stay dim
-    // (0.06-0.6), or it washes out the state-driven lights entirely —
-    // the old fixed 0.9 made every room look lit no matter what.
+    // elevation the same way the render service does (0 at night —
+    // night is dark — up to 0.6 at full daylight). It must stay dim,
+    // or it washes out the state-driven lights entirely — the old
+    // fixed 0.9 made every room look lit no matter what.
     this._hemi = new THREE.HemisphereLight(0xffffff, 0x555566, 0.15);
     this._scene.add(this._hemi);
     // Directional sun, positioned and colored by _updateSunLight from
     // sun.sun. It casts shadows; the shadow camera is sized to the
     // model in _buildScene once the radius is known.
     this._sunLight = new THREE.DirectionalLight(0xffffff, 0);
+    this._sunLight.name = "sun";
     this._sunLight.castShadow = true;
     this._sunLight.shadow.mapSize.set(2048, 2048);
     this._sunLight.shadow.bias = -0.0005;
     this._scene.add(this._sunLight);
     this._scene.add(this._sunLight.target);
+    // Directional moon, positioned and dimmed by _updateMoonLight
+    // (same shadow setup as the sun). It shines through windows at
+    // night, so the night render is moonlit, not black.
+    this._moonLight = new THREE.DirectionalLight(MOON_COLOR, 0);
+    this._moonLight.name = "moon";
+    this._moonLight.castShadow = true;
+    this._moonLight.shadow.mapSize.set(2048, 2048);
+    this._moonLight.shadow.bias = -0.0005;
+    this._scene.add(this._moonLight);
+    this._scene.add(this._moonLight.target);
 
     // Two viewer cameras: the default perspective orbit camera, and an
     // orthographic one (created lazily) for when the user selects an
@@ -1094,6 +1492,15 @@ class SceneRendererPanel extends HTMLElement {
           this._fanAngle += (dt * Math.PI * 2) / 3;
           fan.object.rotation.y = this._fanAngle;
         }
+      }
+      // Weather particles fall continuously while rain or snow is
+      // selected (the fall loops; _weatherTime is the shared clock,
+      // advanced by the same clamped delta as the fan).
+      this._weatherTime += dt;
+      const weatherPreset =
+        WEATHER_PRESETS[this._weather] || WEATHER_PRESETS.sunny;
+      if (weatherPreset.particles) {
+        this._updateWeatherParticles(weatherPreset.particles);
       }
       this._renderer.render(this._scene, this._camera);
     };
@@ -1233,7 +1640,21 @@ class SceneRendererPanel extends HTMLElement {
     this._scriptObjects = [];
     this._curtains = [];
     this._windows = [];
+    this._areaLights = [];
+    this._ambientLights = [];
     this._sunMarker = null;
+    // Weather particles belong to the old model's bounds — drop them
+    // so they are rebuilt for the new model on the next _applyWeather.
+    if (this._weatherPoints) {
+      for (const points of Object.values(this._weatherPoints)) {
+        this._scene.remove(points);
+        points.geometry.dispose();
+        points.material.dispose();
+      }
+      this._weatherPoints = null;
+      this._weatherBase = null;
+    }
+    const haLightNodes = [];
 
     const group = new THREE.Group();
     group.add(modelScene);
@@ -1266,7 +1687,9 @@ class SceneRendererPanel extends HTMLElement {
 
     // Sun shadow camera: the sun sits radius*4 out from the center
     // (see _updateSunLight), so the far plane must clear 5 radii and
-    // the frustum must cover the whole model.
+    // the frustum must cover the whole model. The moon sits at the
+    // same distance (see _updateMoonLight), so it gets the same
+    // shadow camera.
     if (this._sunLight) {
       this._sunLight.shadow.camera.near = 0.5;
       this._sunLight.shadow.camera.far = radius * 8;
@@ -1274,6 +1697,14 @@ class SceneRendererPanel extends HTMLElement {
       this._sunLight.shadow.camera.right = radius * 1.5;
       this._sunLight.shadow.camera.top = radius * 1.5;
       this._sunLight.shadow.camera.bottom = -radius * 1.5;
+    }
+    if (this._moonLight) {
+      this._moonLight.shadow.camera.near = 0.5;
+      this._moonLight.shadow.camera.far = radius * 8;
+      this._moonLight.shadow.camera.left = -radius * 1.5;
+      this._moonLight.shadow.camera.right = radius * 1.5;
+      this._moonLight.shadow.camera.top = radius * 1.5;
+      this._moonLight.shadow.camera.bottom = -radius * 1.5;
     }
 
     const markerRadius = Math.max(0.05, Math.min(0.35, radius * 0.012));
@@ -1299,6 +1730,10 @@ class SceneRendererPanel extends HTMLElement {
         // Window marker for bounce lights (see _finalizeWindows).
         this._windows.push({ name: obj.name, marker: obj, light: null });
       }
+      // Model-declared lights (ha_light extras): collected here, built
+      // in _finalizeHaLights after the bounds are known.
+      const ha = parseHaLightExtras(obj);
+      if (ha) haLightNodes.push({ obj, ha });
       if (obj.isMesh) {
         // Model meshes cast and receive shadows (markers live in the
         // group, not the model scene, so they stay shadow-free), except
@@ -1327,6 +1762,9 @@ class SceneRendererPanel extends HTMLElement {
         // normal bias alone handles acne — mirror scene.mjs.
         obj.shadow.bias = 0;
         obj.shadow.normalBias = 0.02;
+        // Blur radius: the TV's shadows are soft (big area source);
+        // every other light keeps the three.js default (crisp).
+        obj.shadow.radius = shadowRadiusForLight(obj.name);
       }
       this._modelLights.push({
         name: obj.name,
@@ -1377,6 +1815,11 @@ class SceneRendererPanel extends HTMLElement {
     // Bounce-light windows: one renderer-owned point light per
     // window_* marker (see _finalizeWindows).
     this._finalizeWindows();
+
+    // Model-declared lights (ha_light extras): area lights fitted to
+    // their mesh + ambient lights on bare empties (see
+    // _finalizeHaLights).
+    this._finalizeHaLights(haLightNodes);
   }
 
   _finalizeCurtains() {
@@ -1425,6 +1868,198 @@ class SceneRendererPanel extends HTMLElement {
       w.outward = curtainOutwardNormal(w.marker, this._modelCenter);
       w.transmission = WINDOW_TRANSMISSION[room] ?? 1.0;
       w.light = light;
+    }
+  }
+
+  // Model-declared lights from ha_light extras (mirror scene.mjs
+  // loadModel): area lights fitted to their mesh, ambient lights on
+  // bare empties. Not model lights — no marker, no list row, no
+  // shadow. The area light's RectAreaLight needs
+  // RectAreaLightUniformsLib.init() (the LTC lookup textures) before
+  // the first render with one; once per page is enough.
+  _finalizeHaLights(haLightNodes) {
+    if (haLightNodes.length === 0) return;
+    this._modelGroup.updateMatrixWorld(true);
+    for (const { obj, ha } of haLightNodes) {
+      if (ha.type === "area") {
+        const built = this._buildAreaLight(obj, ha);
+        if (built) {
+          this._modelGroup.add(built.light);
+          this._areaLights.push(built);
+        }
+      } else if (ha.type === "ambient") {
+        const day = typeof ha.day === "number" ? ha.day : AMBIENT_DEFAULT_DAY;
+        const night =
+          typeof ha.night === "number" ? ha.night : AMBIENT_DEFAULT_NIGHT;
+        const light = new THREE.AmbientLight(
+          parseHaColor(ha.color) ?? 0xffffff,
+          day,
+        );
+        light.name = AMBIENT_LIGHT_NAME_PREFIX + obj.name;
+        this._modelGroup.add(light);
+        this._ambientLights.push({ name: obj.name, light, day, night });
+      } else {
+        console.warn(
+          `scene-renderer: ha_light on "${obj.name}": unknown type ${JSON.stringify(ha.type)} — ignored`,
+        );
+      }
+    }
+    if (this._areaLights.length > 0 && !this._rectAreaLibReady) {
+      RectAreaLightUniformsLib.init();
+      this._rectAreaLibReady = true;
+    }
+    // New lights: sync them to the current states right away (the
+    // TV may already be on, the sun may already be up).
+    this._updateAreaLights();
+    this._updateAmbientLights();
+  }
+
+  // Build the RectAreaLight for one mesh with ha_light type "area"
+  // (mirror scene.mjs buildAreaLight): size and facing come from the
+  // mesh geometry — the emitting face is the thin axis of the world
+  // bounding box, the facing sign comes from the followed light's
+  // side (it sits just in front of the emitting face), width/height
+  // are the other two extents (height is the vertical one). Returns
+  // null when the declaration cannot drive a light.
+  _buildAreaLight(mesh, ha) {
+    let followed = null;
+    if (typeof ha.follows === "string") {
+      const entry = this._modelLights.find((e) => e.name === ha.follows);
+      followed = entry ? entry.light : null;
+      if (!followed) {
+        console.warn(
+          `scene-renderer: ha_light area on "${mesh.name}": follows "${ha.follows}", not a model light`,
+        );
+      }
+    }
+    const standalone = typeof ha.intensity === "number";
+    if (!followed && !standalone) {
+      console.warn(
+        `scene-renderer: ha_light area on "${mesh.name}": needs "follows" or "intensity" — ignored`,
+      );
+      return null;
+    }
+    const box = new THREE.Box3().setFromObject(mesh);
+    const meshCenter = box.getCenter(new THREE.Vector3());
+    const size = box.getSize(new THREE.Vector3());
+    const extents = [size.x, size.y, size.z];
+    let thinAxis = 0;
+    for (let i = 1; i < 3; i += 1) {
+      if (extents[i] < extents[thinAxis]) thinAxis = i;
+    }
+    const refPoint = followed
+      ? followed.getWorldPosition(new THREE.Vector3())
+      : meshCenter.clone().sub(this._modelCenter).add(meshCenter);
+    const sign =
+      refPoint.getComponent(thinAxis) >= meshCenter.getComponent(thinAxis)
+        ? 1
+        : -1;
+    const facing = new THREE.Vector3();
+    facing.setComponent(thinAxis, sign);
+    let width;
+    let height;
+    if (thinAxis === 0) {
+      width = size.z;
+      height = size.y;
+    } else if (thinAxis === 1) {
+      width = size.x;
+      height = size.z;
+    } else {
+      width = size.x;
+      height = size.y;
+    }
+    const colorOverride = parseHaColor(ha.color);
+    const light = new THREE.RectAreaLight(
+      colorOverride ? colorOverride.clone() : 0xffffff,
+      0,
+      Math.max(width, 0.01),
+      Math.max(height, 0.01),
+    );
+    // The emitting mesh may carry a baked emissive (the TV screen
+    // glows at strength 2.0 in the model). Capture it here so
+    // _updateAreaLights can switch the mesh off with its light —
+    // otherwise the screen glows white even when the TV is off
+    // (mirror scene.mjs buildAreaLight).
+    const mat = mesh.material;
+    const emissiveIntensity =
+      mat && typeof mat.emissiveIntensity === "number"
+        ? mat.emissiveIntensity
+        : 0;
+    light.name = AREA_LIGHT_NAME_PREFIX + mesh.name;
+    // RectAreaLight emits along its local -Z (lookAt aims a light's
+    // -Z at the target), so look at a point in front of the face. The
+    // up vector flips when the facing is near-vertical (a ceiling
+    // panel), or lookAt degenerates.
+    light.position.copy(meshCenter).addScaledVector(facing, AREA_LIGHT_OFFSET_M);
+    const up =
+      Math.abs(facing.y) > 0.9
+        ? new THREE.Vector3(0, 0, 1)
+        : new THREE.Vector3(0, 1, 0);
+    light.up.copy(up);
+    light.lookAt(meshCenter.clone().add(facing));
+    return {
+      name: mesh.name,
+      mesh,
+      light,
+      followed,
+      scale:
+        typeof ha.scale === "number" && ha.scale > 0
+          ? ha.scale
+          : AREA_DEFAULT_SCALE,
+      baseIntensity: standalone ? ha.intensity : 0,
+      colorOverride,
+      emissiveIntensity,
+      facing: facing.clone(),
+      width,
+      height,
+    };
+  }
+
+  // Drive the area lights from their followed punctual light's
+  // effective intensity (mirror scene.mjs updateAreaLights): intensity
+  // = followed intensity x scale, color = followed color unless
+  // extras.color overrides it. The mesh's own emissive follows the
+  // light too (a TV screen must not glow when off). Called at the end
+  // of _updateModelLights (the followed light's intensity is set
+  // there) and once when the model loads.
+  _updateAreaLights() {
+    for (const a of this._areaLights) {
+      if (a.followed) {
+        const lit = a.followed.intensity > 0;
+        a.light.intensity = a.followed.intensity * a.scale;
+        if (!a.colorOverride) a.light.color.copy(a.followed.color);
+        a.light.visible = lit;
+        const mat = a.mesh && a.mesh.material;
+        if (mat && typeof mat.emissiveIntensity === "number") {
+          mat.emissiveIntensity = lit ? a.emissiveIntensity : 0;
+        }
+      } else {
+        a.light.intensity = a.baseIntensity;
+        a.light.visible = a.baseIntensity > 0;
+      }
+    }
+  }
+
+  // Daylight factor from a sun position: 0 at/below the horizon, 1
+  // at 30 degrees and above — the same ramp as the sun intensity and
+  // the hemisphere fill (mirror scene.mjs daylightFactor). No sun
+  // (null) counts as night.
+  _daylightFactor(sun) {
+    if (!sun || typeof sun.elevation !== "number") return 0;
+    return Math.min(1, Math.max(0, sun.elevation / 30));
+  }
+
+  // Drive the ambient lights from the sun elevation (mirror scene.mjs
+  // updateAmbientLights): intensity interpolates between the extras
+  // `night` value below the horizon and `day` at full daylight. The
+  // sun comes from _effectiveSun, so the time-of-day slider drives
+  // the ambient too. Called from _updateSunLight and once when the
+  // model loads.
+  _updateAmbientLights() {
+    if (this._ambientLights.length === 0) return;
+    const factor = this._daylightFactor(this._effectiveSun());
+    for (const a of this._ambientLights) {
+      a.light.intensity = a.night + (a.day - a.night) * factor;
     }
   }
 
@@ -1581,16 +2216,50 @@ class SceneRendererPanel extends HTMLElement {
 
   // --- live state ------------------------------------------------------
 
-  /** Marker color/opacity/scale for one model light from its HA entity. */
+  /** Marker color/opacity/scale for one model light from its HA entity.
+
+  Mirrors the example script's apply logic: the light follows its
+  mapped entity (on -> base x brightness, color from the entity);
+  unmapped lights render OFF. Precedence: a direct light toggle wins
+  first, then the mapped entity (whose state and brightness may be
+  emulated), then the TV glow as a fallback. */
   _lightAppearance(modelName) {
-    const mapping = (this._panelData && this._panelData.mapping) || {};
+    const mapping = this._lightMapping();
     const entityId = mapping[modelName];
+    // A direct light toggle wins over everything — the entity and the
+    // TV glow. "on" keeps the entity's color/brightness when there is
+    // one (the toggle only flips on/off, like the entity toggles).
+    const lightOverride = this._lightOverrides.get(modelName);
+    if (lightOverride !== undefined) {
+      if (lightOverride === "off") {
+        return {
+          rgb: [0x3a, 0x3f, 0x44],
+          opacity: 0.55,
+          scale: 1,
+          brightness: 0,
+          state: "off",
+        };
+      }
+      const st = entityId ? this._state(entityId) : null;
+      const rgb = this._entityColor(st) || [255, 255, 255];
+      const brightness = entityId ? this._emulatedBrightness(entityId) : 1;
+      return {
+        rgb,
+        opacity: 0.35 + 0.65 * brightness,
+        scale: 0.85 + 0.3 * brightness,
+        brightness,
+        state: "on",
+      };
+    }
     if (!entityId) {
+      // Unmapped: off in the viewer, like the script renders it.
+      // The marker stays neutral white but dim so the light is still
+      // findable in the 3D view.
       return {
         rgb: [255, 255, 255],
-        opacity: 0.9,
+        opacity: 0.55,
         scale: 1,
-        brightness: 1,
+        brightness: 0,
         state: "unmapped",
       };
     }
@@ -1621,21 +2290,8 @@ class SceneRendererPanel extends HTMLElement {
         state: st ? state : "unknown",
       };
     }
-    const attrs = st.attributes || {};
-    let rgb = null;
-    if (Array.isArray(attrs.rgb_color)) rgb = attrs.rgb_color;
-    else if (Array.isArray(attrs.hs_color)) {
-      rgb = hsToRgb(attrs.hs_color[0], attrs.hs_color[1]);
-    } else if (Array.isArray(attrs.xy_color)) {
-      rgb = xyToRgb(attrs.xy_color[0], attrs.xy_color[1]);
-    } else if (typeof attrs.color_temp_kelvin === "number") {
-      rgb = kelvinToRgb(attrs.color_temp_kelvin);
-    } else if (typeof attrs.color_temp === "number" && attrs.color_temp > 0) {
-      rgb = kelvinToRgb(1000000 / attrs.color_temp);
-    }
-    if (!rgb) rgb = [255, 255, 255];
-    const brightness =
-      typeof attrs.brightness === "number" ? attrs.brightness / 255 : 1;
+    const rgb = this._entityColor(st) || [255, 255, 255];
+    const brightness = this._emulatedBrightness(entityId);
     return {
       rgb,
       opacity: 0.35 + 0.65 * brightness,
@@ -1647,18 +2303,19 @@ class SceneRendererPanel extends HTMLElement {
 
   /** Drive the model's real three.js lights from the mapped HA entities.
 
-  Mirrors the render service's built-in mapping (scene.mjs applyLights):
-  on -> intensity = model base x brightness, color = entity color (or
-  color temperature); off/unavailable -> intensity 0; unmapped -> model
-  base values. Without this the viewer showed every light at full base
-  brightness no matter what HA said. */
+  Mirrors the example script's apply logic (scene.example.js
+  applyLightMapping): on -> intensity = model base x brightness,
+  color = entity color (or color temperature); off/unavailable ->
+  intensity 0; unmapped -> intensity 0 too (the script sets absolute
+  values for every light, so nothing is left at base by accident).
+  Without this the viewer showed every light at full base brightness
+  no matter what HA said. */
   _updateModelLights() {
     for (const entry of this._modelLights) {
       const app = this._lightAppearance(entry.name);
       if (app.state === "unmapped") {
-        entry.light.intensity = entry.baseIntensity;
-        entry.light.color.copy(entry.baseColor);
-        entry.light.castShadow = true;
+        entry.light.intensity = 0;
+        entry.light.castShadow = false;
       } else if (app.state !== "on" && app.state !== "tv") {
         entry.light.intensity = 0;
         // An off light casts no shadow — and skipping its 6 cube faces
@@ -1679,6 +2336,9 @@ class SceneRendererPanel extends HTMLElement {
     }
     // Light states changed: re-render the shadow maps on the next frame.
     this._requestShadowUpdate();
+    // Area lights follow their punctual light's effective intensity
+    // (set above) — the TV's area fill tracks the TV light.
+    this._updateAreaLights();
   }
 
   _updateLightMarkers() {
@@ -1698,10 +2358,20 @@ class SceneRendererPanel extends HTMLElement {
   }
 
   // HA azimuth: 0 = north, 90 = east. Model layout: +X = east,
-  // +Z = south, so north is -Z. Shared by the sun marker and the sun
-  // light so they always agree on where the sun is.
+  // +Z = south, so north is -Z. Shared by the sun marker, the sun
+  // light, the moon light, the curtain glow and the bounce lights so
+  // they always agree on where the sun is.
+  //
+  // North offset: `az` is a TRUE-north azimuth (from sun.sun, the
+  // fixed pin, or the NOAA calc), but the model frame is rotated by
+  // `north_offset` — the true-north azimuth the model's north side
+  // (-Z) faces. Subtract it before placing the sun/moon (mirror
+  // scene.mjs modelAzimuth — the viewer and the service must agree).
+  // With offset 0 the model is laid out true-north-up and the
+  // direction is unchanged.
   _sunDirection(az, el) {
-    const azR = (az * Math.PI) / 180;
+    const modelAz = (((az - (this._northOffset || 0)) % 360) + 360) % 360;
+    const azR = (modelAz * Math.PI) / 180;
     const elR = (el * Math.PI) / 180;
     return new THREE.Vector3(
       Math.cos(elR) * Math.sin(azR),
@@ -1743,10 +2413,17 @@ class SceneRendererPanel extends HTMLElement {
   // The sun the viewer renders: the time-of-day slider's override
   // when set, else the fixed sun from panel_data (when present), else
   // the live sun.sun state. The slider override is viewer-local
-  // emulation — it never touches the renders or the real sun.
+  // emulation — it never touches the renders or the real sun. A
+  // season-only override (day-of-year set, time live) computes the
+  // sun for today at the current time on the season date.
   _effectiveSun() {
-    if (this._sunOverride !== null) {
-      const computed = this._computedSun(this._sunOverride);
+    if (this._sunOverride !== null || this._seasonOverride !== null) {
+      const now = new Date();
+      const minutes =
+        this._sunOverride !== null
+          ? this._sunOverride
+          : now.getHours() * 60 + now.getMinutes();
+      const computed = this._computedSun(minutes, this._seasonOverride);
       if (computed) return computed;
       // No lat/lon (or an invalid date): fall through to the live sun.
     }
@@ -1770,10 +2447,48 @@ class SceneRendererPanel extends HTMLElement {
     return { azimuth, elevation };
   }
 
-  // Sun elevation/azimuth for today at the given local minutes-from-
-  // midnight, from hass.config latitude/longitude (NOAA). Null when
-  // the location is unavailable.
-  _computedSun(minutes) {
+  // The moon position the viewer renders: the time-of-day slider's
+  // override when set (computed for the slider's time and season, so
+  // night slider positions show moonlight), else panel_data.moon
+  // from the coordinator's lunar ephemeris. Null when neither is
+  // available (older integration, sun disabled) — no moonlight then.
+  _effectiveMoon() {
+    if (this._sunOverride !== null || this._seasonOverride !== null) {
+      const now = new Date();
+      const minutes =
+        this._sunOverride !== null
+          ? this._sunOverride
+          : now.getHours() * 60 + now.getMinutes();
+      const computed = this._computedMoon(minutes, this._seasonOverride);
+      if (computed) return computed;
+      // No lat/lon (or an invalid date): fall through to panel_data.
+    }
+    if (this._panelData && "moon" in this._panelData) {
+      const panelMoon = this._panelData.moon;
+      if (
+        panelMoon &&
+        typeof panelMoon.azimuth === "number" &&
+        typeof panelMoon.elevation === "number"
+      ) {
+        return panelMoon;
+      }
+      return null;
+    }
+    return null;
+  }
+
+  // The calendar date for a day-of-year (1 = Jan 1) in the current
+  // year. The season slider's date; the timezone offset is taken from
+  // this date, so DST is right for the season, not for today.
+  _seasonDate(dayOfYear) {
+    return new Date(new Date().getFullYear(), 0, dayOfYear);
+  }
+
+  // Sun elevation/azimuth for the given local minutes-from-midnight,
+  // from hass.config latitude/longitude (NOAA). `dayOfYear` (1..365)
+  // is the season slider's date; null means today. Null when the
+  // location is unavailable.
+  _computedSun(minutes, dayOfYear = null) {
     const config = this._hass && this._hass.config;
     if (
       !config ||
@@ -1782,46 +2497,93 @@ class SceneRendererPanel extends HTMLElement {
     ) {
       return null;
     }
-    const now = new Date();
+    const date = dayOfYear !== null ? this._seasonDate(dayOfYear) : new Date();
     return solarPosition({
-      year: now.getFullYear(),
-      month: now.getMonth() + 1,
-      day: now.getDate(),
+      year: date.getFullYear(),
+      month: date.getMonth() + 1,
+      day: date.getDate(),
       minutes,
       latitude: config.latitude,
       longitude: config.longitude,
-      tzOffsetMinutes: now.getTimezoneOffset(),
+      tzOffsetMinutes: date.getTimezoneOffset(),
     });
   }
 
-  // Keep the Sun section in sync with the override: show it only when
-  // the location is known, label the effective sun (live or the
-  // slider's time), and enable the Live button only while overridden.
+  // Moon elevation/azimuth for the given local minutes-from-midnight,
+  // from hass.config latitude/longitude (Schlyter). `dayOfYear`
+  // (1..365) is the season slider's date; null means today. Null when
+  // the location is unavailable. Mirror _computedSun.
+  _computedMoon(minutes, dayOfYear = null) {
+    const config = this._hass && this._hass.config;
+    if (
+      !config ||
+      typeof config.latitude !== "number" ||
+      typeof config.longitude !== "number"
+    ) {
+      return null;
+    }
+    const date = dayOfYear !== null ? this._seasonDate(dayOfYear) : new Date();
+    return lunarPosition({
+      year: date.getFullYear(),
+      month: date.getMonth() + 1,
+      day: date.getDate(),
+      minutes,
+      latitude: config.latitude,
+      longitude: config.longitude,
+      tzOffsetMinutes: date.getTimezoneOffset(),
+    });
+  }
+
+  // Moon suffix for the sun label: " · moon el 24.1°, az 98.3°" when
+  // the moon is up, empty otherwise (moon down or no moon data).
+  _moonLabelSuffix() {
+    const moon = this._effectiveMoon();
+    if (!moon || moon.elevation <= 0) return "";
+    return ` · moon el ${moon.elevation.toFixed(1)}°, az ${moon.azimuth.toFixed(1)}°`;
+  }
+
+  // Keep the Sun section in sync with the overrides: show it only
+  // when the location is known, label the effective sun (live or the
+  // sliders' time and season), and enable the Live button only while
+  // either slider is overridden. The season slider is parked at
+  // today's day-of-year while live, and shows the override date
+  // ("21 Jun") in the season label.
   _updateSunSlider() {
     const hasLocation = this._computedSun(720) !== null;
     this._els.sunSection.hidden = !hasLocation;
     if (!hasLocation) return;
-    if (this._sunOverride === null) {
-      this._els.sunLive.disabled = true;
-      const sun = this._effectiveSun();
+    const overridden = this._sunOverride !== null || this._seasonOverride !== null;
+    this._els.sunLive.disabled = !overridden;
+    const now = new Date();
+    const minutes =
+      this._sunOverride !== null
+        ? this._sunOverride
+        : now.getHours() * 60 + now.getMinutes();
+    const hh = String(Math.floor(minutes / 60)).padStart(2, "0");
+    const mm = String(minutes % 60).padStart(2, "0");
+    // Day-of-year for today (Jan 1 = 1): park the season slider there
+    // while live so dragging starts from the current season.
+    const todayDoy = Math.floor(
+      (now - new Date(now.getFullYear(), 0, 0)) / 86400000,
+    );
+    const doy = this._seasonOverride !== null ? this._seasonOverride : todayDoy;
+    this._els.seasonSlider.value = String(doy);
+    const seasonDate = this._seasonDate(doy);
+    const dateStr = `${seasonDate.getDate()} ${MONTHS_SHORT[seasonDate.getMonth()]}`;
+    this._els.seasonLabel.textContent = dateStr;
+    const sun = this._effectiveSun();
+    if (!overridden) {
       this._els.sunLabel.textContent = sun
-        ? `Live — elevation ${sun.elevation.toFixed(1)}°, azimuth ${sun.azimuth.toFixed(1)}°`
+        ? `Live — elevation ${sun.elevation.toFixed(1)}°, azimuth ${sun.azimuth.toFixed(1)}°${this._moonLabelSuffix()}`
         : "Live — no sun data";
-      // Park the slider at the current time so dragging starts from
-      // now rather than from wherever it was left.
-      const now = new Date();
-      this._els.sunSlider.value = String(
-        now.getHours() * 60 + now.getMinutes(),
-      );
+      // Park the time slider at the current time so dragging starts
+      // from now rather than from wherever it was left.
+      this._els.sunSlider.value = String(minutes);
       return;
     }
-    this._els.sunLive.disabled = false;
-    const sun = this._effectiveSun();
-    const hh = String(Math.floor(this._sunOverride / 60)).padStart(2, "0");
-    const mm = String(this._sunOverride % 60).padStart(2, "0");
     this._els.sunLabel.textContent = sun
-      ? `${hh}:${mm} — elevation ${sun.elevation.toFixed(1)}°, azimuth ${sun.azimuth.toFixed(1)}° (preview)`
-      : `${hh}:${mm} (preview)`;
+      ? `${hh}:${mm} · ${dateStr} — elevation ${sun.elevation.toFixed(1)}°, azimuth ${sun.azimuth.toFixed(1)}° (preview)${this._moonLabelSuffix()}`
+      : `${hh}:${mm} · ${dateStr} (preview)`;
   }
 
   /** Drive the directional sun light + hemisphere from the effective
@@ -1840,8 +2602,11 @@ class SceneRendererPanel extends HTMLElement {
     if (!sun) {
       this._sunLight.intensity = 0;
       this._hemi.intensity = 0.5;
+      this._updateMoonLight();
+      this._applyWeather();
       this._updateCurtainGlow();
       this._updateBounceLights();
+      this._updateAmbientLights();
       this._requestShadowUpdate();
       return;
     }
@@ -1849,9 +2614,16 @@ class SceneRendererPanel extends HTMLElement {
     const el = sun.elevation;
     if (el < 0) {
       this._sunLight.intensity = 0;
-      this._hemi.intensity = 0.06;
+      // Night: the hemisphere goes to 0 — night is dark (an earlier
+      // 0.06 floor kept every night render dimly lit). A model that
+      // wants a moonlight floor declares it in its ambient light's
+      // `night` value instead. Mirror scene.mjs applySun.
+      this._hemi.intensity = 0;
+      this._updateMoonLight();
+      this._applyWeather();
       this._updateCurtainGlow();
       this._updateBounceLights();
+      this._updateAmbientLights();
       this._requestShadowUpdate();
       return;
     }
@@ -1871,9 +2643,142 @@ class SceneRendererPanel extends HTMLElement {
     const dayFrac = Math.min(1, Math.max(0, el / 30));
     this._sunLight.intensity = 3.0 * dayFrac;
     this._hemi.intensity = 0.15 + 0.45 * dayFrac;
+    this._updateMoonLight();
+    this._applyWeather();
     this._updateCurtainGlow();
     this._updateBounceLights();
+    this._updateAmbientLights();
     this._requestShadowUpdate();
+  }
+
+  // Moon fade from a sun position (mirror scene.mjs moonFadeFactor):
+  // 0 while the sun is up, 1 once the sun is 12 degrees below the
+  // horizon. No sun (null) counts as no moon.
+  _moonFadeFactor(sun) {
+    if (!sun || typeof sun.elevation !== "number") return 0;
+    return Math.min(1, Math.max(0, -sun.elevation / 12));
+  }
+
+  /** Drive the directional moon light from the effective moon
+  position (see _effectiveMoon) and the effective sun elevation.
+
+  Mirrors the render service's applyMoon: the moon shines through
+  windows and casts shadows like a dim second sun, fading in as the
+  sun sets (full once the sun is 12 deg below the horizon) and off
+  when the moon itself is below the horizon or the sun is up. Called
+  from _updateSunLight on all paths, so the sun slider moves the
+  moonlight with the sun, like the ambient lights. */
+  _updateMoonLight() {
+    if (!this._moonLight) return;
+    const moon = this._effectiveMoon();
+    if (!moon || moon.elevation <= 0) {
+      this._moonLight.intensity = 0;
+      return;
+    }
+    const fade = this._moonFadeFactor(this._effectiveSun());
+    if (fade <= 0) {
+      this._moonLight.intensity = 0;
+      return;
+    }
+    const dir = this._sunDirection(moon.azimuth, moon.elevation);
+    this._moonLight.position
+      .copy(this._modelCenter)
+      .addScaledVector(dir, this._modelRadius * 4);
+    this._moonLight.target.position.copy(this._modelCenter);
+    this._moonLight.target.updateMatrixWorld();
+    this._moonLight.intensity = MOON_INTENSITY * fade;
+  }
+
+  // Apply the emulated weather preset (mirror scene.mjs applyWeather):
+  // dim the sun and moon, flatten the hemisphere while the sun is up,
+  // tint the clear color, and show the rain/snow particles. Called
+  // from _updateSunLight AFTER the sun and moon intensities are set
+  // (so the dimming is not overwritten) and BEFORE the curtain glow
+  // and bounce lights (which read the weathered sun intensity). The
+  // sun/moon/hemi intensities are set fresh on every _updateSunLight
+  // call, so the multiplication never compounds.
+  _applyWeather() {
+    if (!this._sunLight || !this._hemi || !this._renderer) return;
+    const preset = WEATHER_PRESETS[this._weather] || WEATHER_PRESETS.sunny;
+    this._sunLight.intensity *= preset.sun;
+    if (this._moonLight) this._moonLight.intensity *= preset.sun;
+    const sun = this._effectiveSun();
+    const sunUp = !sun || sun.elevation > 0;
+    if (preset.hemi !== null && sunUp) {
+      this._hemi.intensity = preset.hemi;
+    }
+    if (preset.tint && sunUp) {
+      this._renderer.setClearColor(new THREE.Color(preset.tint), 1);
+    } else {
+      this._renderer.setClearColor(0x000000, 0);
+    }
+    this._updateWeatherParticles(preset.particles);
+  }
+
+  // Lazily create the rain/snow THREE.Points (once per model) and add
+  // them to the scene (mirror scene.mjs ensureWeatherParticles).
+  // Points never cast shadows; depthWrite off so a flake never
+  // occludes the house behind it.
+  _ensureWeatherParticles() {
+    if (!this._scene || !this._modelBounds) return;
+    this._weatherPoints = {};
+    this._weatherBase = {};
+    for (const kind of ["rain", "snow"]) {
+      const spec = WEATHER_PARTICLES[kind];
+      const positions = weatherParticlePositions(
+        kind,
+        this._modelBounds,
+        this._floorY,
+      );
+      const geometry = new THREE.BufferGeometry();
+      geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+      const material = new THREE.PointsMaterial({
+        color: spec.color,
+        size: spec.size,
+        sizeAttenuation: true,
+        transparent: true,
+        opacity: spec.opacity,
+        depthWrite: false,
+      });
+      const points = new THREE.Points(geometry, material);
+      points.name = `weather_${kind}`;
+      points.visible = false;
+      points.frustumCulled = false; // the cloud spans the whole volume
+      this._scene.add(points);
+      this._weatherPoints[kind] = points;
+      this._weatherBase[kind] = positions;
+    }
+  }
+
+  // Show/hide the particle systems for the current weather and advance
+  // the fall to _weatherTime (mirror scene.mjs updateWeatherParticles).
+  // Called from _applyWeather (on weather or sun changes) and from the
+  // render loop (every frame, while rain or snow is selected).
+  _updateWeatherParticles(kind) {
+    if (!this._scene || !this._modelBounds) return;
+    if (!this._weatherPoints) this._ensureWeatherParticles();
+    if (!this._weatherPoints) return;
+    const yMin = this._floorY + 0.2;
+    const yMax = this._floorY + 7;
+    for (const [name, points] of Object.entries(this._weatherPoints)) {
+      const active = name === kind;
+      points.visible = active;
+      if (!active) continue;
+      const spec = WEATHER_PARTICLES[name];
+      const base = this._weatherBase[name];
+      const attr = points.geometry.getAttribute("position");
+      const arr = attr.array;
+      for (let i = 0; i < spec.count; i += 1) {
+        arr[i * 3 + 1] = weatherFallY(
+          base[i * 3 + 1],
+          this._weatherTime,
+          spec.speed,
+          yMin,
+          yMax,
+        );
+      }
+      attr.needsUpdate = true;
+    }
   }
 
   // Sheer-curtain glow (mirror scene.mjs updateCurtainGlow): a curtain
@@ -2038,7 +2943,7 @@ class SceneRendererPanel extends HTMLElement {
   // --- side lists ------------------------------------------------------
 
   _renderLightList() {
-    const mapping = (this._panelData && this._panelData.mapping) || {};
+    const mapping = this._lightMapping();
     const list = this._els.lightList;
     list.innerHTML = "";
     this._lightRows = new Map();
@@ -2067,20 +2972,25 @@ class SceneRendererPanel extends HTMLElement {
       li.appendChild(dot);
       li.appendChild(main);
       li.appendChild(stateEl);
-      // Toggle switch for mapped lights: flips the viewer's LOCAL
-      // preview override for the entity (emulation-only — never
-      // calls an HA service). The row click still selects the light
-      // for details; the switch stops propagation so the two don't
-      // fight. Only light-domain entities get a switch.
-      let toggleInput = null;
-      if (entityId && entityId.startsWith("light.")) {
-        const toggle = this._makeToggle(entityId, `Toggle ${marker.name}`);
-        toggleInput = toggle.input;
-        li.appendChild(toggle.label);
-      }
+      // Direct toggle switch for the light: flips the viewer's LOCAL
+      // preview override for this model light (emulation-only — never
+      // calls an HA service, and never touches the mapped entity). A
+      // set toggle wins over the entity's state. Every light gets one,
+      // mapped or not — an unmapped light can be previewed on too.
+      // The row click still selects the light for details; the switch
+      // stops propagation so the two don't fight.
+      const toggle = this._makeLightToggle(
+        marker.name,
+        `Toggle ${marker.name}`,
+      );
+      li.appendChild(toggle.label);
       li.addEventListener("click", () => this._selectLight(marker.name));
       list.appendChild(li);
-      this._lightRows.set(marker.name, { dot, stateEl, toggleInput });
+      this._lightRows.set(marker.name, {
+        dot,
+        stateEl,
+        toggleInput: toggle.input,
+      });
     }
     this._updateLightList();
   }
@@ -2104,23 +3014,191 @@ class SceneRendererPanel extends HTMLElement {
     return { label, input };
   }
 
+  // A toggle switch for one model light: flips the viewer's LOCAL
+  // preview override for it (emulation-only — never calls an HA
+  // service, and never touches the mapped entity). The label stops
+  // propagation so a switch inside a clickable row does not also
+  // trigger the row's click handler.
+  _makeLightToggle(modelName, labelText) {
+    const label = document.createElement("label");
+    label.className = "switch";
+    const input = document.createElement("input");
+    input.type = "checkbox";
+    input.setAttribute("aria-label", labelText);
+    const slider = document.createElement("span");
+    slider.className = "slider";
+    label.appendChild(input);
+    label.appendChild(slider);
+    label.addEventListener("click", (ev) => ev.stopPropagation());
+    input.addEventListener("change", () => this._toggleLight(modelName));
+    return { label, input };
+  }
+
   _updateLightList() {
     if (!this._lightRows) return;
-    const mapping = (this._panelData && this._panelData.mapping) || {};
+    const mapping = this._lightMapping();
     for (const [name, row] of this._lightRows) {
       const app = this._lightAppearance(name);
       row.dot.style.backgroundColor = `rgb(${app.rgb[0]},${app.rgb[1]},${app.rgb[2]})`;
       row.dot.style.opacity = String(app.opacity);
       const entityId = mapping[name];
-      const overridden = entityId ? this._isOverridden(entityId) : false;
+      // Preview when the light itself is toggled, or its entity is
+      // (state or brightness) emulated.
+      const overridden =
+        this._lightOverrides.has(name) ||
+        (entityId &&
+          (this._isOverridden(entityId) ||
+            this._brightnessOverrides.has(entityId)));
       row.stateEl.textContent = overridden ? `${app.state} (preview)` : app.state;
       row.stateEl.classList.toggle("preview", overridden);
       if (row.toggleInput) {
         row.toggleInput.checked = app.state === "on" || app.state === "tv";
-        row.toggleInput.disabled =
-          app.state === "unavailable" || app.state === "unknown";
+        // A mapped light whose entity is gone cannot be previewed
+        // from the entity — but the direct toggle still works, so it
+        // is never disabled: it flips the light, not the entity.
+        row.toggleInput.disabled = false;
       }
     }
+  }
+
+  // Subscribed entities (panel_data.entities — the YAML list plus the
+  // script's subscriptions and the object drivers): one row per
+  // entity, with the lights it drives, its live state, and emulation
+  // controls — a toggle for toggleable domains and a brightness slider
+  // for lights that report a brightness. Everything here feeds the
+  // preview ONLY, through the lightMapping: flipping an entity's
+  // toggle drives every light it maps to.
+  _renderEntityList() {
+    const entities = (this._panelData && this._panelData.entities) || [];
+    const mapping = this._lightMapping();
+    const list = this._els.entityList;
+    list.innerHTML = "";
+    this._entityRows = new Map();
+    if (entities.length === 0) {
+      list.innerHTML = `<li class="row-sub">No subscribed entities. List them in the YAML <code>entities</code> block or declare them in scene.js with <code>subscribe</code>.</li>`;
+      return;
+    }
+    // Reverse the mapping: entity id -> model lights it drives.
+    const drivenBy = new Map();
+    for (const [light, entityId] of Object.entries(mapping)) {
+      if (!drivenBy.has(entityId)) drivenBy.set(entityId, []);
+      drivenBy.get(entityId).push(light);
+    }
+    for (const entityId of entities) {
+      const li = document.createElement("li");
+      li.className = "clickable";
+      const dot = document.createElement("span");
+      dot.className = "dot";
+      const main = document.createElement("div");
+      main.className = "row-main";
+      const nameEl = document.createElement("div");
+      nameEl.className = "row-name";
+      nameEl.textContent = entityId;
+      const sub = document.createElement("div");
+      sub.className = "row-sub";
+      const driven = drivenBy.get(entityId) || [];
+      sub.textContent =
+        driven.length > 0 ? `drives ${driven.join(", ")}` : "drives no light";
+      main.appendChild(nameEl);
+      main.appendChild(sub);
+      // Brightness slider for lights that report a brightness: the
+      // value comes from the real attribute until the slider moves.
+      let sliderInput = null;
+      let sliderLabel = null;
+      const st = this._state(entityId);
+      if (
+        entityId.startsWith("light.") &&
+        st &&
+        typeof st.attributes?.brightness === "number"
+      ) {
+        const row = document.createElement("div");
+        row.className = "brightness-row";
+        sliderInput = document.createElement("input");
+        sliderInput.type = "range";
+        sliderInput.min = "0";
+        sliderInput.max = "100";
+        sliderInput.step = "1";
+        sliderInput.setAttribute("aria-label", `Brightness ${entityId}`);
+        sliderLabel = document.createElement("span");
+        sliderInput.addEventListener("click", (ev) => ev.stopPropagation());
+        sliderInput.addEventListener("input", () => {
+          this._setBrightnessOverride(entityId, Number(sliderInput.value) / 100);
+        });
+        row.appendChild(sliderInput);
+        row.appendChild(sliderLabel);
+        main.appendChild(row);
+      }
+      const stateEl = document.createElement("span");
+      stateEl.className = "row-state";
+      li.appendChild(dot);
+      li.appendChild(main);
+      li.appendChild(stateEl);
+      let toggleInput = null;
+      if (isToggleableEntity(entityId)) {
+        const toggle = this._makeToggle(entityId, `Toggle ${entityId}`);
+        toggleInput = toggle.input;
+        li.appendChild(toggle.label);
+      }
+      li.addEventListener("click", () => this._selectEntity(entityId));
+      list.appendChild(li);
+      this._entityRows.set(entityId, {
+        dot,
+        stateEl,
+        toggleInput,
+        sliderInput,
+        sliderLabel,
+      });
+    }
+    this._updateEntityList();
+  }
+
+  _updateEntityList() {
+    if (!this._entityRows) return;
+    for (const [entityId, row] of this._entityRows) {
+      const state = this._emulatedState(entityId);
+      const overridden =
+        this._isOverridden(entityId) ||
+        this._brightnessOverrides.has(entityId);
+      row.stateEl.textContent = overridden ? `${state} (preview)` : state;
+      row.stateEl.classList.toggle("preview", overridden);
+      const active = ON_STATES.has(state);
+      row.dot.style.backgroundColor = active ? "#ffb300" : "#3a3f44";
+      row.dot.style.opacity = active ? "1" : "0.55";
+      if (row.toggleInput) {
+        row.toggleInput.checked = active;
+        row.toggleInput.disabled =
+          state === "unavailable" || state === "unknown";
+      }
+      if (row.sliderInput) {
+        const brightness = this._emulatedBrightness(entityId);
+        // Don't fight the user mid-drag: only move the slider when
+        // the value actually changed (the input event already set
+        // the override, so a re-render keeps it in place).
+        if (Number(row.sliderInput.value) !== Math.round(brightness * 100)) {
+          row.sliderInput.value = String(Math.round(brightness * 100));
+        }
+        row.sliderInput.disabled = state !== "on";
+        row.sliderLabel.textContent = `${Math.round(brightness * 100)}%`;
+        row.sliderLabel.classList.toggle(
+          "preview",
+          this._brightnessOverrides.has(entityId),
+        );
+      }
+    }
+  }
+
+  _selectEntity(entityId) {
+    const mapping = this._lightMapping();
+    const driven = Object.entries(mapping)
+      .filter(([, e]) => e === entityId)
+      .map(([light]) => light);
+    const state = this._emulatedState(entityId);
+    this._els.info.textContent =
+      `Entity ${entityId} — ${state}` +
+      (driven.length > 0 ? ` — drives ${driven.join(", ")}` : " — drives no light") +
+      (this._isOverridden(entityId) || this._brightnessOverrides.has(entityId)
+        ? " (preview)"
+        : "");
   }
 
   // Script-driven objects (fan, TV screen): one row per object the
@@ -2232,13 +3310,19 @@ class SceneRendererPanel extends HTMLElement {
   }
 
   _selectLight(name) {
-    const mapping = (this._panelData && this._panelData.mapping) || {};
+    const mapping = this._lightMapping();
     const entityId = mapping[name];
     const app = this._lightAppearance(name);
+    const overridden =
+      this._lightOverrides.has(name) ||
+      (entityId &&
+        (this._isOverridden(entityId) ||
+          this._brightnessOverrides.has(entityId)));
     this._els.info.textContent = entityId
       ? `Light ${name} — ${entityId} — ${app.state}` +
-        (this._isOverridden(entityId) ? " (preview)" : "")
-      : `Light ${name} — not mapped to a Home Assistant entity`;
+        (overridden ? " (preview)" : "")
+      : `Light ${name} — not mapped to a Home Assistant entity` +
+        (overridden ? " (preview)" : "");
   }
 
   _selectSun() {

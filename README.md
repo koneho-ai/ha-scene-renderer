@@ -51,23 +51,27 @@ no UI setup flow. Add a `scene_renderer` block to
 
 ```yaml
 scene_renderer:
-  lights:
-    living_room_1: light.living_room
-    kitchen_1: light.kitchen
+  entities:
+    - light.living_room
+    - light.kitchen
 ```
 
 Every key is optional — a bare `scene_renderer:` line works, and the
-app is discovered automatically. Only the lights you map follow live
-state; unmapped lights render at their model defaults (full
-brightness, model color), so the demo model needs no onboarding at
-all.
+app is discovered automatically. The YAML only lists the entities to
+subscribe to; the light→entity mapping itself lives in the scene
+script (`scene.js`), as a `lightMapping` table the script applies
+every frame — a mapped light whose entity is on shines at model base
+× brightness in the entity's color, and a light not in the table
+renders off. The bundled `scene.example.js` has the full table and
+apply logic for the sample model. The old YAML `lights:` mapping is
+deprecated (see the wiki's [[Configuration]] page for the migration).
 
 | Key | Default | Notes |
 | --- | --- | --- |
 | `service_url` | discovered | Base URL of the render service. Only needed if Supervisor discovery fails (e.g. the app runs outside the Supervisor); usually something like `http://a1b2c3d4-scene-renderer:3000` |
 | `sun_entity` | `sun.sun` | Sun entity to follow; set to `null` to disable the sun |
 | `name` | `Scene Renderer` | Scene name, used for the device and entities |
-| `lights` | `{}` | Mapping of model light names (e.g. `living_room_1`) to HA light entity ids |
+| `entities` | `[]` | The entities the integration subscribes to — their states are sent to the render service in every render request, and the script maps them to model lights via its `lightMapping` table |
 | `objects` | `{}` | Mapping of model object names (e.g. `ceiling_fan`) to HA entity ids — the panel's Objects section lists them with their driving entity and a toggle |
 | `cameras` | all | Camera names to expose, one image entity each; omit to expose every camera the app offers |
 
@@ -75,134 +79,7 @@ Changing the YAML needs a Home Assistant restart (standard for
 YAML-only integrations). To remove the integration, delete the block
 and restart.
 
-> **Upgrading from 0.2.x?** The config flow is gone in 0.3.0: delete
-> the old integration entry first (Settings → Devices & Services → HA
-> Scene Renderer → ⋮ → Delete), then add the YAML block above with
-> your light mapping and restart. Deleting first frees up the entity
-> ids (`image.<name>_<camera>` etc.), so the YAML setup reuses them;
-> if the old entry still exists when the YAML setup runs, the new
-> entities get `_2` suffixes instead.
->
-> **Upgrading from 0.3.0?** 0.3.0 registered bare entity ids
-> (`image.overview`, `sensor.render_status`, `button.re_render`)
-> because no device attaches to a YAML-only setup. 0.3.1 renames them
-> to the scene-prefixed ids (`image.scene_renderer_overview`, …)
-> automatically on the first restart after updating — no action
-> needed, unless you built automations or dashboards on the bare ids,
-> in which case update them to the new ids. 0.3.1 also fixes the
-> sidebar panel leaving a black gap at the bottom of the page, and
-> adds a toggle switch to each mapped light in the panel's light list
-> so the render can be tested from the panel itself.
->
-> **0.3.2** fixes a startup crash in 0.3.1 (`No module named
-> 'homeassistant.util.slugify'` — the migration imported slugify from
-> a submodule that doesn't exist in HA; it lives in
-> `homeassistant.util`). If 0.3.1 left the entities unavailable and
-> the panel missing, update to 0.3.2 and restart — the migration runs
-> on setup and everything comes back under the new ids.
->
-> **0.3.3** fixes the migration itself: 0.3.1/0.3.2 removed the bare
-> registry entries, but HA stashes removed entries in
-> `deleted_entities` and restores the old id when the entity is
-> re-added, so the bare ids came straight back. 0.3.3 renames the
-> entries in place instead, which sticks.
->
-> **0.3.4** fixes the panel showing stale code after an update: the
-> panel JS was served at a fixed URL, so browsers kept running the
-> old cached copy (no toggles, black gap at the bottom) until a
-> manual hard refresh. The module URL now carries the integration
-> version, so every release loads fresh. 0.3.4 also makes the panel's
-> 3D viewer use the real lighting: the model's lights now follow
-> their mapped HA entities (on/off, brightness, color) and the sun
-> follows `sun.sun`, mirroring the rendered images — previously the
-> viewer showed every light at full base brightness under a strong
-> fixed ambient, no matter what HA said.
->
-> **0.3.6** makes every light cast shadows, in the rendered images and
-> in the panel's 3D viewer: each model light renders a shadow map
-> (point lights use cube maps), the sun casts too, and every model
-> mesh casts and receives. Off lights cast nothing, so they cost no
-> shadow passes. Shadow maps in the viewer update only when a light
-> or the sun changes, and motion clips render shadows once and freeze
-> them for the rest of the clip — re-rendering 14 cube maps every
-> frame would be 84 extra scene renders per frame. Renders take
-> longer with shadows on (a 1280×720 still with all 14 lights on is
-> roughly 13 seconds on the test machine, up from under a second).
-> 0.3.6 also adds a `render_ms` attribute to each image entity: the
-> wall-clock milliseconds the service spent rendering that camera's
-> latest image (frames + encoding for clips), so you can see what the
-> shadows cost per camera. And 0.3.6 replaces the sample model with a
-> new 8-room house (14 lights, a TV driven by `scene.js`, one window
-> per room) plus an invisible shadow-casting ceiling — a mesh whose
-> material is named `ShadowOnly` renders as nothing but still casts
-> shadows, so the sun enters only through the windows. Meshes whose
-> materials are all transparent (glass) cast no shadow. 0.3.6 also
-> lets you pin the sun with `sun_elevation` + `sun_azimuth` in the
-> YAML — a fixed high sun instead of following `sun.sun`, handy in
-> winter when the real sun never gets high — adds door openings and a
-> ceiling fan (script-driven, spins when its light is on) to the
-> sample house, maps the TV as a light (`living_room_tv`, driven by
-> its mapped entity when the TV is off and by `scene.js` when it is
-> on), and fixes scene.js in the default backend: an SES import bug
-> had silently disabled user scripts under node-webgl, so scene.js
-> only ever ran under the Puppeteer fallback.
->
-> **0.3.7** makes shadows per-light soft: each point
-> light gets a shadow map size (512, 1024, or 2048) from a
-> deterministic hash of its name, so some lights cast soft shadows
-> and others crisp ones — stable across renders because the hash only
-> depends on the name. The panel viewer does the same one step
-> lighter (256/512/1024). 0.3.7 also fixes a shadow bug: a light the
-> script lights on its own (the TV glow while its mapped entity is
-> off) now shines and casts shadows — visibility and shadow casting
-> follow the light's effective intensity after the script runs, not
-> the mapped entity's on/off. Cameras can now be orthographic: `projection:
-> orthographic` + `ortho_size` (frustum height in metres, default:
-> fit the model) in `cameras.yaml`, and the panel viewer adopts the
-> projection when you select the camera. A camera with no
-> `background` now renders TRANSPARENT where no geometry is visible
-> (alpha 0) instead of opaque black — a hex `background` still gives
-> an opaque backdrop, and clips keep the transparency too. Sheer
-> curtains behave like the real thing: a `SheerCurtain` mesh casts a
-> dithered partial shadow (~45% of the sun gets through, broken up
-> like a weave), glows warm when the sun is on its side, and
-> `curtain_glow_*` lights (diffuse re-emission, never casting
-> shadows) are driven from the sun by `scene.js`. Sunlight bouncing
-> off the floor patch is emulated with one soft point light per
-> sunlit window — models mark their windows with empty
-> `window_<room>` nodes. The panel gains an Objects section (the fan
-> and TV screen, with their driving entities from the script's
-> `objectDrivers` export), clickable object markers in the 3D view, a
-> spinning fan, and a TV screen that shows/hides with the TV — and
-> the toggles are now emulation-only: flipping one sets a local
-> preview override in the viewer (marked "(preview)", cleared by
-> Reset preview) and never touches the real entity. A time-of-day
-> sun slider moves the viewer's sun to any time (computed from your
-> latitude/longitude), with a Live button to return to the real sun.
-> The panel also re-fetches its data when the frontend reconnects
-> after an HA restart, so a page loaded before the restart no longer
-> keeps a stale mapping or sun forever.
->
-> **0.3.8** adds an `objects` key to the YAML block: map model objects
-> to entities the same way `lights` maps lights (e.g. `ceiling_fan:
-> light.wizcolor1`) — mapped objects show in the panel's Objects
-> section with their driving entity and a toggle, and the integration
-> re-renders when a driver changes. A YAML object mapping wins over
-> the script's `objectDrivers` for the same object. 0.3.8 also
-> removes the `curtain_glow_*` lights 0.3.7 added: the curtain's glow
-> is its own material (warm emissive where the sun hits it) and the
-> room fill from a sunlit window is the bounce light — no separate
-> glow light sources, nothing to map. The sample model's TV light
-> moved to 4 cm in front of the screen face, so the glow reads as
-> coming from the screen itself. 0.3.8 also fixes the bounce lights
-> at a low sun: the patch is clamped to within 5 m of its window
-> (about one room) and the bounce fades to 0 as the patch approaches
-> that limit, so a low sun no longer throws the bounce into another
-> room — high-sun behaviour is unchanged. 0.3.8 also fixes point
-> lights leaking through thin interior walls: the point-light shadow
-> depth bias is gone (it punched through 0.10 m walls in the
-> perspective cube camera) and shadow acne is handled by the normal
-> bias alone.
+See [CHANGELOG.md](CHANGELOG.md) for the release history.
 
 ## What you get in Home Assistant
 
@@ -242,7 +119,8 @@ configured (and disappears if the integration is removed).
 - **Light markers** sit at each model light's position, colored by the
   light's live state: on lights show their current color and
   brightness, off/unavailable lights are dim gray, unmapped lights are
-  neutral white. The markers update live as entities change.
+  neutral white but dim (they render off, like the script renders
+  them). The markers update live as entities change.
 - **Camera markers** show where each camera sits and where it points.
   Click one to jump the 3D viewer to that camera's viewpoint (adopting
   its projection — an orthographic camera views orthographic) and see
@@ -254,17 +132,22 @@ configured (and disappears if the integration is removed).
 - **Sun marker** — the sun's position from `sun.sun`, hidden below the
   horizon.
 - **Side list** — every light (model name, mapped entity, live state),
-  every script-driven object (object name, driving entity, live
-  state), and every camera.
-- **Emulation-only toggles** — the light and object toggles do NOT
-  call any HA service: flipping one sets a local preview override in
-  the viewer only, so you can try "what if this light were on" without
-  touching the real house. Overridden rows are marked "(preview)";
-  **Reset preview** (next to the Lights heading) clears all overrides
-  and returns the viewer to the real entity states. Overrides are
-  session-local (gone on reload) and never affect the renders. The fan
-  spins in the viewer while its emulated state is on, and the TV toggle
-  shows/hides the TV screen plus its light.
+  every subscribed entity (entity id, the lights it drives, live
+  state), every script-driven object (object name, driving entity,
+  live state), and every camera.
+- **Emulation-only toggles** — the light, entity and object toggles
+  do NOT call any HA service: flipping one sets a local preview
+  override in the viewer only, so you can try "what if this light
+  were on" without touching the real house. Overridden rows are
+  marked "(preview)"; **Reset preview** (next to the Lights heading)
+  clears all overrides and returns the viewer to the real entity
+  states. Overrides are session-local (gone on reload) and never
+  affect the renders. The fan spins in the viewer while its emulated
+  state is on, and the TV toggle shows/hides the TV screen plus its
+  light. An entity toggle drives its lights through the script's
+  `lightMapping`; a direct light toggle wins over the entity (and
+  over the TV glow). Lights that report a brightness get a slider in
+  the Entities section too.
 - **Time-of-day sun slider** — a Sun section with a 00:00–24:00 slider
   moves the viewer's sun to the chosen time (computed from your
   latitude/longitude, shown with its elevation/azimuth). **Live**
@@ -272,17 +155,19 @@ configured (and disappears if the integration is removed).
   or the real sun.
 
 The panel gets the model from the app (through the integration — the
-browser cannot reach the app directly) and the light mapping from the
-integration, which is the only place that knows it. If the app is
-unreachable the panel says so instead of showing a blank page. The
-panel re-fetches its data (mapping, sun, cameras, script entities)
+browser cannot reach the app directly) and the light mapping and
+entity list from the integration. If the app is unreachable the panel
+says so instead of showing a blank page. The panel re-fetches its data
+(light mapping, entities, sun, cameras, script entities)
 when the frontend reconnects after an HA restart, so a page loaded
 before the restart picks up the new data without a manual reload.
 
 ## Light parametrization
 
-The render emulates what your entities are actually doing. The
-integration normalizes each mapped entity into a parameter set:
+The render emulates what your entities are actually doing. The scene
+script maps entities to lights (its `lightMapping` table, applied in
+`update()` every frame — the bundled `scene.example.js` has the
+standard apply logic). Each mapped entity is read as:
 
 | Render parameter | From the entity |
 | --- | --- |
@@ -295,14 +180,16 @@ integration normalizes each mapped entity into a parameter set:
 are present: `color_temp` mode uses the temperature, `hs` / `xy` / `rgb`
 modes use the color.
 
-The service applies the parameters on top of the **model's base values**:
+The script applies the parameters on top of the **model's base values**:
 the model's `KHR_lights_punctual` intensity is the "full brightness" look
 and its color is the default color.
 
 - intensity = model base intensity × brightness (0 when off)
 - color = entity color, else Kelvin→RGB of `color_temp_k`, else model color
 
-Unmapped lights render at their model base values. One approximation to
+A light not in `lightMapping` renders OFF — the script sets absolute
+values for every light every frame, so nothing is ever left at the
+model's base intensity by accident. One approximation to
 know about: in RGB color modes the brightness lives partly in the color
 itself (HA docs), so a natively-RGB light with a dark color renders
 slightly dimmer than its brightness value alone would suggest.

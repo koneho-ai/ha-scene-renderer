@@ -2,11 +2,12 @@
 // overridable with the SCENE_SCRIPT_PATH env var).
 //
 // The script is a small ESM-style module (see script.mjs): it must export
-// a default update function and may declare `export const subscribe` and
-// `export const objectDrivers`. This module only loads and watches the
-// file; compilation happens in the render backend's realm (Node for
-// node-webgl, the browser page for puppeteer) via the injected `compile`
-// function, which returns { ok, subscribe, objectDrivers, error }.
+// a default update function and may declare `export const subscribe`,
+// `export const objectDrivers`, and `export const lightMapping`. This
+// module only loads and watches the file; compilation happens in the
+// render backend's realm (Node for node-webgl, the browser page for
+// puppeteer) via the injected `compile` function, which returns
+// { ok, subscribe, objectDrivers, lightMapping, error }.
 //
 // Failure policy (never break rendering):
 //   - file missing -> no script (v1 behavior), not an error
@@ -27,12 +28,17 @@ const RELOAD_DEBOUNCE_MS = 200;
 export function createScriptStore({ filePath, log, compile }) {
   const fileName = basename(filePath);
   const dirPath = dirname(filePath);
-  // Status: { present, hash, subscribe, object_drivers, status, error }.
-  // status: 'none' (no file) | 'ok' (compiled) | 'error' (last compile failed).
-  // object_drivers maps model object names to their driving entity
-  // ({ ceiling_fan: "light.wizcolor1" }) — from the script's
-  // `export const objectDrivers`; the panel shows those objects.
-  let status = { present: false, hash: null, subscribe: [], object_drivers: {}, status: "none", error: null };
+  // Status: { present, hash, subscribe, object_drivers, light_mapping,
+  // status, error }. status: 'none' (no file) | 'ok' (compiled) |
+  // 'error' (last compile failed). object_drivers maps model object
+  // names to their driving entity ({ ceiling_fan: "light.wizcolor1" })
+  // — from the script's `export const objectDrivers`; the panel shows
+  // those objects. light_mapping maps model light names to their
+  // driving entity ({ living_room_1: "light.living_room" }) — from the
+  // script's `export const lightMapping`; it is THE light→entity
+  // mapping (the YAML `lights` block is deprecated), and the panel
+  // shows it in the Lights section.
+  let status = { present: false, hash: null, subscribe: [], object_drivers: {}, light_mapping: {}, status: "none", error: null };
   let lastHash = null;
   let lastMtimeMs = 0;
   let lastExisted = false;
@@ -64,7 +70,7 @@ export function createScriptStore({ filePath, log, compile }) {
             log("error", `scene.js: failed to clear the script: ${compileErr.message}`);
           }
         }
-        status = { present: false, hash: null, subscribe: [], object_drivers: {}, status: "none", error: null };
+        status = { present: false, hash: null, subscribe: [], object_drivers: {}, light_mapping: {}, status: "none", error: null };
         lastHash = null;
         lastExisted = false;
         lastMtimeMs = 0;
@@ -96,6 +102,10 @@ export function createScriptStore({ filePath, log, compile }) {
         object_drivers:
           result.objectDrivers && typeof result.objectDrivers === "object"
             ? { ...result.objectDrivers }
+            : {},
+        light_mapping:
+          result.lightMapping && typeof result.lightMapping === "object"
+            ? { ...result.lightMapping }
             : {},
         status: "ok",
         error: null,
@@ -143,6 +153,7 @@ export function createScriptStore({ filePath, log, compile }) {
         ...status,
         subscribe: [...status.subscribe],
         object_drivers: { ...status.object_drivers },
+        light_mapping: { ...status.light_mapping },
       };
     },
 

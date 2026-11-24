@@ -86,7 +86,7 @@ export async function createBackend({ serverUrl, log }) {
       return page.evaluate(() => window.__scriptInfo());
     },
 
-    async render({ lights: lightStates, sun, entities, cameras, width, height, fileConfig, shouldAbort }) {
+    async render({ lights: lightStates, sun, moon, entities, cameras, width, height, fileConfig, northOffset, weather, shouldAbort }) {
       // Split stills from clips using the effective configs (which carry
       // the per-camera clip entry, or null). listCameras returns an array;
       // index it by name.
@@ -116,11 +116,14 @@ export async function createBackend({ serverUrl, log }) {
           {
             lights: lightStates || {},
             sun: sun ?? null,
+            moon: moon ?? null,
             entities: entities || {},
             cameras: stillNames,
             width,
             height,
             fileConfig: fileConfig || {},
+            northOffset: northOffset ?? 0,
+            weather: weather ?? "sunny",
           },
         );
         for (const [name, dataUrl] of Object.entries(result.images)) {
@@ -152,10 +155,13 @@ export async function createBackend({ serverUrl, log }) {
               name,
               lights: lightStates || {},
               sun: sun ?? null,
+              moon: moon ?? null,
               entities: entities || {},
               cfg,
               time,
               loop,
+              northOffset: northOffset ?? 0,
+              weather: weather ?? "sunny",
               freezeShadows: i > 0,
             },
           );

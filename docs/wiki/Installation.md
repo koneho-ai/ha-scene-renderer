@@ -40,12 +40,16 @@ The integration is YAML-only — there is no UI setup flow. Add a `scene_rendere
 
 ```yaml
 scene_renderer:
-  lights:
-    living_room_1: light.living_room
-    kitchen_1: light.kitchen
+  entities:
+    - light.living_room
+    - light.kitchen
 ```
 
-Every key is optional — a bare `scene_renderer:` line works. See [[Configuration]] for the full reference and the 0.2.x migration notes.
+Every key is optional — a bare `scene_renderer:` line works. The YAML
+only lists the entities to subscribe to; the light→entity mapping
+lives in the scene script (`scene.js`) as a `lightMapping` table —
+see [[Configuration]] for the full reference and the 0.2.x migration
+notes.
 
 ## What you get in Home Assistant
 

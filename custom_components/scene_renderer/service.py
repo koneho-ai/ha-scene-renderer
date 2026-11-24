@@ -70,6 +70,7 @@ class RenderServiceClient:
 
         Shape: {"script": {"present": bool, "hash": str | None,
         "subscribe": [...], "object_drivers": {object_name: entity_id},
+        "light_mapping": {light_name: entity_id},
         "status": "none"|"ok"|"error", "error": ..., "last_error": ...,
         "error_count": int}}.
         """

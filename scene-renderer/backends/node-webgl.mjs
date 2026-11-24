@@ -78,7 +78,7 @@ export async function createBackend({ modelPath, log }) {
   // with alpha 0) — without it the output would be opaque black.
   const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: true });
   renderer.shadowMap.enabled = true;
-  renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+  renderer.shadowMap.type = THREE.PCFShadowMap;
   renderer.toneMapping = THREE.ACESFilmicToneMapping;
   renderer.toneMappingExposure = sceneLib.BASE_EXPOSURE;
   renderer.setPixelRatio(1);
@@ -115,12 +115,12 @@ export async function createBackend({ modelPath, log }) {
     },
 
     // Compile a new user script (or clear it with null). Returns
-    // { ok, subscribe, objectDrivers, error }; a failed compile keeps
-    // the last good script running.
+    // { ok, subscribe, objectDrivers, lightMapping, error }; a failed
+    // compile keeps the last good script running.
     async setScript(source) {
       if (source === null || source === undefined) {
         script = null;
-        return { ok: true, subscribe: [], objectDrivers: {} };
+        return { ok: true, subscribe: [], objectDrivers: {}, lightMapping: {} };
       }
       if (!sesAvailable) {
         return { ok: false, error: "SES is not available in this process — scene.js cannot be loaded" };
@@ -130,7 +130,7 @@ export async function createBackend({ modelPath, log }) {
       });
       if (!result.ok) return result;
       script = result;
-      return { ok: true, subscribe: result.subscribe, objectDrivers: result.objectDrivers };
+      return { ok: true, subscribe: result.subscribe, objectDrivers: result.objectDrivers, lightMapping: result.lightMapping };
     },
 
     async getScriptInfo() {
@@ -141,7 +141,7 @@ export async function createBackend({ modelPath, log }) {
       };
     },
 
-    async render({ lights, sun, entities, cameras, width, height, fileConfig, shouldAbort }) {
+    async render({ lights, sun, moon, entities, cameras, width, height, fileConfig, northOffset, weather, shouldAbort }) {
       const out = {};
       const defaults = { width, height };
       const frameArgs = {
@@ -149,8 +149,11 @@ export async function createBackend({ modelPath, log }) {
         model,
         lights,
         sun,
+        moon,
         entities: entities || {},
         script,
+        northOffset: northOffset ?? 0,
+        weather: weather ?? "sunny",
         setSize,
         capture,
         log,

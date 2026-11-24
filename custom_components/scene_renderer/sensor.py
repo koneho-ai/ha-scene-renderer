@@ -64,7 +64,7 @@ class SceneRenderSensor(SensorEntity):
             "last_error": coordinator.last_error,
             "service_url": coordinator.service_url,
             "cameras": list(coordinator.cameras),
-            "mapped_lights": len(coordinator.mapping),
+            "mapped_lights": len(coordinator.script_light_mapping),
             "sun_elevation": sun["elevation"] if sun else None,
             "sun_azimuth": sun["azimuth"] if sun else None,
             "sun_fixed": coordinator.sun_fixed is not None,

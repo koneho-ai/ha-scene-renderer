@@ -30,6 +30,28 @@ In Blender, punctual lights export as `KHR_lights_punctual` when the exporter op
 
 **Window markers (bounce lights).** Empty nodes named `window_<room>` (one per window, at the window center) mark the windows for emulated indirect illumination: when the sun shines through a window, the renderer places one soft point light about 1 m above the bright patch on the floor, re-illuminating the room. The light never casts shadows, has a short range, and its intensity follows the sun × the window's transmission (bare 1.0, blinds ~0.5, sheer curtain ~0.35, by room) × the floor albedo. The patch stays within 5 m of its window (about one room) and the bounce fades to 0 as the patch approaches that limit, so a low sun never throws the bounce into another room. A model without markers gets no bounce, silently — nothing else changes.
 
+**Model-declared lights (`ha_light` extras).** glTF's `KHR_lights_punctual` only expresses point, spot, and directional lights — no area lights, no ambient light. The renderer supports both through a **private glTF extras convention**: a node declares itself a light with an `ha_light` entry in its extras (a JSON object), and the renderer builds the corresponding three.js light at load time. The mesh or node name is the light's id. `ha_light` lights are **not** mappable: they never appear in the panel's light list or the `lights` map — they follow another light or the sun.
+
+| Type | Declared on | Extras schema |
+| --- | --- | --- |
+| `area` | a mesh (the mesh IS the emitter) | `{"type": "area", "follows": "<punctual light name>", "scale": 5.0}` or `{"type": "area", "intensity": 40}`; optional `"color": "#rrggbb"` |
+| `ambient` | a bare empty node | `{"type": "ambient", "color": "#bfd4e6", "day": 0.05, "night": 0.2}` |
+
+**Area lights.** The renderer creates a `THREE.RectAreaLight` fitted to the mesh: its size comes from the mesh's world bounding box (the thin axis is the emitting face; width/height are the other two extents, height vertical) and its facing comes from the geometry too — the face toward the followed light, or away from the model center for a standalone light. With `follows`, the area light's intensity is the followed punctual light's effective intensity × `scale` (default 1), updated every frame — so a TV screen's area fill tracks the TV point light, including off = 0, and the scene script drives both through the one mapped light. Its color follows the followed light unless `color` overrides it. With `intensity` instead of `follows`, the area light is constant (a glowing ceiling panel, say). **RectAreaLight cannot cast shadows** — that is a three.js limitation, not a bug: pair an area light with a punctual light at the same place for shadows, the way the sample pairs the TV screen's area light with the `living_room_tv` point light.
+
+**Ambient lights.** The renderer creates a `THREE.AmbientLight` and drives its intensity from the sun elevation every frame: `night` below the horizon, ramping to `day` at 30° elevation (the same ramp as the sun intensity), so the panel's time-of-day slider drives it too. The hemisphere fill also follows the sun and goes to **0 at night** — so `night` is the model's opt-in moonlight floor: the sample uses 0.2 (rooms read ~12 luminance, dimly visible, not black). Night may exceed day — the daytime fill comes from the hemisphere, so the ambient day is only a subtle lift, while at night the ambient is the only fill. A marker without a `night` value defaults to 0.2; a model with no ambient marker gets no ambient light at all.
+
+**Moonlight is automatic — no model config needed.** At night the renderer adds a dim cool directional moonlight (position from a lunar ephemeris, intensity fading in as the sun sets — see [[Sample Scene]]). It shines through windows and casts shadows like the sun. The only model-side choice is the ambient `night` floor above, which lights the rooms the moon doesn't reach.
+
+**Adding one in Blender.** Custom properties on the object become node extras on export (the glTF exporter's extras are on by default — `export_extras=True`). A dict property needs one line of Python (the Properties panel only offers simple types):
+
+```python
+bpy.data.objects["tv_screen"]["ha_light"] = {"type": "area", "follows": "living_room_tv", "scale": 5.0}
+bpy.data.objects["ambient"]["ha_light"] = {"type": "ambient", "color": "#bfd4e6", "day": 0.05, "night": 0.2}
+```
+
+A JSON string in a string property works too — the renderer parses it. Run `scripts/verify_glb.py` on the exported GLB: it validates the convention (valid type, required fields, `follows` names an existing light, `scale` > 0, `color` is `#rrggbb`, ambient on a bare empty, `day`/`night` ≥ 0).
+
 ## Installing your model
 
 1. Put the `.glb` in `/share/scene-renderer/models/` on the HA host (create the folder if needed).

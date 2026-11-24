@@ -1,16 +1,17 @@
 """HA Scene Renderer integration (YAML-only).
 
 There is no config flow: the integration is configured in
-``configuration.yaml`` under the ``scene_renderer`` key, and only the
-lights you map are linked — unmapped lights render at their model
-defaults, so the demo model needs no onboarding at all:
+``configuration.yaml`` under the ``scene_renderer`` key. The YAML
+lists the entities the integration subscribes to — the light→entity
+mapping itself lives in the scene script (``scene.js``, see
+``scene.example.js``), not in YAML:
 
 .. code-block:: yaml
 
     scene_renderer:
-      lights:
-        living_room_1: light.living_room
-        kitchen_1: light.kitchen
+      entities:
+        - light.living_room
+        - light.kitchen
 
 Full reference (all keys optional):
 
@@ -23,10 +24,25 @@ Full reference (all keys optional):
   a high noon sun in winter, when the real sun never gets above the
   rooftops. Both keys together or neither; the sun entity is then
   only used by scene.js, if the script reads it.
+- ``north_offset``: rotate the sun (and moon) to match the real
+  house orientation (degrees, 0–360, default 0). The model is laid
+  out with its north side (-Z) facing true north; if the real house
+  is rotated, set this to the true-north azimuth the model's north
+  side faces — e.g. 90 when the model's north side faces true east.
+  The offset applies to the live sun, the fixed sun pin, and the
+  moon, in both the renders and the panel viewer.
 - ``name``: scene name, used for the device and entities
   (default "Scene Renderer").
-- ``lights``: mapping of model light names to HA entity ids. Only
-  mapped lights follow live state; the rest render at base values.
+- ``entities``: the entities the integration subscribes to. Their
+  states are sent to the render service in every render request, and
+  the script maps them to model lights via its ``lightMapping``
+  table. A change to any of them re-renders. The script's own
+  ``subscribe`` export adds further entities on top of this list.
+- ``lights``: DEPRECATED — the old mapping of model light names to HA
+  entity ids. It no longer affects renders; the mapping lives in
+  ``scene.js`` (``lightMapping``). If present, setup logs a warning
+  with the equivalent ``lightMapping`` table so it can be pasted into
+  the script, then ignores the block.
 - ``objects``: mapping of model object names (e.g. the ``ceiling_fan``
   group) to HA entity ids. The panel lists mapped objects in its
   Objects section with their driving entity and a toggle, and the
@@ -56,7 +72,9 @@ from homeassistant.util import slugify
 
 from .const import (
     CONF_CAMERAS,
+    CONF_ENTITIES,
     CONF_LIGHTS,
+    CONF_NORTH_OFFSET,
     CONF_OBJECTS,
     CONF_SERVICE_URL,
     CONF_SUN_AZIMUTH,
@@ -108,7 +126,18 @@ CONFIG_SCHEMA = vol.Schema(
                         vol.Optional(CONF_SUN_AZIMUTH): vol.All(
                             vol.Coerce(float), vol.Range(min=0, max=360)
                         ),
+                        vol.Optional(CONF_NORTH_OFFSET, default=0): vol.All(
+                            vol.Coerce(float), vol.Range(min=0, max=360)
+                        ),
                         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
+                        vol.Optional(CONF_ENTITIES, default=[]): [
+                            cv.entity_id
+                        ],
+                        # Deprecated: the light→entity mapping now
+                        # lives in scene.js (lightMapping). Still
+                        # accepted so existing configs validate;
+                        # async_setup warns with the equivalent table
+                        # and ignores the block.
                         vol.Optional(CONF_LIGHTS, default={}): {
                             cv.string: cv.entity_id
                         },
@@ -126,6 +155,39 @@ CONFIG_SCHEMA = vol.Schema(
 )
 
 PLATFORMS = [Platform.IMAGE, Platform.SENSOR, Platform.BUTTON]
+
+
+def _format_light_mapping_table(mapping: dict[str, str]) -> str:
+    """A YAML `lights` mapping as a scene.js `lightMapping` table.
+
+    Rendered as JS the user can paste into their scene.js, e.g.::
+
+        export const lightMapping = {
+          living_room_1: "light.living_room",
+          kitchen_1: "light.kitchen",
+        };
+
+    Keys are sorted for a stable log line.
+    """
+    lines = ["export const lightMapping = {"]
+    for name in sorted(mapping):
+        lines.append(f'  {name}: "{mapping[name]}",')
+    lines.append("};")
+    return "\n".join(lines)
+
+
+def _warn_deprecated_lights_mapping(mapping: dict[str, str]) -> None:
+    """Warn that the YAML `lights` mapping is deprecated, with the
+    equivalent scene.js table. The mapping is logged, never auto-written
+    into the user's script."""
+    _LOGGER.warning(
+        "Scene Renderer: the YAML `lights:` mapping is deprecated and "
+        "no longer affects renders — the light→entity mapping lives in "
+        "scene.js now. Move it there as a `lightMapping` table, and "
+        "list the entities in the YAML `entities:` block so the "
+        "integration subscribes to them:\n%s",
+        _format_light_mapping_table(mapping),
+    )
 
 
 def _migrate_bare_entity_ids(
@@ -199,13 +261,17 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
             "in the scene_renderer YAML block"
         )
         return False
+    deprecated_lights = conf.get(CONF_LIGHTS, {})
+    if deprecated_lights:
+        _warn_deprecated_lights_mapping(deprecated_lights)
     coordinator = SceneRenderCoordinator(
         hass,
         service_url=service_url,
         sun_entity_id=conf.get(CONF_SUN_ENTITY, SUN_ENTITY_ID),
         sun_elevation=conf.get(CONF_SUN_ELEVATION),
         sun_azimuth=conf.get(CONF_SUN_AZIMUTH),
-        mapping=conf.get(CONF_LIGHTS, {}),
+        north_offset=conf.get(CONF_NORTH_OFFSET, 0),
+        entities=conf.get(CONF_ENTITIES, []),
         objects=conf.get(CONF_OBJECTS, {}),
         cameras=conf.get(CONF_CAMERAS),
         name=conf.get(CONF_NAME, DEFAULT_NAME),

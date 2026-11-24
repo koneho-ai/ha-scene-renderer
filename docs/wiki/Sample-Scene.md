@@ -50,11 +50,21 @@ Room lights sit at ceiling height (2.3 m); the TV light sits 4 cm in front of th
 
 The living room TV is a dark body (1.3 × 0.75 m) against the east wall with a separate `tv_screen` mesh (pale blue-white emissive material) and the `living_room_tv` point light in front of it. The light is mapped as a light in the YAML, so its entity drives the glow when the TV is off; the bundled `scene.example.js` takes over when the TV is on (Plex client playing/paused/idle): screen visible + light glowing in slowly shifting colors; TV off → screen dark, light back to its mapped value. See [[Scene Scripting]].
 
+The screen is also the model's first **area light**: `tv_screen` carries `ha_light` extras (`{"type": "area", "follows": "living_room_tv", "scale": 5.0}`), so the renderer fits a RectAreaLight to the screen (1.24 × 0.69 m, facing into the living room) and drives it from the TV point light's intensity × 5. The area light gives the soft fill on the couch and floor in front of the screen; the point light still carries the shadows (RectAreaLight can't cast them) — and since the screen is a big area source, its shadows are soft: the renderer gives the TV point light a shadow blur radius (16 texels on its 512 map, halved to 8 in the panel viewer whose maps are half the size), so the fan-blade shadows on the wall blur instead of cutting hard. Every other light keeps the crisp default radius of 1. Larger radii don't soften further — the 5-tap PCF just turns to dither noise past ~32 — so 16 is the tuned value. The screen's own emissive follows the TV light too — the renderer switches the baked emissive off with the light, so the screen never glows white while the TV is off. See [[Creating Your Own Scene]] for the convention.
+
+## The ambient light
+
+A bare empty node named `ambient` at the model center carries `ha_light` extras (`{"type": "ambient", "color": "#bfd4e6", "day": 0.05, "night": 0.2}`): a cool ambient light at 0.05 during the day, rising to 0.2 at night — the moonlit-sky floor, so rooms without a moon-facing window stay dimly visible instead of black. Night exceeds day on purpose: the daytime fill comes from the hemisphere (0.6), so the ambient day is only a subtle lift, while at night the ambient is the only fill (hemisphere 0) and must carry the floor alone. The value is tuned: 0.015 still rendered black under ACES tone mapping, 0.15 reads ~8 luminance, 0.25 reads ~16 — 0.2 lands at ~12.
+
+## Moonlight
+
+At night the renderer adds a second, much weaker sun: a dim cool blue-white directional light (`#cfdcee`, intensity 2.0) that shines through the windows and casts shadows with the sun's shadow setup. Its position comes from a low-precision lunar ephemeris (Paul Schlyter's algorithm, ~0.3° accuracy — the same code in the service, the panel viewer, and the integration coordinator), computed from the date/time and the home's latitude/longitude. Intensity fades in as the sun sets — 0 while the sun is up, full once the sun is 12° below the horizon (end of nautical twilight) — and keys off the *effective* sun elevation, so a pinned daytime sun keeps the moon off. There is deliberately no moon-phase factor: the moon shines at full-moon brightness whenever it is up at night, so new-moon nights stay dimly visible instead of black. The moon does not drive curtain glow or bounce lights (too weak to matter); those stay sun-only. No model configuration is needed — moonlight is automatic; the ambient `night` value is the model's opt-in floor underneath it. See [[Configuration]] for the fixed-sun and sun-disabled interactions.
+
 ## The 2 named cameras
 
 | Name | Position (m) | FOV | Framing |
 | --- | --- | --- | --- |
-| `overview` | (0, 18, 0) | 32° | Top-down view of the whole house (switchable to orthographic per camera in `cameras.yaml`) |
+| `overview` | (-12, 14, 12) | 32° | Angled 3/4 aerial view of the whole house from the south-west, ~39.5° elevation (switchable to orthographic per camera in `cameras.yaml`) |
 | `living_room` | (-7.05, 2.2, -0.25) | 32° | Inside the living room, facing the TV |
 
 Each camera is its own image entity in Home Assistant (e.g. `image.scene_renderer_overview`).

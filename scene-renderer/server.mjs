@@ -7,7 +7,8 @@
 //   GET  /cameras     scene cameras with their effective config
 //                     (model + cameras.yaml + defaults, merged)
 //   GET  /script      user script (scene.js) status + subscriptions
-//   POST /render      { lights, sun, entities, cameras, width, height }
+//   POST /render      { lights, sun, moon, entities, cameras, width, height,
+//                     north_offset, weather }
 //                     -> JSON { renders: { cameraName:
 //                     { data: base64, content_type, lights: [...] } },
 //                     script: {...} }
@@ -15,7 +16,12 @@
 //                     cameras with a clip: entry in cameras.yaml.
 //                     `lights` is the per-camera projection of the model
 //                     lights into image coordinates (see scene.mjs
-//                     projectLights).
+//                     projectLights). `north_offset` (degrees, default 0)
+//                     rotates true-north sun/moon azimuths into the
+//                     model frame (see scene.mjs modelAzimuth).
+//                     `weather` is a preset name (sunny|overcast|rainy|
+//                     snowy, default sunny); unknown names fall back to
+//                     sunny with a warning.
 //   GET  /model       the loaded model GLB bytes (for the HA sidebar
 //                     panel, via the integration's proxy; alias of
 //                     /model.glb)
@@ -362,9 +368,30 @@ const server = createServer(async (req, res) => {
       const args = {
         lights: body.lights && typeof body.lights === "object" ? body.lights : {},
         sun: body.sun && typeof body.sun === "object" ? body.sun : null,
-        // Entity snapshot for the user script (subscribed entities +
-        // mapped lights + sun, as sent by the integration). The script
-        // sees the same snapshot on every frame of a clip.
+        moon: body.moon && typeof body.moon === "object" ? body.moon : null,
+        // North offset (degrees, default 0): rotates true-north sun/moon
+        // azimuths into the model frame (see scene.mjs modelAzimuth).
+        // Normalized to [0, 360); non-numeric values mean 0.
+        northOffset:
+          typeof body.north_offset === "number" && Number.isFinite(body.north_offset)
+            ? ((body.north_offset % 360) + 360) % 360
+            : 0,
+        // Weather preset (default sunny). Unknown names fall back to
+        // sunny in scene.mjs resolveWeather; warn here so a typo is
+        // visible instead of silently sunny.
+        weather: (() => {
+          const w = body.weather;
+          if (w === undefined || w === null) return "sunny";
+          if (typeof w === "string" && ["sunny", "overcast", "rainy", "snowy"].includes(w)) {
+            return w;
+          }
+          log("warning", `render requested unknown weather ${JSON.stringify(w)} — using sunny`);
+          return "sunny";
+        })(),
+        // Entity snapshot for the user script (the YAML entities list
+        // plus the script's subscriptions and the sun, as sent by the
+        // integration). The script sees the same snapshot on every
+        // frame of a clip.
         entities: body.entities && typeof body.entities === "object" ? body.entities : {},
         cameras,
         width,

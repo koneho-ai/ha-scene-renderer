@@ -1,9 +1,10 @@
 // User script (scene.js) runtime — shared by both render backends.
 //
-// The script is a small ESM-style module with three supported exports:
+// The script is a small ESM-style module with four supported exports:
 //
 //   export const subscribe = [...]             (optional)
 //   export const objectDrivers = {...}         (optional)
+//   export const lightMapping = {...}          (optional)
 //   export default function update(...) {...}  (required)
 //
 // `objectDrivers` maps model object names to the entity that drives
@@ -12,6 +13,16 @@
 // declaration only: the script still reads the entities itself (via
 // `subscribe`); the panel uses the mapping to know which entity
 // belongs to which object, which the flat subscribe list cannot say.
+//
+// `lightMapping` maps model light names to the entity that drives
+// each one ({ living_room_1: "light.living_room" }) — it is THE
+// light→entity mapping (the YAML `lights` block is deprecated and
+// ignored). The script's update() applies it every frame (see
+// scene.example.js): on -> model base x brightness, color from the
+// entity, color_temp supported; lights not in the table render off.
+// The integration reads the table from the script status so the panel
+// can show which entity drives each light, and warns when the table
+// references an entity it does not subscribe to.
 //
 // It runs inside a SES Compartment (Agoric hardened JS): no process, no
 // require, no fs/network, no imports at all. The compartment is created by
@@ -153,6 +164,7 @@ export function checkScriptSource(source) {
 // Export transform. Supported forms (each at the start of a line):
 //   export const subscribe = [...]        -> const subscribe = [...]
 //   export const objectDrivers = {...}    -> const objectDrivers = {...}
+//   export const lightMapping = {...}     -> const lightMapping = {...}
 //   export default function update(...)   -> function update(...)
 //   export default function (...)         -> const __sceneDefault = function (...)
 //   export default update;                -> (removed; update is the default)
@@ -186,14 +198,19 @@ export function transformScript(stripped) {
       out.push(indent + trimmed.slice("export ".length));
       continue;
     }
+    m = trimmed.match(/^export\s+const\s+lightMapping\s*=/);
+    if (m) {
+      out.push(indent + trimmed.slice("export ".length));
+      continue;
+    }
     if (/^export\s+const\s+/.test(trimmed)) {
-      return { ok: false, error: "scene.js may only export `subscribe` and `objectDrivers` (as `export const subscribe = [...]` / `export const objectDrivers = {...}`)" };
+      return { ok: false, error: "scene.js may only export `subscribe`, `objectDrivers` and `lightMapping` (as `export const subscribe = [...]` / `export const objectDrivers = {...}` / `export const lightMapping = {...}`)" };
     }
     if (/^export\s+(let|var|class|abstract|interface|type|enum|namespace)\b/.test(trimmed)) {
-      return { ok: false, error: "scene.js supports only `export const subscribe`, `export const objectDrivers`, and a default export — no other exports" };
+      return { ok: false, error: "scene.js supports only `export const subscribe`, `export const objectDrivers`, `export const lightMapping`, and a default export — no other exports" };
     }
     if (/^export\s*\{/.test(trimmed) || /^export\s*\*/.test(trimmed)) {
-      return { ok: false, error: "scene.js does not support `export { ... }` or `export *` — use `export const subscribe`, `export const objectDrivers`, and `export default function update`" };
+      return { ok: false, error: "scene.js does not support `export { ... }` or `export *` — use `export const subscribe`, `export const objectDrivers`, `export const lightMapping`, and `export default function update`" };
     }
     if (trimmed.startsWith("export default")) {
       defaultCount += 1;
@@ -223,12 +240,12 @@ export function transformScript(stripped) {
       out.push(indent + trimmed.replace(/^export\s+default\s+/, `const ${DEFAULT_ALIAS} = `));
       continue;
     }
-    return { ok: false, error: `unsupported export in scene.js: "${trimmed.slice(0, 60)}" — use \`export const subscribe\`, \`export const objectDrivers\`, and \`export default function update\`` };
+    return { ok: false, error: `unsupported export in scene.js: "${trimmed.slice(0, 60)}" — use \`export const subscribe\`, \`export const objectDrivers\`, \`export const lightMapping\`, and \`export default function update\`` };
   }
 
   const code = out.join("\n");
   if (/\bexport\b/.test(blankStrings(code))) {
-    return { ok: false, error: "unsupported export in scene.js — use `export const subscribe`, `export const objectDrivers`, and `export default function update`" };
+    return { ok: false, error: "unsupported export in scene.js — use `export const subscribe`, `export const objectDrivers`, `export const lightMapping`, and `export default function update`" };
   }
   if (defaultName === null) {
     return { ok: false, error: "scene.js must export a default update function (`export default function update({ entities, scene }) { ... }`)" };
@@ -238,8 +255,8 @@ export function transformScript(stripped) {
 
 // ---------------------------------------------------------------------------
 // Compilation: static checks + transform + compartment.evaluate.
-// Returns a handle { ok, update, subscribe, objectDrivers, lastError,
-// errorCount } or { ok: false, error }.
+// Returns a handle { ok, update, subscribe, objectDrivers, lightMapping,
+// lastError, errorCount } or { ok: false, error }.
 // ---------------------------------------------------------------------------
 function formatLogArgs(args) {
   const parts = args.map((a) => {
@@ -285,7 +302,8 @@ export function compileScript(source, { log = () => {} } = {}) {
     `(() => {\n${transformed.code}\n` +
     `return { update: typeof ${transformed.defaultName} === "function" ? ${transformed.defaultName} : undefined, ` +
     `subscribe: typeof subscribe !== "undefined" ? subscribe : undefined, ` +
-    `objectDrivers: typeof objectDrivers !== "undefined" ? objectDrivers : undefined };\n})()`;
+    `objectDrivers: typeof objectDrivers !== "undefined" ? objectDrivers : undefined, ` +
+    `lightMapping: typeof lightMapping !== "undefined" ? lightMapping : undefined };\n})()`;
 
   let result;
   try {
@@ -326,11 +344,34 @@ export function compileScript(source, { log = () => {} } = {}) {
     }
     objectDrivers = { ...drivers };
   }
+  let lightMapping = {};
+  if (result.lightMapping !== undefined) {
+    // Same shape as objectDrivers, for lights: { lightName: entityId }.
+    // The values are exact entity IDs, not patterns — a light is driven
+    // by one entity. Keys must be non-empty strings; unknown light
+    // names are fine (the panel skips lights the model does not have,
+    // and the example's apply loop only touches model lights).
+    const mapping = result.lightMapping;
+    const isPlainObject =
+      mapping !== null &&
+      typeof mapping === "object" &&
+      !Array.isArray(mapping);
+    if (
+      !isPlainObject ||
+      !Object.entries(mapping).every(
+        ([k, v]) => typeof k === "string" && k.length > 0 && typeof v === "string" && v.length > 0,
+      )
+    ) {
+      return { ok: false, error: "scene.js `lightMapping` must be an object mapping model light names to entity IDs, e.g. { living_room_1: \"light.living_room\" }" };
+    }
+    lightMapping = { ...mapping };
+  }
   return {
     ok: true,
     update: result.update,
     subscribe,
     objectDrivers,
+    lightMapping,
     lastError: null,
     lastErrorAt: null,
     errorCount: 0,

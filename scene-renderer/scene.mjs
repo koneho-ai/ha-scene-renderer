@@ -10,12 +10,18 @@
 // Light model (see README "Light parametrization"):
 //   - The model's KHR_lights_punctual lights hold the BASE look: their
 //     intensity is "full brightness" and their color is the default color.
-//   - A render request carries per-light parameters from Home Assistant:
-//     { on, brightness (0..1 | null), color ([r,g,b] 0..255 | null),
-//       color_temp_k (int | null) }.
-//   - Applied: intensity = base * brightness (0 when off);
-//     color = entity color, else Kelvin -> RGB, else base color.
-//   - Lights with no parameters render at base values.
+//   - The scene script maps entities to lights (its `lightMapping`
+//     table, applied in update()): on -> base x brightness, color from
+//     the entity (rgb/hs/xy/color_temp); off or unmapped -> 0. The
+//     script sets absolute values for every light every frame.
+//   - A render request may still carry per-light parameters
+//     ({ on, brightness (0..1 | null), color ([r,g,b] 0..255 | null),
+//       color_temp_k (int | null) }): applyLightStates applies them
+//     first — intensity = base * brightness (0 when off); color =
+//     entity color, else Kelvin -> RGB, else base color; lights with
+//     no parameters render at base values — and the script then
+//     overrides them. The integration sends no light parameters: it
+//     sends the entity states and lets the script map them.
 //
 // Camera model (see README "Cameras"):
 //   - Cameras come from the model: named glTF cameras, identified by name.
@@ -53,6 +59,7 @@
 //     sun is on their side (see updateCurtainGlow).
 import * as THREE from "three";
 import { GLTFLoader } from "three/addons/loaders/GLTFLoader.js";
+import { RectAreaLightUniformsLib } from "three/addons/lights/RectAreaLightUniformsLib.js";
 import { runScriptCall } from "./script.mjs";
 
 export const BUILTIN_CAMERAS = ["overview", "topdown", "front"];
@@ -66,22 +73,25 @@ const DEFAULT_CLEAR_ALPHA = 0;
 
 // Point/spot shadow maps: one cube map (6 faces) per point light.
 // Each light gets its map size from a deterministic hash of its name
-// (512, 1024 or 2048 px), so some lights cast soft/chunky shadows and
-// others crisp ones — three.js PCFSoftShadowMap ignores shadow.radius,
-// so map size is the only softness lever. Deterministic per name, so a
-// light's shadows look the same on every render. A 2048 cube map is
-// ~100 MB (6 faces x 2048^2 x 4 B), but only lights that are ON
-// allocate one, and the hash spreads the 14 sample lights 7/4/3 across
-// the sizes (worst case, all on: ~426 MB). Bias: the depth bias is
-// ZERO — in a perspective cube shadow camera (near 0.1, far ~26 m)
-// a -0.004 NDC bias is ~0.3-0.5 m of world depth at 4-5 m from the
-// light, which punches straight through a 0.10 m interior wall (the
-// dining-room leak, 0.3.8). Acne is handled by the normal bias
-// alone (0.02 m along the surface normal — it offsets the sample
-// point, not the depth, so a thin wall still blocks). Too much
-// normal bias detaches shadows from their casters (peter-panning).
-// The sun keeps its own -0.0005 (proven in production; ortho camera,
-// only ~1.7 cm of leak, harmless).
+// (512, 1024 or 2048 px), so some lights cast chunkier shadows and
+// others crisper ones. Deterministic per name, so a light's shadows
+// look the same on every render. A 2048 cube map is ~100 MB (6 faces
+// x 2048^2 x 4 B), but only lights that are ON allocate one, and the
+// hash spreads the 14 sample lights 7/4/3 across the sizes (worst
+// case, all on: ~426 MB). Shadow softness beyond the map size comes
+// from shadow.radius (see shadowRadiusForLight): PCFShadowMap honors
+// it — the old PCFSoftShadowMap ignored it, and was removed in three
+// r186 anyway (r187 silently substitutes PCF), so the renderers use
+// PCFShadowMap outright. Bias: the depth bias is ZERO — in a
+// perspective cube shadow camera (near 0.1, far ~26 m) a -0.004 NDC
+// bias is ~0.3-0.5 m of world depth at 4-5 m from the light, which
+// punches straight through a 0.10 m interior wall (the dining-room
+// leak, 0.3.8). Acne is handled by the normal bias alone (0.02 m
+// along the surface normal — it offsets the sample point, not the
+// depth, so a thin wall still blocks). Too much normal bias detaches
+// shadows from their casters (peter-panning). The sun keeps its own
+// -0.0005 (proven in production; ortho camera, only ~1.7 cm of leak,
+// harmless).
 export const POINT_SHADOW_MAP_SIZES = [512, 1024, 2048];
 const POINT_SHADOW_BIAS = 0;
 const POINT_SHADOW_NORMAL_BIAS = 0.02;
@@ -97,6 +107,24 @@ export function shadowMapSizeForLight(name) {
     hash = Math.imul(hash, 0x01000193);
   }
   return POINT_SHADOW_MAP_SIZES[(hash >>> 0) % POINT_SHADOW_MAP_SIZES.length];
+}
+
+// Shadow blur radius (in shadow-map texels) for one light, from its
+// name. PCFShadowMap honors shadow.radius: getPointShadow spreads its
+// 5 Vogel-disk samples over radius/mapSize of direction space, so the
+// blur grows with distance from the light — radius 16 on the TV's 512
+// map is ~12 cm of blur 4 m from the light. Only the TV gets a blur:
+// it is a big area source in reality, so its shadows are soft. Every
+// other light keeps the three.js default of 1 (a 1-texel spread:
+// crisp, unchanged from before). The panel viewer mirrors this at
+// half the radius — its maps are half the service's (256 vs 512 for
+// the TV), and the radius is in texels, so half the value gives the
+// same angular blur. Tuned in softshadow_verify.mjs. Exported for
+// tests.
+export const TV_SHADOW_RADIUS = 16;
+export const DEFAULT_SHADOW_RADIUS = 1;
+export function shadowRadiusForLight(name) {
+  return name === "living_room_tv" ? TV_SHADOW_RADIUS : DEFAULT_SHADOW_RADIUS;
 }
 
 // A mesh whose material is named "ShadowOnly" is invisible in the render
@@ -128,6 +156,55 @@ const SHADOW_ONLY_MATERIAL = "ShadowOnly";
 const SHEER_CURTAIN_MATERIAL = "SheerCurtain";
 const CURTAIN_DITHER_DISCARD = 0.35;
 const CURTAIN_DITHER_CELL_M = 0.02;
+
+// Model-declared lights via glTF extras (PRIVATE convention — glTF's
+// KHR_lights_punctual only expresses point/spot/directional, so the
+// model declares anything else in node extras, from Blender custom
+// properties: extras.ha_light = { type, ... }. The panel viewer
+// mirrors all of this; see scene-renderer-panel.js. The model
+// validator (scripts/verify_glb.py) is the strict gate — a typo in
+// extras silently does nothing at render time, so it checks every
+// field. The renderer is lenient: an invalid entry is skipped with a
+// warning, never a crash.
+//
+//   Area:   { type: "area", follows: "<punctual light>", scale?: n }
+//           or { type: "area", intensity: n } for a constant light.
+//           The mesh IS the emitter: a RectAreaLight fitted to the
+//           mesh bounds, facing the followed light (which sits just
+//           in front of the emitting face by convention). Driven per
+//           frame from the followed light's effective intensity x
+//           scale (or the constant intensity), same color as the
+//           followed light unless extras.color overrides it.
+//           RectAreaLight cannot cast shadows — the followed point
+//           light carries the shadows, the area light the soft fill.
+//           Rect area lights need RectAreaLightUniformsLib.init()
+//           (the LTC lookup textures) before the first render with
+//           one — loadModel calls it, once, when area lights exist.
+//   Ambient: { type: "ambient", color?: "#rrggbb", day?: n, night?: n }
+//           on a bare empty (ambient has no geometry). An
+//           AmbientLight driven by sun elevation every frame: `day`
+//           at full daylight, fading to `night` below the horizon —
+//           the moonlit-sky floor, so night is dimly visible rather
+//           than black. The hemisphere fill follows the same ramp
+//           (see applySun). The directional moonlight itself is a
+//           separate renderer-owned light (see the Moon section):
+//           the model declares only the ambient floor.
+const HA_LIGHT_EXTRAS_KEY = "ha_light";
+const AREA_LIGHT_NAME_PREFIX = "area_";
+const AMBIENT_LIGHT_NAME_PREFIX = "ambient_";
+// The area light sits just off the emitting face so it never
+// z-fights the mesh it is fitted to.
+const AREA_LIGHT_OFFSET_M = 0.01;
+const AREA_DEFAULT_SCALE = 1.0;
+const AMBIENT_DEFAULT_DAY = 0.1;
+// Default night floor for an ambient marker without a `night` value:
+// 0.2 keeps rooms dimly visible at night (the moonlit floor — same
+// as the sample model's tuned value), instead of black.
+const AMBIENT_DEFAULT_NIGHT = 0.2;
+
+// RectAreaLightUniformsLib.init() builds the LTC data textures; once
+// per process is enough (the init itself has no guard).
+let rectAreaLibReady = false;
 const CURTAIN_GLOW_COLOR = 0xfff2dd;
 const CURTAIN_GLOW_SCALE = 0.3;
 
@@ -328,6 +405,55 @@ export function kelvinToRgb(kelvin) {
 }
 
 // ---------------------------------------------------------------------------
+// HA hs_color ([hue 0-360, saturation 0-100]) -> [r, g, b] 0..255.
+// Mirrors HA's color_hs_to_RGB (lightness 0.5).
+// ---------------------------------------------------------------------------
+export function hsToRgb(h, s) {
+  const hue = ((((h % 360) + 360) % 360) / 360);
+  const sat = Math.max(0, Math.min(100, s)) / 100;
+  const light = 0.5; // HA's color_hs_to_RGB uses lightness 0.5
+  const c = (1 - Math.abs(2 * light - 1)) * sat;
+  const x = c * (1 - Math.abs(((hue * 6) % 2) - 1));
+  const m = light - c / 2;
+  let r;
+  let g;
+  let b;
+  if (hue < 1 / 6) [r, g, b] = [c, x, 0];
+  else if (hue < 2 / 6) [r, g, b] = [x, c, 0];
+  else if (hue < 3 / 6) [r, g, b] = [0, c, x];
+  else if (hue < 4 / 6) [r, g, b] = [0, x, c];
+  else if (hue < 5 / 6) [r, g, b] = [x, 0, c];
+  else [r, g, b] = [c, 0, x];
+  return [
+    Math.round((r + m) * 255),
+    Math.round((g + m) * 255),
+    Math.round((b + m) * 255),
+  ];
+}
+
+// ---------------------------------------------------------------------------
+// CIE xy (+ optional brightness 0-1) -> [r, g, b] 0..255.
+// Wide RGB D65 matrix, same as HA's color_xy_to_RGB.
+// ---------------------------------------------------------------------------
+export function xyToRgb(x, y, brightness = 1) {
+  const z = 1 - x - y;
+  const yy = Math.max(0, Math.min(1, brightness));
+  const xr = (yy / y) * x;
+  const zr = (yy / y) * z;
+  let r = xr * 1.656492 - yy * 0.354851 - zr * 0.255038;
+  let g = -xr * 0.707196 + yy * 1.655397 + zr * 0.036152;
+  let b = xr * 0.051713 - yy * 0.121364 + zr * 1.01153;
+  const fix = (v) =>
+    v <= 0.0031308 ? 12.92 * v : 1.055 * Math.pow(v, 1 / 2.4) - 0.055;
+  r = fix(r);
+  g = fix(g);
+  b = fix(b);
+  const max = Math.max(r, g, b, 1);
+  const clamp = (v) => Math.max(0, Math.min(255, Math.round((v / max) * 255)));
+  return [clamp(r), clamp(g), clamp(b)];
+}
+
+// ---------------------------------------------------------------------------
 // Model loading
 // ---------------------------------------------------------------------------
 export async function loadModel(arrayBuffer) {
@@ -362,11 +488,17 @@ export async function loadModel(arrayBuffer) {
   const cameras = new Map();
   const curtainMeshes = [];
   const windowMarkers = [];
+  const haLightNodes = [];
   scene.traverse((obj) => {
     if (obj.isMesh) {
       applyMeshShadowRules(obj);
       if (hasSheerCurtainMaterial(obj)) curtainMeshes.push(obj);
     }
+    // Model-declared lights (ha_light extras): collected here, built
+    // after the bounds are known (area lights need the mesh bounds
+    // and the followed light's position).
+    const ha = parseHaLightExtras(obj);
+    if (ha) haLightNodes.push({ obj, ha });
     // Window markers for bounce lights (see updateBounceLights):
     // empty nodes named window_<room>. Meshes/lights/cameras with a
     // window_ name are not markers.
@@ -395,6 +527,9 @@ export async function loadModel(arrayBuffer) {
         obj.shadow.mapSize.set(mapSize, mapSize);
         obj.shadow.bias = POINT_SHADOW_BIAS;
         obj.shadow.normalBias = POINT_SHADOW_NORMAL_BIAS;
+        // Blur radius: the TV's shadows are soft (big area source);
+        // every other light keeps the three.js default (crisp).
+        obj.shadow.radius = shadowRadiusForLight(obj.name);
       }
       lights.set(obj.name, obj);
     }
@@ -450,6 +585,38 @@ export async function loadModel(arrayBuffer) {
     };
   });
 
+  // Model-declared lights from ha_light extras (see the header):
+  // area lights fitted to their mesh, ambient lights on bare empties.
+  // Not part of `lights` — they are not mappable model lights (an
+  // area light follows its punctual light; an ambient is driven by
+  // the sun), so they never appear in the light list, the health
+  // endpoint, or the light projections. World matrices are current
+  // (updateMatrixWorld ran above for the curtains).
+  const areaLights = [];
+  const ambientLights = [];
+  for (const { obj, ha } of haLightNodes) {
+    if (ha.type === "area") {
+      const built = buildAreaLight(obj, ha, lights, center);
+      if (built) {
+        scene.add(built.light);
+        areaLights.push(built);
+      }
+    } else if (ha.type === "ambient") {
+      const day = typeof ha.day === "number" ? ha.day : AMBIENT_DEFAULT_DAY;
+      const night = typeof ha.night === "number" ? ha.night : AMBIENT_DEFAULT_NIGHT;
+      const light = new THREE.AmbientLight(parseHaColor(ha.color) ?? 0xffffff, day);
+      light.name = AMBIENT_LIGHT_NAME_PREFIX + obj.name;
+      scene.add(light);
+      ambientLights.push({ name: obj.name, light, day, night });
+    } else {
+      console.warn(`scene.js: ha_light on "${obj.name}": unknown type ${JSON.stringify(ha.type)} — ignored`);
+    }
+  }
+  if (areaLights.length > 0 && !rectAreaLibReady) {
+    RectAreaLightUniformsLib.init();
+    rectAreaLibReady = true;
+  }
+
   // Bounce-light windows: one renderer-owned point light per marker,
   // created once here and repositioned per frame by
   // updateBounceLights. Not part of `lights` (it is not a model light:
@@ -485,6 +652,7 @@ export async function loadModel(arrayBuffer) {
   // Sun (directional, added by the service, not part of the model) and a
   // hemisphere fill so unlit areas never go pure black.
   const sun = new THREE.DirectionalLight(0xffffff, 0);
+  sun.name = "sun";
   sun.castShadow = true;
   sun.shadow.mapSize.set(2048, 2048);
   sun.shadow.camera.near = 1;
@@ -496,6 +664,23 @@ export async function loadModel(arrayBuffer) {
   sun.shadow.bias = -0.0005;
   scene.add(sun);
   scene.add(sun.target);
+  // Moon (directional, same shadow setup as the sun): a dim, cool
+  // second sun for the night. Its position comes from the render
+  // request (the coordinator computes it from the lunar ephemeris);
+  // applyMoon drives its intensity off the effective sun elevation.
+  const moon = new THREE.DirectionalLight(MOON_COLOR, 0);
+  moon.name = "moon";
+  moon.castShadow = true;
+  moon.shadow.mapSize.set(2048, 2048);
+  moon.shadow.camera.near = 1;
+  moon.shadow.camera.far = diag * 4;
+  moon.shadow.camera.left = -diag;
+  moon.shadow.camera.right = diag;
+  moon.shadow.camera.top = diag;
+  moon.shadow.camera.bottom = -diag;
+  moon.shadow.bias = -0.0005;
+  scene.add(moon);
+  scene.add(moon.target);
   const hemi = new THREE.HemisphereLight(0xbfd4e6, 0x8a7a66, 0.5);
   scene.add(hemi);
 
@@ -509,7 +694,7 @@ export async function loadModel(arrayBuffer) {
     animations.push({ name: clip.name, duration: clip.duration });
   }
 
-  return { scene, lights, cameras, curtains, windows, floorY, bounds, center, size, diag, sun, hemi, mixer, animations, sunState: null };
+  return { scene, lights, cameras, curtains, windows, floorY, bounds, center, size, diag, sun, moon, hemi, mixer, animations, sunState: null, moonState: null, areaLights, ambientLights };
 }
 
 export function listLights(lights) {
@@ -572,8 +757,8 @@ export function applyLightStates(lights, params) {
 
 // Sync each light's visibility AND shadow casting to its EFFECTIVE
 // intensity, after the user script has run: visible = intensity > 0,
-// castShadow = intensity > 0. The built-in mapping above sets both
-// from the mapped entity's on/off, but the script can raise a light's
+// castShadow = intensity > 0. applyLightStates above sets both from
+// the request's light parameters, but the script can raise a light's
 // intensity on its own (the TV glow while light.lampy is off) —
 // without this sync that light would stay invisible (three.js skips
 // invisible lights entirely: no illumination, no shadow) and shine
@@ -717,6 +902,190 @@ export function updateBounceLights(model) {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Model-declared lights (ha_light extras)
+// ---------------------------------------------------------------------------
+// Read the ha_light declaration off a loaded node. GLTFLoader copies
+// node extras into userData, so a Blender dict custom property arrives
+// as an object; a JSON string (an author pasting JSON into a string
+// property) is parsed too. Anything else is ignored (the validator is
+// the strict gate; the renderer never crashes on a bad declaration).
+function parseHaLightExtras(obj) {
+  const raw = obj.userData && obj.userData[HA_LIGHT_EXTRAS_KEY];
+  if (!raw) return null;
+  if (typeof raw === "object") return raw;
+  if (typeof raw === "string") {
+    try {
+      const parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : null;
+    } catch {
+      console.warn(`scene.js: ha_light on "${obj.name}": not valid JSON — ignored`);
+      return null;
+    }
+  }
+  return null;
+}
+
+// Extras color: a "#rrggbb" string (sRGB, like HA colors) or a
+// [r, g, b] 0..1 array. Returns a THREE.Color or null.
+function parseHaColor(value) {
+  if (typeof value === "string" && /^#[0-9a-fA-F]{6}$/.test(value)) {
+    return new THREE.Color(value);
+  }
+  if (Array.isArray(value) && value.length === 3 &&
+      value.every((v) => typeof v === "number")) {
+    return new THREE.Color(value[0], value[1], value[2]);
+  }
+  return null;
+}
+
+// Build the RectAreaLight for one mesh with ha_light type "area".
+// Size and facing come from the mesh geometry, nothing is hardcoded:
+// the emitting face is the thin axis of the world bounding box, the
+// facing sign comes from the followed light's side (it sits just in
+// front of the emitting face by convention), and width/height are the
+// other two extents (height is the vertical one). Returns null (with
+// a warning) when the declaration cannot drive a light: no follows
+// target and no constant intensity. Exported for tests.
+export function buildAreaLight(mesh, ha, lights, center) {
+  let followed = null;
+  if (typeof ha.follows === "string") {
+    followed = lights.get(ha.follows) || null;
+    if (!followed) {
+      console.warn(`scene.js: ha_light area on "${mesh.name}": follows "${ha.follows}", not a model light`);
+    }
+  }
+  const standalone = typeof ha.intensity === "number";
+  if (!followed && !standalone) {
+    console.warn(`scene.js: ha_light area on "${mesh.name}": needs "follows" or "intensity" — ignored`);
+    return null;
+  }
+  const box = new THREE.Box3().setFromObject(mesh);
+  const meshCenter = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3());
+  // Thin axis = the emitting face's normal. Ties (a cube) pick x.
+  const extents = [size.x, size.y, size.z];
+  let thinAxis = 0;
+  for (let i = 1; i < 3; i += 1) {
+    if (extents[i] < extents[thinAxis]) thinAxis = i;
+  }
+  // Sign: the followed light's side of the mesh center (it sits in
+  // front of the emitting face); without one, away from the model
+  // center (like a curtain's outward normal).
+  const refPoint = followed
+    ? followed.getWorldPosition(new THREE.Vector3())
+    : meshCenter.clone().sub(center).add(meshCenter);
+  const sign = refPoint.getComponent(thinAxis) >= meshCenter.getComponent(thinAxis) ? 1 : -1;
+  const facing = new THREE.Vector3();
+  facing.setComponent(thinAxis, sign);
+  // Width/height are the other two extents; height is the vertical
+  // one (for a horizontal panel — thin axis y — width is x, height z).
+  let width;
+  let height;
+  if (thinAxis === 0) {
+    width = size.z;
+    height = size.y;
+  } else if (thinAxis === 1) {
+    width = size.x;
+    height = size.z;
+  } else {
+    width = size.x;
+    height = size.y;
+  }
+  const colorOverride = parseHaColor(ha.color);
+  const light = new THREE.RectAreaLight(
+    colorOverride ? colorOverride.clone() : 0xffffff,
+    0,
+    Math.max(width, 0.01),
+    Math.max(height, 0.01),
+  );
+  // The emitting mesh may carry a baked emissive (the TV screen glows
+  // at strength 2.0 in the model). Capture it here so updateAreaLights
+  // can switch the mesh off with its light — otherwise the screen
+  // glows white even when the TV is off (found by the moonlight
+  // verify, 2026-11-24: living-room night renders showed a white TV
+  // with all lights off). The convention assumes the area mesh owns
+  // its material; a shared material would toggle for every user.
+  const mat = mesh.material;
+  const emissiveIntensity =
+    mat && typeof mat.emissiveIntensity === "number" ? mat.emissiveIntensity : 0;
+  light.name = AREA_LIGHT_NAME_PREFIX + mesh.name;
+  // RectAreaLight emits along its local -Z (lookAt aims a light's -Z
+  // at the target), so look at a point in front of the face. The up
+  // vector flips when the facing is near-vertical (a ceiling panel),
+  // or lookAt degenerates.
+  light.position.copy(meshCenter).addScaledVector(facing, AREA_LIGHT_OFFSET_M);
+  const up = Math.abs(facing.y) > 0.9 ? new THREE.Vector3(0, 0, 1) : new THREE.Vector3(0, 1, 0);
+  light.up.copy(up);
+  light.lookAt(meshCenter.clone().add(facing));
+  return {
+    name: mesh.name,
+    mesh,
+    light,
+    followed,
+    scale: typeof ha.scale === "number" && ha.scale > 0 ? ha.scale : AREA_DEFAULT_SCALE,
+    baseIntensity: standalone ? ha.intensity : 0,
+    colorOverride,
+    emissiveIntensity,
+    facing: facing.clone(),
+    width,
+    height,
+  };
+}
+
+// Daylight factor from the sun state: 0 at/below the horizon, 1 at
+// 30 degrees and above — the same ramp as the sun intensity
+// (sunIntensityForElevation) and the hemisphere fill. No sun state
+// (sun disabled) counts as night: the hemisphere's no-data floor
+// (0.5) already provides the base fill there. Exported for tests.
+export function daylightFactor(sunState) {
+  if (!sunState || typeof sunState.elevation !== "number") return 0;
+  return Math.min(1, Math.max(0, sunState.elevation / 30));
+}
+
+// Drive the area lights from their followed punctual light's
+// EFFECTIVE intensity (call after the script + shadow sync, so a
+// script-lit TV glows in the area light too): intensity = followed
+// intensity x scale, color = followed color unless extras.color
+// overrides it. A standalone area light (extras intensity, no
+// follows) is constant. Off (intensity 0) hides the light —
+// RectAreaLight has no shadow to sync. The mesh's own emissive
+// follows the light too (a TV screen must not glow when off).
+// Exported for tests.
+export function updateAreaLights(model) {
+  const areas = model.areaLights || [];
+  if (areas.length === 0) return;
+  for (const a of areas) {
+    if (a.followed) {
+      const lit = a.followed.intensity > 0;
+      a.light.intensity = a.followed.intensity * a.scale;
+      if (!a.colorOverride) a.light.color.copy(a.followed.color);
+      a.light.visible = lit;
+      const mat = a.mesh && a.mesh.material;
+      if (mat && typeof mat.emissiveIntensity === "number") {
+        mat.emissiveIntensity = lit ? a.emissiveIntensity : 0;
+      }
+    } else {
+      a.light.intensity = a.baseIntensity;
+      a.light.visible = a.baseIntensity > 0;
+    }
+  }
+}
+
+// Drive the ambient lights from the sun elevation (call after the
+// script, which may have moved the sun): intensity interpolates
+// between the extras `night` value below the horizon and `day` at
+// full daylight. With night 0 the night render is (near-)black.
+// Exported for tests.
+export function updateAmbientLights(model) {
+  const ambients = model.ambientLights || [];
+  if (ambients.length === 0) return;
+  const factor = daylightFactor(model.sunState);
+  for (const a of ambients) {
+    a.light.intensity = a.night + (a.day - a.night) * factor;
+  }
+}
+
 // A curtain's outward normal (the side the sun hits): the curtain is a
 // vertical plane facing local +Z; its world normal is that axis through
 // the node's orientation, with the sign from the model center — the
@@ -753,6 +1122,23 @@ export function curtainOutwardNormal(mesh, center) {
 // HA sun convention: azimuth 0 = north, 90 = east, 180 = south, 270 = west
 // (clockwise); elevation = degrees above the horizon. The model is laid out
 // with +X = east, +Z = south, so north is -Z.
+//
+// NORTH CONVENTION (0.3.9): the model frame assumes model north (-Z) IS
+// true north. The real house may be rotated: `north_offset` (YAML
+// `north_offset`, degrees) is the true-north azimuth the model's north
+// side (-Z) faces — 0 means the model's north side faces true north,
+// 90 means it faces true east. The effective model-frame azimuth is
+// (true azimuth - north_offset) mod 360: with a 90 deg offset a sun at
+// true south (180) sits at model azimuth 90, i.e. on the model's east
+// (+X) side — the side that faces true south once the house is rotated.
+// The offset applies to the sun AND the moon (both arrive as true-north
+// azimuths); the script's getSun()/positionSun work in model frame, past
+// the offset. The coordinator sends the offset in the render payload;
+// direct API callers pass `north_offset` the same way (default 0).
+export function modelAzimuth(trueAzimuth, northOffset = 0) {
+  const az = (trueAzimuth - northOffset) % 360;
+  return az < 0 ? az + 360 : az;
+}
 function sunColorForElevation(elevation) {
   // Warm at the horizon, neutral at noon. Stops in sRGB.
   const stops = [
@@ -779,7 +1165,7 @@ function sunColorForElevation(elevation) {
 
 // Position the sun light from azimuth/elevation (HA convention, see
 // applySun). Shared by applySun and the script's getSun() — a script can
-// move the sun the same way the built-in mapping does.
+// move the sun the same way applySun does.
 export function positionSun(model, azimuth, elevation) {
   const { sun: sunLight, center, diag } = model;
   const az = (azimuth * Math.PI) / 180;
@@ -800,22 +1186,285 @@ function sunIntensityForElevation(elevation) {
   return 3.0 * Math.min(1, Math.max(0, elevation / 30));
 }
 
-export function applySun(model, sun) {
+export function applySun(model, sun, northOffset = 0) {
   const { sun: sunLight, hemi } = model;
   if (!sun || typeof sun.elevation !== "number" || sun.elevation <= 0) {
-    // Night, or sun disabled: no direct sun; a low ambient so the interior
-    // lights carry the scene.
+    // Night, or sun disabled: no direct sun. At night the hemisphere
+    // goes to 0 — night is dark (an earlier 0.06 floor kept every
+    // night render dimly lit). A model that wants a moonlight floor
+    // declares it in its ambient light's `night` value instead. Sun
+    // disabled (no sun state at all) keeps the 0.5 no-data floor, so
+    // sun-less renders keep their old look.
     sunLight.intensity = 0;
-    hemi.intensity = sun ? 0.06 : 0.5;
-    model.sunState = sun ? { azimuth: sun.azimuth ?? 0, elevation: sun.elevation ?? 0 } : null;
+    hemi.intensity = sun ? 0 : 0.5;
+    model.sunState = sun ? { azimuth: modelAzimuth(sun.azimuth ?? 0, northOffset), elevation: sun.elevation ?? 0 } : null;
     return;
   }
-  positionSun(model, sun.azimuth, sun.elevation);
+  positionSun(model, modelAzimuth(sun.azimuth, northOffset), sun.elevation);
   const rgb = sunColorForElevation(sun.elevation);
   sunLight.color.setRGB(rgb[0] / 255, rgb[1] / 255, rgb[2] / 255, THREE.SRGBColorSpace);
   // 3.0 is bright daylight with ACES.
   sunLight.intensity = sunIntensityForElevation(sun.elevation);
   hemi.intensity = 0.15 + 0.45 * Math.min(1, Math.max(0, sun.elevation / 30));
+}
+
+// ---------------------------------------------------------------------------
+// Moon
+// ---------------------------------------------------------------------------
+// Moonlight: a dim, cool directional light that behaves like a second,
+// much weaker sun — it shines through windows and casts shadows (same
+// shadow setup as the sun). Its position comes from the render request
+// (the coordinator computes it from the lunar ephemeris in moon.py,
+// like the sun); the panel viewer mirrors this with lunar-position.mjs.
+// Intensity keys off the EFFECTIVE sun elevation (model.sunState, set
+// by applySun and possibly moved by the script): 0 while the sun is
+// up, ramping to full as the sun drops to -12 degrees (end of nautical
+// twilight), and 0 when the moon itself is below the horizon. No moon
+// in the request (an older integration, or sun disabled) means no
+// moonlight — the ambient `night` floor is the only night fill then.
+// No phase factor: the moon shines at full-moon brightness whenever it
+// is up at night (a phase factor would make new-moon nights black,
+// which defeats the point — night should stay dimly visible). The
+// moon does not drive curtain glow or bounce lights (too weak to
+// matter); those stay sun-only.
+// MOON_INTENSITY 2.0 is the tuned value (moonlight verify,
+// 2026-11-24): at 0.25 the patches were invisible (mean 0.8), at 1.5
+// visible but dim (peak ~70), at 2.0 clearly visible (peak ~85, ~7x
+// the ambient night floor) without blowing out — the moon stays
+// dimmer than the sun (3.0). The ACES toe + Lambertian /pi eat the
+// low end, so the number looks high for "dim" moonlight.
+const MOON_COLOR = 0xcfdcee;
+const MOON_INTENSITY = 2.0;
+const MOON_FULL_SUN_ELEVATION = -12;
+
+// Moon fade from the sun state: 0 while the sun is up, 1 once the sun
+// is 12 degrees below the horizon. No sun state (sun disabled) counts
+// as no moon. Exported for tests.
+export function moonFadeFactor(sunState) {
+  if (!sunState || typeof sunState.elevation !== "number") return 0;
+  return Math.min(1, Math.max(0, -sunState.elevation / 12));
+}
+
+// Position the moon light from azimuth/elevation (same HA convention
+// as the sun). Exported for tests.
+export function positionMoon(model, azimuth, elevation) {
+  const { moon: moonLight, center, diag } = model;
+  const az = (azimuth * Math.PI) / 180;
+  const el = (elevation * Math.PI) / 180;
+  const dir = new THREE.Vector3(
+    Math.cos(el) * Math.sin(az),
+    Math.sin(el),
+    -Math.cos(el) * Math.cos(az),
+  );
+  moonLight.position.copy(center).addScaledVector(dir, diag * 2);
+  moonLight.target.position.copy(center);
+  moonLight.target.updateMatrixWorld();
+  model.moonState = { azimuth, elevation };
+}
+
+// Drive the moon light from the request's moon position and the final
+// sun state (call after the script, which may have moved the sun).
+// Exported for tests.
+export function applyMoon(model, moon, northOffset = 0) {
+  const { moon: moonLight } = model;
+  if (!moon || typeof moon.elevation !== "number" || typeof moon.azimuth !== "number") {
+    moonLight.intensity = 0;
+    model.moonState = null;
+    return;
+  }
+  model.moonState = { azimuth: modelAzimuth(moon.azimuth, northOffset), elevation: moon.elevation };
+  if (moon.elevation <= 0) {
+    moonLight.intensity = 0;
+    return;
+  }
+  const fade = moonFadeFactor(model.sunState);
+  if (fade <= 0) {
+    moonLight.intensity = 0;
+    return;
+  }
+  positionMoon(model, model.moonState.azimuth, moon.elevation);
+  moonLight.intensity = MOON_INTENSITY * fade;
+}
+
+// ---------------------------------------------------------------------------
+// Weather (emulator)
+// ---------------------------------------------------------------------------
+// Weather presets for the panel emulator (and the render API's `weather`
+// field — the coordinator does not send one, so service renders default
+// to sunny). A preset dims the sun, flattens the hemisphere fill, tints
+// the clear color, and — for rain and snow — adds falling particles
+// OUTSIDE the house. The panel viewer mirrors this section (same preset
+// values, same seeded particle positions); the two packages deploy
+// separately and cannot share the file, so keep them in sync.
+//
+//   sunny:    the current look, untouched (sun x1, hemi from the sun
+//             ramp, transparent clear, no particles).
+//   overcast: dim sun, flat bright hemisphere (an overcast sky is a
+//             big diffuse source), grey clear tint, no particles.
+//   rainy:    overcast, darker, plus rain streaks falling fast.
+//   snowy:    bright diffuse light (snow bounces a lot back up), cool
+//             pale tint, plus large slow snowflakes.
+// The hemisphere override and the clear tint apply only while the sun
+// is up (or there is no sun state at all): an overcast night is still
+// dark. Particles fall day and night. The moon is dimmed by the same
+// sun factor (an overcast sky hides it).
+export const WEATHER_PRESETS = {
+  sunny: { sun: 1.0, hemi: null, tint: null, particles: null },
+  overcast: { sun: 0.25, hemi: 0.6, tint: "#b8bec4", particles: null },
+  rainy: { sun: 0.15, hemi: 0.5, tint: "#9aa3ab", particles: "rain" },
+  snowy: { sun: 0.4, hemi: 0.7, tint: "#dfe8f0", particles: "snow" },
+};
+export const WEATHER_NAMES = Object.keys(WEATHER_PRESETS);
+
+// Resolve a weather name to its preset; unknown names (and anything
+// non-string) fall back to sunny — never break a render for weather.
+export function resolveWeather(name) {
+  if (typeof name === "string" && Object.hasOwn(WEATHER_PRESETS, name)) {
+    return WEATHER_PRESETS[name];
+  }
+  return WEATHER_PRESETS.sunny;
+}
+
+// Seeded RNG (mulberry32): particle positions must be deterministic so
+// a still renders identically every time (and the panel viewer agrees
+// with the service for the same weather).
+export function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function () {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
+
+// Particle counts and fall speeds (m/s), per kind. Rain falls fast and
+// fine; snow drifts down slow and big.
+export const WEATHER_PARTICLES = {
+  rain: { count: 900, size: 0.06, color: 0x9fb4c8, opacity: 0.55, speed: 9.0, seed: 1337 },
+  snow: { count: 600, size: 0.12, color: 0xffffff, opacity: 0.85, speed: 1.2, seed: 4242 },
+};
+
+// Particle positions for one kind, seeded and deterministic: uniform in
+// a volume around the house (bounds expanded by ~6 m, floor to 7 m up),
+// REJECTING any point inside the building footprint (the bounds' x/z
+// extent — for the sample model that is the 15 x 8 m house, so no
+// particle ever lands inside a room). Returns a Float32Array of
+// count*3. Exported for tests.
+export function weatherParticlePositions(kind, bounds, floorY) {
+  const spec = WEATHER_PARTICLES[kind];
+  const rand = mulberry32(spec.seed);
+  const xMin = bounds.min.x - 6;
+  const xMax = bounds.max.x + 6;
+  const zMin = bounds.min.z - 6;
+  const zMax = bounds.max.z + 6;
+  const yMin = floorY + 0.2;
+  const yMax = floorY + 7;
+  const out = new Float32Array(spec.count * 3);
+  let i = 0;
+  while (i < spec.count) {
+    const x = xMin + rand() * (xMax - xMin);
+    const z = zMin + rand() * (zMax - zMin);
+    // Inside the building footprint? Reject — particles stay outside.
+    if (x >= bounds.min.x && x <= bounds.max.x && z >= bounds.min.z && z <= bounds.max.z) {
+      continue;
+    }
+    const y = yMin + rand() * (yMax - yMin);
+    out[i * 3] = x;
+    out[i * 3 + 1] = y;
+    out[i * 3 + 2] = z;
+    i += 1;
+  }
+  return out;
+}
+
+// Fall one particle column: base y minus speed*time, wrapped into the
+// [yMin, yMax) band so the fall loops forever. Pure function of time,
+// so a clip frame at time t is deterministic (and a still at t=0 is
+// exactly the seeded base positions). Exported for tests.
+export function weatherFallY(baseY, time, speed, yMin, yMax) {
+  const height = yMax - yMin;
+  let y = (baseY - yMin - speed * time) % height;
+  if (y < 0) y += height;
+  return yMin + y;
+}
+
+// Lazily create the rain/snow THREE.Points (once per model) and add
+// them to the scene. Points never cast shadows; depthWrite off so a
+// flake never occludes the house behind it.
+function ensureWeatherParticles(model) {
+  if (model.weather) return model.weather;
+  const weather = { points: {}, base: {}, yMin: model.floorY + 0.2, yMax: model.floorY + 7 };
+  for (const kind of ["rain", "snow"]) {
+    const spec = WEATHER_PARTICLES[kind];
+    const positions = weatherParticlePositions(kind, model.bounds, model.floorY);
+    const geometry = new THREE.BufferGeometry();
+    geometry.setAttribute("position", new THREE.BufferAttribute(positions, 3));
+    const material = new THREE.PointsMaterial({
+      color: spec.color,
+      size: spec.size,
+      sizeAttenuation: true,
+      transparent: true,
+      opacity: spec.opacity,
+      depthWrite: false,
+    });
+    const points = new THREE.Points(geometry, material);
+    points.name = `weather_${kind}`;
+    points.visible = false;
+    points.frustumCulled = false; // the cloud spans the whole volume
+    model.scene.add(points);
+    weather.points[kind] = points;
+    weather.base[kind] = positions;
+  }
+  model.weather = weather;
+  return weather;
+}
+
+// Show/hide the particle systems for the current weather and advance
+// the fall to `time` (0 for stills: exactly the seeded positions).
+function updateWeatherParticles(model, kind, time) {
+  const weather = ensureWeatherParticles(model);
+  for (const [name, points] of Object.entries(weather.points)) {
+    const active = name === kind;
+    points.visible = active;
+    if (!active) continue;
+    const spec = WEATHER_PARTICLES[name];
+    const base = weather.base[name];
+    const attr = points.geometry.getAttribute("position");
+    const arr = attr.array;
+    for (let i = 0; i < spec.count; i += 1) {
+      arr[i * 3 + 1] = weatherFallY(base[i * 3 + 1], time, spec.speed, weather.yMin, weather.yMax);
+    }
+    attr.needsUpdate = true;
+  }
+}
+
+// Apply a weather preset to the model, after the sun/moon and the
+// script (weather is atmospheric: it dims whatever the script did).
+// Multiplies the sun and moon intensities, overrides the hemisphere
+// while the sun is up, records the clear tint for the frame, and
+// shows/animates the particles. Exported for tests.
+export function applyWeather(model, weather, time = 0) {
+  const preset = resolveWeather(weather);
+  const sun = model.sun;
+  const moon = model.moon;
+  const hemi = model.hemi;
+  if (sun) sun.intensity *= preset.sun;
+  if (moon) moon.intensity *= preset.sun;
+  const sunUp = !model.sunState || model.sunState.elevation > 0;
+  if (preset.hemi !== null && sunUp) {
+    hemi.intensity = preset.hemi;
+  }
+  model.weatherTint = sunUp ? preset.tint : null;
+  if (preset.particles) {
+    updateWeatherParticles(model, preset.particles, time);
+  } else if (model.weather) {
+    for (const points of Object.values(model.weather.points)) {
+      points.visible = false;
+    }
+  }
+  return preset;
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1804,20 @@ function lightWrapper(light) {
     set intensity(v) {
       light.intensity = v;
     },
+    // The model's base intensity for this light (from the GLB) — the
+    // value the lightMapping apply logic scales by the entity's
+    // brightness (intensity = base x brightness). Read-only: the
+    // script sets `intensity`, never the base.
+    get baseIntensity() {
+      return light.userData.baseIntensity;
+    },
+    // The model's base color for this light, sRGB [r, g, b] 0..255 —
+    // what the light falls back to when its entity has no color or
+    // color temperature.
+    get baseColor() {
+      const c = light.userData.baseColor.getRGB(new THREE.Color(), THREE.SRGBColorSpace);
+      return [Math.round(c.r * 255), Math.round(c.g * 255), Math.round(c.b * 255)];
+    },
     // Color as sRGB [r, g, b] 0..255.
     get color() {
       const c = light.color.getRGB(new THREE.Color(), THREE.SRGBColorSpace);
@@ -1218,7 +1881,7 @@ export function createSceneApi(model) {
           const az = model.sunState ? model.sunState.azimuth : 180;
           positionSun(model, az, v);
           // Moving the sun re-derives daylight intensity from the new
-          // elevation (same ramp as the built-in mapping); the script
+          // elevation (same ramp as applySun); the script
           // can still override intensity afterwards.
           sun.intensity = sunIntensityForElevation(v);
         },
@@ -1257,6 +1920,12 @@ export function createSceneApi(model) {
     kelvinToRgb(k) {
       return kelvinToRgb(k);
     },
+    hsToRgb(h, s) {
+      return hsToRgb(h, s);
+    },
+    xyToRgb(x, y, brightness) {
+      return xyToRgb(x, y, brightness);
+    },
     hasLight(name) {
       return model.lights.has(name);
     },
@@ -1281,12 +1950,18 @@ export function createSceneApi(model) {
 // Per-frame rendering
 //
 // One frame of one camera. The pipeline (per frame):
-//   camera setup (reset to base + apply overrides) -> built-in light
-//   mapping -> sun -> glTF animations sampled at `time` -> user script
-//   -> shadow sync (castShadow follows effective intensity) -> render.
-// The built-in mapping is re-applied before every frame, so the script
-// always starts from the entity state and sets absolute values — frames
-// are independent and clips loop cleanly. A still is one frame at
+//   camera setup (reset to base + apply overrides) -> light parameters
+//   from the request (the script's lightMapping owns the entity
+//   mapping; the integration sends no light parameters, so this resets
+//   every light to its model base) -> sun (true-north azimuth rotated
+//   into model frame by `northOffset`) -> glTF animations sampled
+//   at `time` -> user script -> shadow sync (castShadow follows
+//   effective intensity) -> area lights -> moon (same north offset)
+//   -> weather (sun/moon dim, hemisphere, clear tint, particles) ->
+//   curtain glow -> bounce lights -> ambient lights -> render.
+// The light parameters are re-applied before every frame, so the script
+// always starts from the model base values and sets absolute values —
+// frames are independent and clips loop cleanly. A still is one frame at
 // time 0, loop 0; a clip is N frames at t = i/fps, loop = i/frames.
 // ---------------------------------------------------------------------------
 export function renderFrame({
@@ -1294,12 +1969,15 @@ export function renderFrame({
   model,
   lights,
   sun,
+  moon,
   entities,
   info,
   cfg,
   time,
   loop,
   script,
+  northOffset = 0,
+  weather = "sunny",
   setSize,
   capture,
   onScriptError,
@@ -1307,7 +1985,7 @@ export function renderFrame({
 }) {
   const camera = getRenderCamera(model, info, cfg);
   applyLightStates(model.lights, lights || {});
-  applySun(model, sun ?? null);
+  applySun(model, sun ?? null, northOffset);
   if (model.mixer) model.mixer.setTime(time);
   if (script) {
     const result = runScriptCall(script, {
@@ -1326,14 +2004,30 @@ export function renderFrame({
   // effective intensity (see syncLightVisibilityAndShadow), so
   // script-lit lights shine and cast shadows.
   syncLightVisibilityAndShadow(model.lights);
+  // Area lights follow their punctual light's EFFECTIVE intensity
+  // (post-script, so a script-lit TV glows in the area light too).
+  updateAreaLights(model);
+  // Moonlight keys off the same final sun state (the script may have
+  // moved the sun above); its position comes from the request.
+  applyMoon(model, moon ?? null, northOffset);
+  // Weather dims the sun and moon the script left behind (it runs
+  // before the curtain glow and bounce lights, which read the
+  // weathered sun intensity) and tints the clear color.
+  applyWeather(model, weather, time);
   // Sheer curtains glow from the FINAL sun state (the script may have
   // moved the sun above).
   updateCurtainGlow(model);
   // Bounce lights track the sun patch per frame, same sun state.
   updateBounceLights(model);
+  // Ambient lights follow the same final sun state.
+  updateAmbientLights(model);
   setSize(cfg.width, cfg.height);
   if (cfg.background) {
     renderer.setClearColor(new THREE.Color(cfg.background), 1);
+  } else if (model.weatherTint) {
+    // Weather tint (overcast/rainy/snowy sky) — only when the camera
+    // has no explicit background; an explicit background always wins.
+    renderer.setClearColor(new THREE.Color(model.weatherTint), 1);
   } else {
     renderer.setClearColor(DEFAULT_CLEAR_COLOR, DEFAULT_CLEAR_ALPHA);
   }
@@ -1433,12 +2127,15 @@ export function renderCameras({
   model,
   lights,
   sun,
+  moon,
   entities,
   script,
   cameras,
   width,
   height,
   fileConfig,
+  northOffset = 0,
+  weather = "sunny",
   setSize,
   capture,
   onScriptError,
@@ -1459,12 +2156,15 @@ export function renderCameras({
       model,
       lights,
       sun,
+      moon,
       entities,
       info,
       cfg,
       time: 0,
       loop: 0,
       script: script || null,
+      northOffset,
+      weather,
       setSize,
       capture,
       onScriptError,

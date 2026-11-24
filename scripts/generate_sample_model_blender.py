@@ -110,9 +110,17 @@ LIGHTS = _jittered
 # bounce lights (renderer, window_* markers). Do not re-add them.
 
 CAMERAS = {
-    # overview is TOP-DOWN (user request): straight above the house,
-    # same framing as the old topdown check camera.
-    "overview":    {"loc": (0.0, 0.0, 18.0), "target": (0.0, 0.0, 0.0), "lens": 35},
+    # overview is an ANGLED 3/4 aerial view (0.3.9, user request):
+    # from the south-west, ~39.5 deg elevation, so the house reads
+    # as a dollhouse instead of a flat plan. Blender (-12, -12, 14)
+    # = glTF (-12, 14, 12); the camera looks at the model center.
+    # Chosen over the south-east (living room pushed far-left), the
+    # east-south-east (house reads rotated, wastes the frame) and
+    # the north-east (near north facade is a huge black wall) —
+    # see tests-0.3.0/feature-b/angle_probe.mjs + the
+    # angled-candidate-*.png proofs (2026-11-24). The topdown check
+    # camera below keeps the straight-above view for verification.
+    "overview":    {"loc": (-12.0, -12.0, 14.0), "target": (0.0, 0.0, 0.0), "lens": 35},
     "living_room": {"loc": (-7.05, 0.25, 2.2), "target": (-2.8, 2.1, 0.9), "lens": 35},
     "topdown":     {"loc": (0.0, 0.0, 18.0), "target": (0.0, 0.0, 0.0), "lens": 35},
 }
@@ -553,6 +561,35 @@ for _room in ROOMS:
     print(f"window marker: window_{_room} at "
           f"({_cx:.3f}, {_yc:.3f}, {WIN_SILL + WIN_H / 2:.3f})")
 
+# --- ambient marker: an empty declaring the time-of-day ambient light ---
+# Same ha_light extras convention as the TV area light, but ambient has
+# no geometry, so it lives on an empty at the house center (position is
+# irrelevant for an ambient light — only the extras matter). The
+# renderer creates a THREE.AmbientLight and drives its intensity from
+# the sun elevation every frame: `day` at full daylight, fading to
+# `night` below the horizon. `night` is the moonlit-sky floor: 0.2
+# keeps rooms dimly visible at night (mean luminance ~12 — the
+# directional moonlight adds the patches through the windows) without
+# washing out the moonlight contrast — 0.0 made night perfectly
+# black, which the user rejected, and 0.015 (the first guess) still
+# measured 0.0 under ACES + the Lambertian /pi (moonlight verify,
+# 2026-11-24: 0.15 -> ~8, 0.25 -> ~16). Night EXCEEDS day here on
+# purpose: the daytime fill comes from the hemisphere (0.6), so the
+# ambient day is only a subtle lift, while at night the ambient is
+# the ONLY fill (hemisphere 0) and must carry the floor alone. The
+# hemisphere fill follows the same ramp, so nothing else keeps the
+# night lit. Day 0.05
+# is a subtle cool lift on top of the 0.6 hemisphere — 0.1 compressed
+# the curtain/bounce luminance ratios in the verify suite noticeably
+# (curtain_verify's raw ratio hit 0.755 against a 0.75 threshold).
+bpy.ops.object.empty_add(location=(0.0, 0.0, 1.25))
+_ambient = bpy.context.active_object
+_ambient.name = "ambient"
+_ambient.empty_display_size = 0.1
+_ambient["ha_light"] = {"type": "ambient", "color": "#bfd4e6",
+                        "day": 0.05, "night": 0.2}
+print("ambient marker: ambient at (0, 0, 1.25), day 0.05, night 0.2")
+
 # --- exterior side walls (no windows) ---
 box("wall_west", -7.5, 0.0, 1.225, WALL_T_EXT, 8.15, 2.55, M["wall"])
 box("wall_east", 7.5, 0.0, 1.225, WALL_T_EXT, 8.15, 2.55, M["wall"])
@@ -632,7 +669,18 @@ box("couch_cushion_R", -4.58, 2.5, 0.52, 0.8, 0.95, 0.15, M["cushion"])
 # TV stand + body + screen (screen is a separate mesh, script-toggled)
 box("tv_stand", -2.68, 2.0, 0.225, 0.3, 1.5, 0.45, M["stand"])
 box("tv_body", -2.62, 2.0, 1.05, 0.06, 1.3, 0.75, M["tvbody"])
-box("tv_screen", -2.655, 2.0, 1.05, 0.01, 1.24, 0.69, M["tvscreen"])
+_tv_screen = box("tv_screen", -2.655, 2.0, 1.05, 0.01, 1.24, 0.69, M["tvscreen"])
+# ha_light extras (private convention, see docs/wiki/Sample-Scene.md):
+# the screen mesh IS an area light. The renderer creates a
+# RectAreaLight fitted to the mesh bounds, facing the followed point
+# light (which sits 4 cm in front of the screen face), and drives its
+# intensity = followed light's effective intensity x scale. The point
+# light stays: RectAreaLight cannot cast shadows, so it carries the
+# shadows while the area light carries the soft fill. Custom
+# properties export as node extras (export_extras=True below) —
+# verified with a probe export before this was added.
+_tv_screen["ha_light"] = {"type": "area", "follows": "living_room_tv",
+                          "scale": 5.0}
 
 # --- ceiling fan (living room): a group node scene.js rotates ---
 # The group is an empty at hub height; hub + 4 blades are its children.

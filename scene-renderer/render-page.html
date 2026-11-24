@@ -49,7 +49,7 @@ const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffe
 // transparent where no model geometry is visible (scene.mjs clears
 // with alpha 0) — without it the output would be opaque black.
 renderer.shadowMap.enabled = true;
-renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+renderer.shadowMap.type = THREE.PCFShadowMap;
 renderer.toneMapping = THREE.ACESFilmicToneMapping;
 renderer.toneMappingExposure = sceneLib.BASE_EXPOSURE;
 renderer.setPixelRatio(1);
@@ -76,12 +76,12 @@ function pageLog(level, message) {
 window.__cameras = ({ fileConfig, defaults }) =>
   sceneLib.listCameras(model, fileConfig || {}, defaults, pageLog);
 // Compile a new user script (or clear it with null). Returns only plain
-// data ({ ok, subscribe, objectDrivers, error }) — the compiled handle
-// holds a function and cannot cross page.evaluate.
+// data ({ ok, subscribe, objectDrivers, lightMapping, error }) — the
+// compiled handle holds a function and cannot cross page.evaluate.
 window.__setScript = (source) => {
   if (source === null || source === undefined) {
     currentScript = null;
-    return { ok: true, subscribe: [], objectDrivers: {} };
+    return { ok: true, subscribe: [], objectDrivers: {}, lightMapping: {} };
   }
   if (!sesAvailable) {
     return { ok: false, error: "SES is not available in this page — scene.js cannot be loaded" };
@@ -89,7 +89,7 @@ window.__setScript = (source) => {
   const result = compileScript(source, { log: pageLog });
   if (!result.ok) return { ok: false, error: result.error };
   currentScript = result;
-  return { ok: true, subscribe: result.subscribe, objectDrivers: result.objectDrivers };
+  return { ok: true, subscribe: result.subscribe, objectDrivers: result.objectDrivers, lightMapping: result.lightMapping };
 };
 window.__scriptInfo = () => ({
   present: currentScript !== null,
@@ -105,7 +105,7 @@ window.__scriptInfo = () => ({
 // re-rendering shadows every frame would cost 30 extra scene renders
 // per frame. A still or a clip's first frame always renders fresh
 // shadows.
-window.__renderFrame = ({ name, lights, sun, entities, cfg, time, loop, freezeShadows }) => {
+window.__renderFrame = ({ name, lights, sun, moon, entities, cfg, time, loop, northOffset, weather, freezeShadows }) => {
   const info = sceneLib.getCameraInfo(model, name);
   if (!info) throw new Error(`unknown camera "${name}"`);
   if (freezeShadows) {
@@ -119,18 +119,21 @@ window.__renderFrame = ({ name, lights, sun, entities, cfg, time, loop, freezeSh
     model,
     lights: lights || {},
     sun: sun ?? null,
+    moon: moon ?? null,
     entities: entities || {},
     info,
     cfg,
     time,
     loop,
     script: currentScript,
+    northOffset: northOffset ?? 0,
+    weather: weather ?? "sunny",
     setSize: (w, h) => renderer.setSize(w, h, false),
     capture: () => renderer.domElement.toDataURL("image/png"),
     log: pageLog,
   });
 };
-window.__render = ({ lights, sun, entities, cameras, width, height, fileConfig }) => {
+window.__render = ({ lights, sun, moon, entities, cameras, width, height, fileConfig, northOffset, weather }) => {
   // Stills always render fresh shadows (a clip may have left
   // autoUpdate off).
   renderer.shadowMap.autoUpdate = true;
@@ -140,12 +143,15 @@ window.__render = ({ lights, sun, entities, cameras, width, height, fileConfig }
     model,
     lights: lights || {},
     sun: sun ?? null,
+    moon: moon ?? null,
     entities: entities || {},
     script: currentScript,
     cameras,
     width,
     height,
     fileConfig: fileConfig || {},
+    northOffset: northOffset ?? 0,
+    weather: weather ?? "sunny",
     setSize: (w, h) => renderer.setSize(w, h, false),
     capture: () => renderer.domElement.toDataURL("image/png"),
     log: pageLog,

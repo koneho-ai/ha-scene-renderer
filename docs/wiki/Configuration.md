@@ -8,9 +8,9 @@ Assistant. Every key is optional:
 
 ```yaml
 scene_renderer:
-  lights:
-    living_room_1: light.living_room
-    kitchen_1: light.kitchen
+  entities:
+    - light.living_room
+    - light.kitchen
 ```
 
 | Key | Default | Notes |
@@ -19,19 +19,65 @@ scene_renderer:
 | `sun_entity` | `sun.sun` | Sun entity to follow; set to `null` to disable the sun |
 | `sun_elevation` | — | Fix the sun at this elevation (0–90°); requires `sun_azimuth` |
 | `sun_azimuth` | — | Fix the sun at this azimuth (0–360°); requires `sun_elevation` |
+| `north_offset` | `0` | Rotate the sun (and moon) to match the real house orientation (0–360°); see North offset below |
 | `name` | `Scene Renderer` | Scene name, used for the device and entities |
-| `lights` | `{}` | Mapping of model light names (e.g. `living_room_1`) to HA light entity ids |
+| `entities` | `[]` | The entities the integration subscribes to — their states are sent to the render service in every render request, and the script maps them to model lights via its `lightMapping` table (see [[Scene Scripting]]) |
 | `objects` | `{}` | Mapping of model object names (e.g. `ceiling_fan`) to HA entity ids — see Mapping objects below |
 | `cameras` | all | Camera names to expose, one image entity each; omit to expose every camera the app offers |
 
-Only the lights you map follow live state; unmapped lights render at
-their model defaults (full brightness, model color), so the demo model
-needs no onboarding at all — a bare `scene_renderer:` line works, and
-the app is discovered automatically.
+The YAML only lists the entities to subscribe to — the light→entity
+mapping itself lives in the scene script (`scene.js`), as a
+`lightMapping` table the script applies every frame: a mapped light
+whose entity is on shines at model base × brightness in the entity's
+color (or color temperature); a mapped light whose entity is off, and
+any light not in the table, renders OFF. So the demo model needs no
+onboarding at all — a bare `scene_renderer:` line works (no script, no
+entities, all lights off except the sun), and the app is discovered
+automatically. The script's own `subscribe` export adds further
+entities on top of the YAML list (e.g. the Plex media player that
+drives the TV). The integration warns in the log when `lightMapping`
+references an entity it does not subscribe to — that light would
+render off with no visible reason — so add the entity to `entities:`
+(or to the script's `subscribe`).
+
+### The deprecated `lights` mapping
+
+Before 0.3.9 the mapping lived in YAML (`lights:`, model light name →
+entity id). It is deprecated and **no longer affects renders**: if
+your `configuration.yaml` still has a `lights:` block, setup logs a
+warning with the equivalent `lightMapping` table — paste it into your
+`scene.js` (the integration never writes your script for you), list
+the entities in `entities:`, and delete the `lights:` block:
+
+```yaml
+# BEFORE (deprecated, ignored)
+scene_renderer:
+  lights:
+    living_room_1: light.living_room
+    kitchen_1: light.kitchen
+
+# AFTER
+scene_renderer:
+  entities:
+    - light.living_room
+    - light.kitchen
+```
+
+```js
+// in /share/scene-renderer/scene.js
+export const lightMapping = {
+  living_room_1: "light.living_room",
+  kitchen_1: "light.kitchen",
+};
+```
+
+The bundled `scene.example.js` already contains a full `lightMapping`
+table for the sample model plus the standard apply logic — copy it as
+a starting point (see [[Scene Scripting]]).
 
 ### Mapping objects
 
-Like `lights`, but for model objects instead of lights: the object's
+A mapping of model object names to HA entity ids: the object's
 driving entity shows in the panel's Objects section with a toggle,
 and the integration re-renders when the driver changes. The sample
 house's ceiling fan is the example:
@@ -57,8 +103,9 @@ and restart.
 
 The config flow is gone in 0.3.0. Delete the old integration entry
 first (Settings → Devices & Services → HA Scene Renderer → ⋮ →
-Delete), then add the YAML block above with your light mapping and
-restart. Deleting first frees up the entity ids
+Delete), then add the YAML block above with your entity list and your
+`scene.js` `lightMapping`, and restart. Deleting first frees up the
+entity ids
 (`image.<name>_<camera>` etc.), so the YAML setup reuses them; if the
 old entry still exists when the YAML setup runs, the new entities get
 `_2` suffixes instead.
@@ -187,7 +234,11 @@ bias alone.
 
 ## How lights are rendered
 
-The integration normalizes each mapped entity into a parameter set:
+The scene script maps entities to lights (see [[Scene Scripting]]):
+its `lightMapping` table says which entity drives each model light,
+and its `update()` applies the table every frame — the bundled
+`scene.example.js` has the standard apply logic, and a script that
+only maps entities copies it verbatim. Each mapped entity is read as:
 
 | Render parameter | From the entity |
 | --- | --- |
@@ -198,12 +249,16 @@ The integration normalizes each mapped entity into a parameter set:
 
 `color_mode` decides the priority when both a color and a temperature are present: `color_temp` mode uses the temperature, `hs` / `xy` / `rgb` modes use the color.
 
-The service applies the parameters on top of the **model's base values**: the model's `KHR_lights_punctual` intensity is the "full brightness" look and its color is the default color.
+The script applies the parameters on top of the **model's base values**: the model's `KHR_lights_punctual` intensity is the "full brightness" look and its color is the default color.
 
 - intensity = model base intensity × brightness (0 when off)
 - color = entity color, else Kelvin→RGB of `color_temp_k`, else model color
 
-Unmapped lights render at their model base values. One approximation to know about: in RGB color modes the brightness lives partly in the color itself (HA docs), so a natively-RGB light with a dark color renders slightly dimmer than its brightness value alone would suggest.
+A light not in `lightMapping` renders OFF — the script sets absolute
+values for every light every frame, so nothing is ever left at the
+model's base intensity by accident. (A script with no `lightMapping`
+at all leaves every light at base — the old behaviour — until the
+table is added.) One approximation to know about: in RGB color modes the brightness lives partly in the color itself (HA docs), so a natively-RGB light with a dark color renders slightly dimmer than its brightness value alone would suggest.
 
 A light the user script lights on its own shines and casts shadows: after the script runs, each light's visibility and shadow casting follow its effective intensity (`visible = castShadow = intensity > 0`), not the mapped entity's on/off — so the TV glow shines and casts while its mapped entity is off (three.js skips invisible lights entirely, so syncing the shadow flag alone left a script-lit light dark). Each point light's shadow map size (512, 1024, or 2048) comes from a deterministic hash of its name, so some lights cast soft shadows and others crisp ones.
 
@@ -233,6 +288,15 @@ With sun enabled, the service adds a directional light from `sun.sun`'s `azimuth
 
 Sheer curtains (`SheerCurtain` material) cast a dithered partial shadow — about 45% of the sun gets through, broken up like a weave — and glow warm when the sun is on their side (the glow is the curtain material's own emissive, where the sun hits it — there is no separate glow light). Sunlight bouncing off the floor patch is emulated with one soft point light per sunlit window (models mark their windows with empty `window_<room>` nodes); the bounce light never casts shadows — it is diffuse re-emission, not a point source. The patch stays within 5 m of its window (about one room) and the bounce fades to 0 as the patch approaches that limit, so a low sun never throws the bounce into another room. See [[Creating Your Own Scene]] for the conventions.
 
+## Moonlight
+
+At night the service adds a dim cool directional moonlight (see [[Sample Scene]] for the tuning). The coordinator computes the moon's position from a low-precision lunar ephemeris (Schlyter's algorithm, ~0.3°) using the home's latitude/longitude from the HA config and the current time, and passes it in the render payload as `moon: {elevation, azimuth}` — exactly like the `sun` field — and in `panel_data` for the sidebar viewer. The renderer's moon intensity keys off the *effective* sun elevation (the sun after any script or fixed-sun override): 0 while the sun is up, ramping to full as the sun drops to 12° below the horizon, 0 when the moon itself is below the horizon. Two interactions to know:
+
+- **Fixed sun (`sun_elevation` + `sun_azimuth`):** a pinned daytime sun keeps the moon off all night, because the fade keys off the pinned elevation, not the real one. A pinned *night* sun (elevation below 0) lets the moon shine — with the real moon position for the current time.
+- **Sun disabled (`sun_entity: null`):** the moon is off too — no sun state means no fade reference, so the coordinator sends no moon and the renderer falls back to the ambient `night` floor alone. The panel viewer behaves the same way.
+
+The moon needs no re-render trigger of its own: the sun's 5° quantization already re-renders through the night (~every 20 min), refreshing the moon, which moves ~0.5°/hour. An older integration that sends no `moon` field renders exactly as if the moon were down (ambient floor only) — the field is optional.
+
 Renders are debounced (~1 s after a light change), serialized, and at most one every ~2 s. The sun re-renders when its elevation crosses a 5° step, on sunrise/sunset, or at most every 15 minutes while it is up.
 
 ### Pinning the sun
@@ -253,6 +317,31 @@ sun never changes, so the integration stops re-rendering on sun
 updates; the panel viewer shows the same fixed sun, and the status
 sensor reports `sun_elevation`, `sun_azimuth` and `sun_fixed: true`.
 `sun.sun` is still sent to `scene.js` if the script reads it.
+
+### North offset
+
+The model is laid out with its north side facing true north: in
+model coordinates north is −Z, east is +X, south is +Z, and azimuths
+follow the HA convention (0° = north, 90° = east, 180° = south,
+clockwise). If the real house is rotated relative to that — the
+model's north side faces true east, say — the sun would shine
+through the wrong windows. `north_offset` rotates the sun (and the
+moon) into the model frame: set it to the true-north azimuth the
+model's north side faces, in degrees (0–360, default 0 = the model
+is laid out true-north-up):
+
+```yaml
+scene_renderer:
+  north_offset: 90   # the model's north side faces true east
+```
+
+The offset applies everywhere the sun and moon are placed: the live
+sun, the fixed sun pin above (the pin is a true-north azimuth, so it
+rotates too), the moon, and the panel viewer (sun slider, sun marker,
+curtain glow, bounce lights) — so the renders and the panel always
+agree. The scene script sees model-frame azimuths: `scene.getSun()`
+returns the azimuth *after* the offset is applied (see [[Scene
+Scripting]]). 0 leaves everything exactly as before.
 
 ## Where your files live
 
@@ -302,6 +391,14 @@ it.
 
 All fields are optional. Merge precedence: **file value > model value** (FOV / near / far / position / target from the glTF camera or the computed virtual camera) **> global default** (width/height from the app options; background = scene default; exposure = 1.0). `GET /cameras` returns the effective merged config per camera.
 
+The sample model's `overview` camera is an angled 3/4 aerial from the south-west (glTF (-12, 14, 12), ~39.5° elevation) — a dollhouse view instead of a flat plan. To get the old straight top-down view back, pin the position in `cameras.yaml`:
+
+```yaml
+overview:
+  position: [0, 18, 0]
+  target: [0, 0, 0]
+```
+
 The file is hot-reloaded: the app watches it and picks up changes without a restart (the log says whether the reload succeeded). It never breaks rendering: an unknown camera name is logged and ignored, invalid values for one camera fall back to defaults for that camera only, and a malformed file keeps the last good config. One exception: an invalid `clip:` entry (duration 0.5–30, fps 1–30 as an integer, 2–300 frames total) drops the **whole camera entry** to defaults — check the log for `cameras.yaml` errors if a clip camera renders a still.
 
 See [[Motion Clips]] for what `clip:` does.
@@ -326,6 +423,9 @@ The app listens on port 3000 inside the container (no host port mapping needed �
     }
   },
   "sun": {"azimuth": 210, "elevation": 35},
+  "moon": {"azimuth": 90, "elevation": 30},
+  "north_offset": 90,
+  "weather": "rainy",
   "entities": {
     "sun.sun": {"state": "above_horizon", "attributes": {"elevation": 35, "azimuth": 210}}
   },
@@ -333,4 +433,4 @@ The app listens on port 3000 inside the container (no host port mapping needed �
 }
 ```
 
-Response: `{"renders": {"overview": {"data": "<base64>", "content_type": "image/png", "lights": [{"name": "living_room_1", "x_px": 606, "y_px": 212, "x_pct": 47.3, "y_pct": 29.4, "visible": true}]}, "living_room": {"data": "<base64>", "content_type": "image/webp", "lights": [...]}}, "script": {...}}`. `lights` is the per-camera projection of the model lights into image coordinates (see Light positions above): computed once per render, `visible` when the light is in frame, `null` coordinates when it is behind the camera. `render_ms` is the wall-clock milliseconds that camera's render took (frames + encoding for clips). Any of `lights`, `sun`, `entities`, `cameras` may be omitted; omitting `cameras` renders all cameras. `sun: null` disables the sun for that render. Unknown camera names are ignored; a request with no known cameras returns HTTP 400. Per-camera size, FOV, position, background, exposure, and clip come from the effective camera config (see `cameras.yaml` above), not the request.
+Response: `{"renders": {"overview": {"data": "<base64>", "content_type": "image/png", "lights": [{"name": "living_room_1", "x_px": 606, "y_px": 212, "x_pct": 47.3, "y_pct": 29.4, "visible": true}]}, "living_room": {"data": "<base64>", "content_type": "image/webp", "lights": [...]}}, "script": {...}}`. `lights` is the per-camera projection of the model lights into image coordinates (see Light positions above): computed once per render, `visible` when the light is in frame, `null` coordinates when it is behind the camera. `render_ms` is the wall-clock milliseconds that camera's render took (frames + encoding for clips). Any of `lights`, `sun`, `moon`, `north_offset`, `weather`, `entities`, `cameras` may be omitted; omitting `cameras` renders all cameras. `sun: null` disables the sun for that render; omitting `moon` (or `moon: null`) renders with no moonlight. `north_offset` (degrees, default 0) rotates the true-north sun/moon azimuths into the model frame (see North offset above). `weather` is one of `sunny` (default), `overcast`, `rainy`, `snowy` — a preset that dims the sun, flattens the hemisphere fill, tints the clear color, and (for rain and snow) adds falling particles outside the house; an unknown name falls back to `sunny`. The integration never sends `weather`, so renders are always sunny unless you call the API directly. Unknown camera names are ignored; a request with no known cameras returns HTTP 400. Per-camera size, FOV, position, background, exposure, and clip come from the effective camera config (see `cameras.yaml` above), not the request.

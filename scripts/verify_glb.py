@@ -3,9 +3,11 @@
 (no image decoding needed, so no three.js/DOM workarounds).
 Checks: 14 lights (13 room with jittered values + TV at base 14, no
 curtain_glow_* lights — removed 2026-11-24 at the user's request),
-2 cameras (overview top-down), ceiling_shadow + ShadowOnly material,
+2 cameras (overview angled 3/4 aerial from the south-west),
 fan/TV/door nodes, 8 window_* marker empties, SheerCurtain alpha 0.8
-BLEND + weave normal map, textures intact (13 images / 28 textures).
+BLEND + weave normal map, textures intact (13 images / 28 textures),
+ha_light extras: tv_screen area light following living_room_tv +
+ambient marker with day/night values.
 Usage: verify_glb.py <path-to-glb> [expect-ceiling: yes|no]"""
 import json
 import struct
@@ -65,7 +67,7 @@ room = [li["intensity"] for li in lights
         if li["name"] != "living_room_tv"]
 print(f"  intensity spread: min {min(room):.1f}  max {max(room):.1f}")
 
-# --- cameras: exactly 2, overview top-down ---
+# --- cameras: exactly 2, overview angled 3/4 aerial ---
 print(f"cameras ({len(cameras)}):")
 cam_nodes = {}
 for n in nodes:
@@ -80,11 +82,13 @@ if sorted(cam_nodes) != ["living_room", "overview"]:
 ov = cam_nodes.get("overview")
 if ov:
     t = ov[0].get("translation", [0, 0, 0])
-    # glTF camera looks down its local -Z; Blender (0,0,18) -> glTF (0,18,0)
-    if abs(t[0]) > 0.01 or abs(t[1] - 18.0) > 0.01 or abs(t[2]) > 0.01:
-        errors.append(f"overview not top-down at (0,18,0) in glTF coords: {t}")
+    # glTF camera looks down its local -Z; Blender (-12,-12,14) ->
+    # glTF (-12,14,12): the 0.3.9 angled 3/4 aerial from the
+    # south-west (~39.5 deg elevation), chosen by angle_probe.mjs.
+    if abs(t[0] + 12.0) > 0.01 or abs(t[1] - 14.0) > 0.01 or abs(t[2] - 12.0) > 0.01:
+        errors.append(f"overview not angled at (-12,14,12) in glTF coords: {t}")
     else:
-        print("  overview is top-down at glTF (0, 18, 0)")
+        print("  overview is angled at glTF (-12, 14, 12)")
 
 # --- required nodes ---
 for need in ["ceiling_fan", "tv_screen", "living_room_tv", "front_door",
@@ -215,6 +219,89 @@ if len(images) != 13:
     errors.append(f"expected 13 embedded images, got {len(images)}")
 if len(textures) != 28:
     errors.append(f"expected 28 textures, got {len(textures)}")
+
+# --- ha_light extras: model-declared lights glTF cannot express ---
+# Private convention (see docs/wiki/Sample-Scene.md): a node with
+# extras.ha_light declares a light the renderer creates. type "area":
+# a RectAreaLight fitted to the mesh bounds, driven by a followed
+# punctual light (follows) or a constant intensity; type "ambient":
+# an AmbientLight on a bare empty, driven by sun elevation between
+# day and night. A typo here silently does nothing in the renderer,
+# so the validator checks every field.
+import re
+light_names = {li["name"] for li in lights}
+ha_nodes = [(n.get("name"), n.get("extras", {}).get("ha_light"))
+            for n in nodes
+            if isinstance(n.get("extras", {}).get("ha_light"), dict)]
+print(f"  ha_light nodes: {len(ha_nodes)} (expect 2: tv_screen area, "
+      f"ambient ambient)")
+for name, ha in ha_nodes:
+    print(f"  {name}: {ha}")
+    node = by_name.get(name, {})
+    htype = ha.get("type")
+    if htype not in ("area", "ambient"):
+        errors.append(f"ha_light on {name}: type {htype!r}, "
+                      f"expected 'area' or 'ambient'")
+        continue
+    if "color" in ha:
+        if not isinstance(ha["color"], str) or not re.fullmatch(
+                r"#(?:[0-9a-fA-F]{6})", ha["color"]):
+            errors.append(f"ha_light on {name}: color {ha['color']!r}, "
+                          f"expected '#rrggbb'")
+    if htype == "area":
+        if "mesh" not in node:
+            errors.append(f"ha_light area on {name}: node has no mesh "
+                          f"(area needs geometry to fit)")
+        follows = ha.get("follows")
+        inten = ha.get("intensity")
+        if follows is not None and follows not in light_names:
+            errors.append(f"ha_light area on {name}: follows {follows!r}, "
+                          f"not a model light")
+        if follows is None and inten is None:
+            errors.append(f"ha_light area on {name}: needs 'follows' or "
+                          f"'intensity'")
+        if inten is not None and not isinstance(inten, (int, float)):
+            errors.append(f"ha_light area on {name}: intensity "
+                          f"{inten!r} is not a number")
+        if "scale" in ha and not isinstance(ha["scale"], (int, float)):
+            errors.append(f"ha_light area on {name}: scale {ha['scale']!r} "
+                          f"is not a number")
+        elif isinstance(ha.get("scale"), (int, float)) and ha["scale"] <= 0:
+            errors.append(f"ha_light area on {name}: scale must be > 0")
+    else:  # ambient
+        if any(k in node for k in ("mesh", "camera")):
+            errors.append(f"ha_light ambient on {name}: ambient has no "
+                          f"geometry, declare it on a bare empty")
+        for key in ("day", "night"):
+            if key in ha and not isinstance(ha[key], (int, float)):
+                errors.append(f"ha_light ambient on {name}: {key} "
+                              f"{ha[key]!r} is not a number")
+            elif isinstance(ha.get(key), (int, float)) and ha[key] < 0:
+                errors.append(f"ha_light ambient on {name}: {key} must "
+                              f"be >= 0")
+        # NOTE: night > day is allowed (and is the sample model's
+        # tuned state: night 0.2, day 0.05). The daytime fill comes
+        # from the hemisphere (0.6), so the ambient day is only a
+        # subtle lift, while at night the ambient is the ONLY fill
+        # (hemisphere 0) and must carry the floor alone. An earlier
+        # version of this check rejected night > day; the moonlight
+        # tuning (2026-11-24) showed that assumption was wrong.
+ha_by_name = dict(ha_nodes)
+tv_ha = ha_by_name.get("tv_screen")
+if tv_ha is None or tv_ha.get("type") != "area" or \
+        tv_ha.get("follows") != "living_room_tv":
+    errors.append("tv_screen must declare ha_light area following "
+                  "living_room_tv")
+# The sample model's tuned moonlit floor (see build_house_v2.py): night
+# is dimly visible, not black, and the directional moonlight adds the
+# patches. A rebuild that changes it must update this check too.
+AMBIENT_NIGHT = 0.2
+amb_ha = ha_by_name.get("ambient")
+if amb_ha is None or amb_ha.get("type") != "ambient":
+    errors.append("ambient marker must declare ha_light type ambient")
+elif amb_ha.get("night") != AMBIENT_NIGHT:
+    errors.append(f"ambient night is {amb_ha.get('night')}, expected "
+                  f"{AMBIENT_NIGHT} (the tuned moonlit floor)")
 
 # --- door openings: wall segment count sanity (doors add segments) ---
 wall_nodes = [n for n in nodes if n.get("name", "").startswith("wall_")]

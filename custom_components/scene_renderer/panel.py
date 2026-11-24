@@ -8,7 +8,8 @@ provides:
 - an authenticated HTTP view proxying the model GLB
   (``GET /api/scene_renderer/{entry_id}/model``), and
 - two websocket commands the panel uses to discover config entries and
-  fetch the mapping + effective camera configs + image entity ids.
+  fetch the light mapping + subscribed entities + effective camera
+  configs + image entity ids.
 
 Panel registration follows the exact pattern Home Assistant core itself
 uses in ``panel_custom`` (verified against HA core 2026.11.3):
@@ -202,7 +203,8 @@ async def websocket_panel_data(
     connection: websocket_api.ActiveConnection,
     msg: dict[str, Any],
 ) -> None:
-    """Return one entry's mapping, cameras and image entity ids.
+    """Return one entry's light mapping, entities, cameras and image
+    entity ids.
 
     Cameras are the service's effective configs (model + cameras.yaml +
     defaults, merged). Image entity ids are resolved through the entity
@@ -243,7 +245,17 @@ async def websocket_panel_data(
     connection.send_result(
         msg["id"],
         {
-            "mapping": dict(coordinator.mapping),
+            # THE light→entity mapping, from the script's lightMapping
+            # export (model light name -> entity id). The panel's
+            # Lights section shows it; the viewer drives each light
+            # from its mapped entity's state. Empty when no script is
+            # loaded (or the script declares no mapping).
+            "light_mapping": coordinator.script_light_mapping,
+            # Every entity the integration subscribes to (the YAML
+            # `entities` list + the script's subscriptions + the YAML
+            # object drivers), sorted. The panel's Entities section
+            # lists them with emulation controls.
+            "entities": coordinator.subscribed_entities,
             # YAML `objects` mapping (model object name -> driving
             # entity id), merged with the script's objectDrivers by
             # the panel for the Objects section (YAML wins).
@@ -254,6 +266,15 @@ async def websocket_panel_data(
             # sun.sun), so the viewer agrees with the rendered images.
             # None when the sun is disabled or has no state yet.
             "sun": coordinator.sun_position(),
+            # The moon position (lunar ephemeris for the HA config
+            # lat/lon and now), so the viewer shows moonlight at
+            # night. None when the sun is disabled.
+            "moon": coordinator.moon_position(),
+            # North offset (degrees, 0–360): the true-north azimuth
+            # the model's north side (-Z) faces. The viewer rotates
+            # its sun/moon azimuths by it (see _sunDirection), so the
+            # panel agrees with the renders.
+            "north_offset": coordinator.north_offset,
             # The script's subscriptions, resolved to entity IDs, and
             # its object drivers (model object name -> the entity
             # driving it), so the panel can list script-driven objects

@@ -7,21 +7,31 @@
 //
 // The script is a small ESM-style module:
 //   - export a default function update({ entities, scene, time, loop })
+//   - export `const lightMapping = {...}` mapping model light names to
+//     the entity that drives each one ({ living_room_1:
+//     "light.living_room" }). This is THE light→entity mapping — the
+//     YAML `lights` block is deprecated and ignored. update() applies
+//     it every frame (see applyLightMapping below): on -> model base x
+//     brightness, color from the entity, color_temp supported; lights
+//     not in the table render OFF. List the mapped entities in the
+//     YAML `entities` block so the integration subscribes to them.
 //   - optionally export `const subscribe = [...]` listing the entities
-//     the script reads (entity IDs, domains like "light.*", or globs
-//     like "sensor.*_temperature"). The integration sends only those
-//     entities (plus the mapped lights and sun.sun) and re-renders when
-//     one of them changes. No subscribe list -> the script only sees
-//     the mapped lights and sun.sun.
+//     the script reads beyond the YAML list (entity IDs, domains like
+//     "light.*", or globs like "sensor.*_temperature"). The
+//     integration sends the YAML entities plus these, and re-renders
+//     when one of them changes. No subscribe list -> the script only
+//     sees the YAML entities and sun.sun.
 //   - optionally export `const objectDrivers = {...}` mapping model
 //     object names to the entity that drives each one
 //     ({ ceiling_fan: "light.wizcolor1" }). The sidebar panel shows
 //     those objects with their driving entity and a toggle.
 //
 // Contract (important for clips):
-//   - The service re-applies the built-in light/sun mapping before every
-//     frame, then runs this script — so set ABSOLUTE values here, never
-//     increment (there is deliberately no dt parameter).
+//   - The service resets every light to its model base value before
+//     every frame, then runs this script — so set ABSOLUTE values
+//     here, never increment (there is deliberately no dt parameter).
+//     applyLightMapping below sets every light every frame, so no
+//     light is ever left at base intensity by accident.
 //   - `time` is seconds since the start of the clip; `loop` is 0..1
 //     across one loop of the clip. Both are OPTIONAL — destructure only
 //     what you use; a script that only maps entities never mentions them.
@@ -49,6 +59,32 @@ const FAN_ENTITY = "light.wizcolor1";
 const FAN_OBJECT = "ceiling_fan"; // group node: hub + 4 blades
 
 export const subscribe = [TV_ENTITY, FAN_ENTITY];
+
+// Which entity drives which model light. This is THE light→entity
+// mapping: update() applies it every frame (see applyLightMapping
+// below), the sidebar panel shows it in its Lights section, and the
+// integration warns when it references an entity that is not
+// subscribed (list the entities in the YAML `entities` block). Keys
+// are model light names; values are exact entity IDs, not patterns.
+// A light the model does not have is skipped quietly, so the same
+// file works against any model; a model light NOT in this table
+// renders OFF.
+export const lightMapping = {
+  living_room_1: "light.living_room",
+  living_room_2: "light.living_room_2",
+  living_room_3: "light.living_room_3",
+  living_room_4: "light.living_room_4",
+  living_room_tv: "light.lampy",
+  kitchen_1: "light.kitchen",
+  dining_1: "light.dining",
+  bedroom_1: "light.bedroom",
+  kids_bedroom_1: "light.kids_bedroom",
+  kids_bedroom_2: "light.kids_bedroom_2",
+  kids_bedroom_3: "light.kids_bedroom_3",
+  kids_bedroom_4: "light.kids_bedroom_4",
+  office_1: "light.office",
+  office_2: "light.office_2",
+};
 
 // Which entity drives which model object. The sidebar panel shows these
 // objects with their driving entity and a toggle — the flat subscribe
@@ -79,7 +115,72 @@ function hueToRgb(h) {
   return [v(1), v(0), v(1 - f)];
 }
 
+// An entity's color temperature in kelvin, from the kelvin attribute
+// or the legacy mireds attribute; null when the entity has neither.
+function colorTempKelvin(attrs) {
+  if (typeof attrs.color_temp_kelvin === "number") {
+    return attrs.color_temp_kelvin;
+  }
+  if (typeof attrs.color_temp === "number" && attrs.color_temp > 0) {
+    return 1000000 / attrs.color_temp;
+  }
+  return null;
+}
+
+// An entity's color as sRGB [r, g, b]: rgb_color, hs_color, xy_color,
+// or color temperature. color_temp mode prefers the temperature;
+// every other mode prefers the color, with the temperature as a
+// fallback. No color at all -> the light's model base color.
+function colorFromEntity(attrs, scene, baseColor) {
+  if (attrs.color_mode === "color_temp") {
+    const kelvin = colorTempKelvin(attrs);
+    if (kelvin !== null) return scene.kelvinToRgb(kelvin);
+    return baseColor;
+  }
+  if (Array.isArray(attrs.rgb_color) && attrs.rgb_color.length === 3) {
+    return attrs.rgb_color;
+  }
+  if (Array.isArray(attrs.hs_color) && attrs.hs_color.length === 2) {
+    return scene.hsToRgb(attrs.hs_color[0], attrs.hs_color[1]);
+  }
+  if (Array.isArray(attrs.xy_color) && attrs.xy_color.length === 2) {
+    return scene.xyToRgb(attrs.xy_color[0], attrs.xy_color[1]);
+  }
+  const kelvin = colorTempKelvin(attrs);
+  if (kelvin !== null) return scene.kelvinToRgb(kelvin);
+  return baseColor;
+}
+
+// Standard light mapping: drive every model light from its entity in
+// lightMapping. Run first in update(), before any special cases (the
+// TV block below overrides living_room_tv when the TV is on).
+//   - a mapped light whose entity is on shines at model base x
+//     brightness, in the entity's color (rgb/hs/xy, or color_temp);
+//   - a mapped light whose entity is off, unavailable, unknown, or
+//     missing renders OFF;
+//   - a light NOT in lightMapping renders OFF — every light gets an
+//     absolute value every frame, so nothing is ever left at the
+//     model's base intensity by accident.
+function applyLightMapping({ entities, scene }) {
+  for (const name of scene.listLights()) {
+    const light = scene.getLight(name);
+    const entity = entities[lightMapping[name]];
+    if (!entity || entity.state !== "on") {
+      light.intensity = 0;
+      continue;
+    }
+    const attrs = entity.attributes || {};
+    const brightness =
+      typeof attrs.brightness === "number" ? attrs.brightness / 255 : 1;
+    light.intensity = light.baseIntensity * brightness;
+    light.color = colorFromEntity(attrs, scene, light.baseColor);
+  }
+}
+
 export default function update({ entities, scene, time = 0, loop = 0 }) {
+  // Every model light, driven from lightMapping (unmapped -> off).
+  applyLightMapping({ entities, scene });
+
   // The TV and the fan are only in models that have them — a script
   // that throws on every frame is worse than a script that does
   // nothing, so each block bails out quietly when its model parts are
@@ -91,9 +192,9 @@ export default function update({ entities, scene, time = 0, loop = 0 }) {
     const screen = scene.getObject(TV_SCREEN);
 
     if (!on) {
-      // TV off: the screen goes dark, but the light is left alone —
-      // living_room_tv is mapped as a light in the YAML, so the
-      // mapped entity drives the glow when the TV is off.
+      // TV off: the screen goes dark, but the light keeps the value
+      // applyLightMapping gave it from lightMapping (light.lampy) —
+      // the mapped entity drives the glow when the TV is off.
       screen.visible = false;
     } else {
       // TV on: the screen shows and the light glows in front of the

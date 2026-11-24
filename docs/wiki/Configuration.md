@@ -21,12 +21,33 @@ scene_renderer:
 | `sun_azimuth` | — | Fix the sun at this azimuth (0–360°); requires `sun_elevation` |
 | `name` | `Scene Renderer` | Scene name, used for the device and entities |
 | `lights` | `{}` | Mapping of model light names (e.g. `living_room_1`) to HA light entity ids |
+| `objects` | `{}` | Mapping of model object names (e.g. `ceiling_fan`) to HA entity ids — see Mapping objects below |
 | `cameras` | all | Camera names to expose, one image entity each; omit to expose every camera the app offers |
 
 Only the lights you map follow live state; unmapped lights render at
 their model defaults (full brightness, model color), so the demo model
 needs no onboarding at all — a bare `scene_renderer:` line works, and
 the app is discovered automatically.
+
+### Mapping objects
+
+Like `lights`, but for model objects instead of lights: the object's
+driving entity shows in the panel's Objects section with a toggle,
+and the integration re-renders when the driver changes. The sample
+house's ceiling fan is the example:
+
+```yaml
+scene_renderer:
+  objects:
+    ceiling_fan: light.wizcolor1
+```
+
+The mapping only links object and entity — it does not animate the
+object. The fan still spins because `scene.js` spins it from that
+entity (the panel viewer spins it too, from the same emulated
+state). An object the model does not have is skipped quietly, so
+the same block works against any model. If the script's
+`objectDrivers` drives the same object, the YAML mapping wins.
 
 Changing the YAML needs a Home Assistant restart (standard for
 YAML-only integrations). To remove the integration, delete the block
@@ -143,6 +164,27 @@ The panel also re-fetches its data when the frontend reconnects
 after an HA restart, so a page loaded before the restart no longer
 keeps a stale mapping or sun forever.
 
+**0.3.8** adds an `objects` key to the YAML block: map model objects
+to entities the same way `lights` maps lights (e.g. `ceiling_fan:
+light.wizcolor1`) — mapped objects show in the panel's Objects
+section with their driving entity and a toggle, and the integration
+re-renders when a driver changes. A YAML object mapping wins over
+the script's `objectDrivers` for the same object. 0.3.8 also
+removes the `curtain_glow_*` lights 0.3.7 added: the curtain's glow
+is its own material (warm emissive where the sun hits it) and the
+room fill from a sunlit window is the bounce light — no separate
+glow light sources, nothing to map. The sample model's TV light
+moved to 4 cm in front of the screen face, so the glow reads as
+coming from the screen itself. 0.3.8 also fixes the bounce lights
+at a low sun: the patch is clamped to within 5 m of its window
+(about one room) and the bounce fades to 0 as the patch approaches
+that limit, so a low sun no longer throws the bounce into another
+room — high-sun behaviour is unchanged. 0.3.8 also fixes point
+lights leaking through thin interior walls: the point-light shadow
+depth bias is gone (it punched through 0.10 m walls in the
+perspective cube camera) and shadow acne is handled by the normal
+bias alone.
+
 ## How lights are rendered
 
 The integration normalizes each mapped entity into a parameter set:
@@ -163,7 +205,7 @@ The service applies the parameters on top of the **model's base values**: the mo
 
 Unmapped lights render at their model base values. One approximation to know about: in RGB color modes the brightness lives partly in the color itself (HA docs), so a natively-RGB light with a dark color renders slightly dimmer than its brightness value alone would suggest.
 
-A light the user script lights on its own shines and casts shadows: after the script runs, each light's visibility and shadow casting follow its effective intensity (`visible = castShadow = intensity > 0`), not the mapped entity's on/off — so the TV glow shines and casts while its mapped entity is off (three.js skips invisible lights entirely, so syncing the shadow flag alone left a script-lit light dark). Each point light's shadow map size (512, 1024, or 2048) comes from a deterministic hash of its name, so some lights cast soft shadows and others crisp ones. `curtain_glow_*` lights never cast shadows — they are diffuse re-emission from a sheer curtain, not point sources — but they do become visible when lit.
+A light the user script lights on its own shines and casts shadows: after the script runs, each light's visibility and shadow casting follow its effective intensity (`visible = castShadow = intensity > 0`), not the mapped entity's on/off — so the TV glow shines and casts while its mapped entity is off (three.js skips invisible lights entirely, so syncing the shadow flag alone left a script-lit light dark). Each point light's shadow map size (512, 1024, or 2048) comes from a deterministic hash of its name, so some lights cast soft shadows and others crisp ones.
 
 ## Light positions in the image
 
@@ -189,7 +231,7 @@ Each image entity also carries a `render_ms` attribute: the wall-clock milliseco
 
 With sun enabled, the service adds a directional light from `sun.sun`'s `azimuth` and `elevation` attributes: position, warm-to-neutral color by elevation, and intensity ramping in over the first 30° above the horizon. Below the horizon the sun is off and the interior lights carry the scene. Every light casts shadows — the sun and each model light (point lights use cube shadow maps); off lights cast nothing. Shadow maps in the panel viewer update only when a light or the sun changes, and motion clips render shadows once and freeze them for the rest of the clip.
 
-Sheer curtains (`SheerCurtain` material) cast a dithered partial shadow — about 45% of the sun gets through, broken up like a weave — and glow warm when the sun is on their side. Sunlight bouncing off the floor patch is emulated with one soft point light per sunlit window (models mark their windows with empty `window_<room>` nodes); `curtain_glow_*` lights are the curtain's own re-emitted light, driven from the sun by `scene.js`. Neither casts shadows. See [[Creating Your Own Scene]] for the conventions.
+Sheer curtains (`SheerCurtain` material) cast a dithered partial shadow — about 45% of the sun gets through, broken up like a weave — and glow warm when the sun is on their side (the glow is the curtain material's own emissive, where the sun hits it — there is no separate glow light). Sunlight bouncing off the floor patch is emulated with one soft point light per sunlit window (models mark their windows with empty `window_<room>` nodes); the bounce light never casts shadows — it is diffuse re-emission, not a point source. The patch stays within 5 m of its window (about one room) and the bounce fades to 0 as the patch approaches that limit, so a low sun never throws the bounce into another room. See [[Creating Your Own Scene]] for the conventions.
 
 Renders are debounced (~1 s after a light change), serialized, and at most one every ~2 s. The sun re-renders when its elevation crosses a 5° step, on sunrise/sunset, or at most every 15 minutes while it is up.
 

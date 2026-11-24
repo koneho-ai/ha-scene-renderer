@@ -7,9 +7,9 @@ The integration adds a **Scene Renderer** entry to the Home Assistant sidebar: a
 - **The model** — the same GLB the app renders, loaded from the app through the integration (the browser cannot reach the app directly). Drag to orbit, scroll to zoom, right-drag to pan.
 - **Light markers** — one marker at each model light's position, colored by the light's live state: on lights show their current color and brightness, off/unavailable lights are dim gray, unmapped lights are neutral white. Markers update live as entities change.
 - **Camera markers** — where each camera sits and where it points. Click one to jump the 3D viewer to that camera's viewpoint (adopting its projection — an orthographic camera views orthographic) and see its latest render. The side list shows every camera with its effective resolution.
-- **Object markers** (purple) — one on each script-driven object (the ceiling fan, the TV screen), so they are findable in the viewer. Click one for its driving entity and state.
+- **Object markers** (purple) — one on each mapped object (the ceiling fan, the TV screen), so they are findable in the viewer. Click one for its driving entity and state.
 - **Sun marker** — the sun's position from `sun.sun`, hidden while the sun is below the horizon.
-- **Side list** — every light (model name, mapped entity, live state), every script-driven object (object name, driving entity, live state), and every camera.
+- **Side list** — every light (model name, mapped entity, live state), every mapped object (object name, driving entity, live state), and every camera.
 - **Emulation-only toggles** — the light and object toggles do NOT call any HA service: flipping one sets a local preview override in the viewer only, so you can try "what if this light were on" without touching the real house. Overridden rows are marked "(preview)"; **Reset preview** (next to the Lights heading) clears all overrides and returns the viewer to the real entity states. Overrides are session-local (gone on reload) and never affect the renders. The fan spins in the viewer while its emulated state is on, and the TV toggle shows/hides the TV screen plus its light.
 - **Time-of-day sun slider** — a Sun section with a 00:00–24:00 slider moves the viewer's sun to the chosen time (computed from your latitude/longitude, shown with its elevation/azimuth). **Live** returns to the real sun. Viewer-only: it never affects the renders or the real sun.
 
@@ -22,7 +22,7 @@ The panel is a custom element registered by the integration (`frontend.async_reg
 Data comes from the integration, not the app: the app doesn't know the light mapping (it lives in the integration's YAML config), so the panel asks the integration over the websocket API:
 
 - `scene_renderer/panel_entries` — the configured scenes (YAML-only: exactly one).
-- `scene_renderer/panel_data` — for one scene: the light mapping (model light name → entity id), the cameras with their effective config, the image entity id per camera, the effective sun, and the script data (`script_entities`, `script_object_drivers`).
+- `scene_renderer/panel_data` — for one scene: the light mapping (model light name → entity id), the object mapping (model object name → driving entity id, from the YAML `objects` block), the cameras with their effective config, the image entity id per camera, the effective sun, and the script data (`script_entities`, `script_object_drivers`). The Objects section merges the YAML object mapping with the script's `objectDrivers`, YAML winning on conflict.
 
 The model itself comes from the app's `GET /model` endpoint, proxied by the integration at `/api/scene_renderer/<entry_id>/model` — the browser can't reach the app's internal address. The camera previews use the standard image proxy (`/api/image_proxy/<entity_id>`).
 

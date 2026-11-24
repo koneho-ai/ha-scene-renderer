@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Verify the rebuilt house-v2 GLB by parsing its JSON chunk directly
 (no image decoding needed, so no three.js/DOM workarounds).
-Checks: 16 lights (14 room with jittered values + 2 curtain glow at 0),
+Checks: 14 lights (13 room with jittered values + TV at base 14, no
+curtain_glow_* lights — removed 2026-11-24 at the user's request),
 2 cameras (overview top-down), ceiling_shadow + ShadowOnly material,
 fan/TV/door nodes, 8 window_* marker empties, SheerCurtain alpha 0.8
 BLEND + weave normal map, textures intact (13 images / 28 textures).
@@ -31,7 +32,10 @@ cameras = gltf.get("cameras", [])
 errors = []
 by_name = {n.get("name"): n for n in nodes}
 
-# --- lights: 16, jittered values, TV at base 14, glow at 0 ---
+# --- lights: 14, jittered values, TV at base 14 ---
+# (No curtain_glow_* lights — removed 2026-11-24 at the user's request:
+# the curtain glow comes from the SheerCurtain material itself and room
+# re-emission from the bounce lights. None may exist.)
 print(f"lights ({len(lights)}):")
 total = 0.0
 for li in lights:
@@ -39,46 +43,26 @@ for li in lights:
     inten = li["intensity"]
     color = li.get("color", [1, 1, 1])
     watts = inten / 54.35
-    if name != "living_room_tv" and not name.startswith("curtain_glow_"):
+    if name != "living_room_tv":
         total += watts
     print(f"  {name:16s} intensity {inten:7.2f}  ~{watts:.4f}W  "
           f"color ({color[0]:.3f}, {color[1]:.3f}, {color[2]:.3f})")
-if len(lights) != 16:
-    errors.append(f"expected 16 lights, got {len(lights)}")
+if len(lights) != 14:
+    errors.append(f"expected 14 lights, got {len(lights)}")
 tv = next((li for li in lights if li["name"] == "living_room_tv"), None)
 if tv is None or abs(tv["intensity"] - 14.0) > 0.5:
     errors.append("living_room_tv not at base 14")
-# curtain glow lights: base 0, warm white (1.0, 0.95, 0.85), at the
-# curtained windows (Blender (x, y, z) -> glTF (x, z, -y)).
-GLOW_EXPECTED = {
-    "curtain_glow_living_room": (-5.0, 1.5, -3.525),
-    "curtain_glow_bedroom": (-5.0, 1.5, 3.525),
-}
-for gname, gpos in GLOW_EXPECTED.items():
-    gl = next((li for li in lights if li["name"] == gname), None)
-    if gl is None:
-        errors.append(f"{gname} missing from KHR_lights_punctual")
-        continue
-    if abs(gl["intensity"]) > 0.01:
-        errors.append(f"{gname} intensity {gl['intensity']}, expected 0")
-    gc = gl.get("color", [1, 1, 1])
-    if any(abs(a - b) > 0.01 for a, b in zip(gc, (1.0, 0.95, 0.85))):
-        errors.append(f"{gname} color {gc}, expected (1.0, 0.95, 0.85)")
-    gnode = by_name.get(gname, {})
-    gt = gnode.get("translation")
-    if gt is None:
-        errors.append(f"{gname} node has no translation")
-    elif any(abs(a - b) > 0.01 for a, b in zip(gt, gpos)):
-        errors.append(f"{gname} at glTF {gt}, expected {gpos}")
-    else:
-        print(f"  {gname}: intensity 0, color (1.0, 0.95, 0.85), "
-              f"glTF pos ({gt[0]:.3f}, {gt[1]:.3f}, {gt[2]:.3f})")
-print(f"  room-light total (excl. TV, excl. glow): {total:.4f}W (was 9.2800W, "
+glow = [li["name"] for li in lights if li["name"].startswith("curtain_glow_")]
+if glow:
+    errors.append(f"curtain_glow_* lights must not exist, found {glow}")
+glow_nodes = [n for n in by_name if n.startswith("curtain_glow_")]
+if glow_nodes:
+    errors.append(f"curtain_glow_* nodes must not exist, found {glow_nodes}")
+print(f"  room-light total (excl. TV): {total:.4f}W (was 9.2800W, "
       f"ratio {total / 9.28:.4f})")
-# spread check: softest vs hardest room light (glow excluded — they are 0)
+# spread check: softest vs hardest room light
 room = [li["intensity"] for li in lights
-        if li["name"] != "living_room_tv"
-        and not li["name"].startswith("curtain_glow_")]
+        if li["name"] != "living_room_tv"]
 print(f"  intensity spread: min {min(room):.1f}  max {max(room):.1f}")
 
 # --- cameras: exactly 2, overview top-down ---
@@ -141,10 +125,8 @@ for room, prefix in TREATMENTS.items():
         errors.append(f"no treatment nodes for {room} (expected {prefix})")
 hb = [n for n in by_name if n.startswith("blinds_h_")]
 vb = [n for n in by_name if n.startswith("blinds_v_")]
-# curtain panels + rods only — the curtain_glow_* light nodes share the
-# "curtain_" prefix and must not be counted here.
-cu = [n for n in by_name
-      if n.startswith("curtain_") and not n.startswith("curtain_glow_")]
+# curtain panels + rods.
+cu = [n for n in by_name if n.startswith("curtain_")]
 print(f"  blinds_h nodes: {len(hb)} (expect 26: 2 rooms x 12 slats + 2 headrails)")
 print(f"  blinds_v nodes: {len(vb)} (expect 24: 2 rooms x 11 slats + 2 headrails)")
 print(f"  curtain nodes: {len(cu)} (expect 6: 2 rooms x 2 panels + 2 rods)")
@@ -199,6 +181,16 @@ markers = [n for n in nodes if n.get("name", "").startswith("window_")]
 print(f"  window markers: {len(markers)} (expect 8)")
 if len(markers) != 8:
     errors.append(f"expected 8 window_* markers, got {len(markers)}")
+
+# --- interior doors: 10 closed slabs (middle 4 + divN 3 + divS 3) ---
+# Slabs are named door_<name>; handles are door_<name>_handle and
+# frames are frame_door_<name>_*, so slabs = door_* minus handles.
+slabs = [n for n in nodes
+         if n.get("name", "").startswith("door_")
+         and "_handle" not in n["name"]]
+print(f"  interior door slabs: {len(slabs)} (expect 10)")
+if len(slabs) != 10:
+    errors.append(f"expected 10 interior door slabs, got {len(slabs)}")
 for mname, mpos in MARKER_EXPECTED.items():
     mn = by_name.get(mname)
     if mn is None:

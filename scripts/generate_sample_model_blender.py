@@ -77,7 +77,7 @@ LIGHTS = {
     "kids_bedroom_4": ( 1.0, -3.0, 0.64, (1.0, 0.88, 0.70)),
     "office_1":       ( 5.5, 1.2, 0.64, (1.0, 0.95, 0.88)),
     "office_2":       ( 6.5, 2.8, 0.64, (1.0, 0.95, 0.88)),
-    "living_room_tv": (-3.16, 2.0, 0.2576, (1.0, 1.0, 1.0)),  # base 14: mappable as a light; the script animates it when the TV is on
+    "living_room_tv": (-2.70, 2.0, 0.2576, (1.0, 1.0, 1.0)),  # base 14: mappable as a light; the script animates it when the TV is on — sits 4 cm in front of the screen face (-2.66), so the screen itself reads as the light source
 }
 TV_LIGHT_Z = 1.1
 
@@ -103,27 +103,11 @@ for _name, (_x, _y, _w, _c) in LIGHTS.items():
           f"color {_c} -> ({_nc[0]:.3f}, {_nc[1]:.3f}, {_nc[2]:.3f})")
 LIGHTS = _jittered
 
-# Curtain glow lights (renderer re-emission): two point lights the scene
-# script drives so sheer curtains re-emit warm diffuse light into the
-# room instead of passing sunlight straight through. Base intensity 0
-# (0 W) — dark unless the script lights them. Kept OUT of LIGHTS so the
-# jitter sequence above (and the 14 room lights' values) is untouched,
-# and so the exact warm-white color is never jittered.
-# Positions: window center x, 0.4 m inside the inner wall face, 1.5 m
-# high (window center height = WIN_SILL + WIN_H/2). The inner face of a
-# 0.15 m exterior wall centred on y=+-4.0 sits at y=+-3.925.
-# Names are a contract: the renderer keys on the `curtain_glow_` prefix.
-GLOW_LIGHTS = {
-    # (x, y, z, watts, (r, g, b))
-    "curtain_glow_living_room": (
-        (ROOMS["living_room"][0] + ROOMS["living_room"][1]) / 2,
-        4.0 - WALL_T_EXT / 2 - 0.4, WIN_SILL + WIN_H / 2,
-        0.0, (1.0, 0.95, 0.85)),
-    "curtain_glow_bedroom": (
-        (ROOMS["bedroom"][0] + ROOMS["bedroom"][1]) / 2,
-        -4.0 + WALL_T_EXT / 2 + 0.4, WIN_SILL + WIN_H / 2,
-        0.0, (1.0, 0.95, 0.85)),
-}
+# NOTE (2026-11-24): curtain glow lights REMOVED at the user's request —
+# he never asked for separate light sources for the curtains. The
+# curtain glow comes from the SheerCurtain material itself (renderer
+# emissive, sun-driven) and room re-emission comes from the patch
+# bounce lights (renderer, window_* markers). Do not re-add them.
 
 CAMERAS = {
     # overview is TOP-DOWN (user request): straight above the house,
@@ -292,9 +276,9 @@ M = {
 # layer is backlit (alpha 0.5 looked like glass, user feedback). It
 # exports as glTF alphaMode BLEND; the renderer gives SheerCurtain a
 # dithered partial shadow (~46% sun transmission) plus a warm emissive
-# glow, and drives the curtain_glow_* lights for re-emission — so the
-# alpha controls the LOOK (fabric vs glass) while the shadow behavior
-# lives in the renderer. The alpha lives on the Principled BSDF
+# glow on the sunlit parts, and the patch bounce lights re-emit sun
+# into the room — so the alpha controls the LOOK (fabric vs glass)
+# while the shadow behavior lives in the renderer. The alpha lives on the Principled BSDF
 # *Alpha socket*: Blender 5.3's exporter derives alphaMode from that
 # socket (not from the Base Color's 4th component, which it ignores,
 # and not from blend_method). verify_glb.py checks the exported alphaMode.
@@ -587,6 +571,50 @@ for x in (-2.5, 2.0, 4.75):
     wall_run(f"wall_div_S_{x}", "y", x, -4.05, 0.05,
              [door_opening(-2.0)], WALL_T_INT, M["wall"])
 
+# --- interior doors: CLOSED slabs in all 10 door openings ---
+# The openings were left open, so a light in one room shone through
+# the doorways into the next rooms (long diagonal bands across the
+# dining room, bedroom and kids room — the user read it as the walls
+# being transparent). Closed slabs make each room light-tight and the
+# doors visible, like the front door. The slab is slightly larger
+# than the opening (0.94 x 2.12 vs 0.9 x 2.1) so its edges sit inside
+# the wall segments and no hairline of light leaks around it.
+def interior_door(name, cx, cy, along_x):
+    """Closed door slab + frame + handle, centred at (cx, cy).
+    along_x: the wall runs along X (middle wall); else along Y."""
+    dt = WALL_T_INT + 0.04
+    dw = 0.07
+    if along_x:
+        box(f"door_{name}", cx, cy, DOOR_H / 2, 0.94, 0.05, 2.12, M["door"])
+        box(f"frame_door_{name}_L", cx - 0.45 - dw / 2, cy, DOOR_H / 2,
+            dw, dt, DOOR_H + dw, M["frame"])
+        box(f"frame_door_{name}_R", cx + 0.45 + dw / 2, cy, DOOR_H / 2,
+            dw, dt, DOOR_H + dw, M["frame"])
+        box(f"frame_door_{name}_T", cx, cy, DOOR_H + dw / 2,
+            DOOR_W + 2 * dw, dt, dw, M["frame"])
+        box(f"door_{name}_handle", cx + 0.32, cy - 0.045, 1.0,
+            0.14, 0.06, 0.03, M["fanmetal"])
+    else:
+        box(f"door_{name}", cx, cy, DOOR_H / 2, 0.05, 0.94, 2.12, M["door"])
+        box(f"frame_door_{name}_L", cx, cy - 0.45 - dw / 2, DOOR_H / 2,
+            dt, dw, DOOR_H + dw, M["frame"])
+        box(f"frame_door_{name}_R", cx, cy + 0.45 + dw / 2, DOOR_H / 2,
+            dt, dw, DOOR_H + dw, M["frame"])
+        box(f"frame_door_{name}_T", cx, cy, DOOR_H + dw / 2,
+            dt, DOOR_W + 2 * dw, dw, M["frame"])
+        box(f"door_{name}_handle", cx - 0.045, cy + 0.32, 1.0,
+            0.06, 0.14, 0.03, M["fanmetal"])
+
+# middle wall (y=0): living|bedroom, dining|kids, kitchen|bath1, office|bath2
+for i, cx in enumerate((-5.0, -0.5, 3.0, 6.0)):
+    interior_door(f"middle_{i}", cx, 0.0, True)
+# north dividers: living|dining, dining|kitchen, kitchen|office
+for i, x in enumerate((-2.5, 1.5, 4.5)):
+    interior_door(f"divN_{i}", x, 2.0, False)
+# south dividers: bedroom|kids, kids|bath1, bath1|bath2
+for i, x in enumerate((-2.5, 2.0, 4.75)):
+    interior_door(f"divS_{i}", x, -2.0, False)
+
 # --- shadow ceiling: invisible in the renderer, blocks top sunlight ---
 shadow_coll = bpy.data.collections.new("ShadowCeiling")
 bpy.context.scene.collection.children.link(shadow_coll)
@@ -802,20 +830,6 @@ for name, (x, y, watts, color) in LIGHTS.items():
     obj.location = (x, y, z)
     bpy.context.scene.collection.objects.link(obj)
     light_objs[name] = obj
-# curtain glow lights: same POINT setup, explicit z (window height),
-# base 0 W — the scene script drives them.
-for name, (x, y, z, watts, color) in GLOW_LIGHTS.items():
-    data = bpy.data.lights.new(name=name, type="POINT")
-    data.energy = watts
-    data.use_temperature = False
-    data.color = color
-    data.shadow_soft_size = 0.25
-    obj = bpy.data.objects.new(name=name, object_data=data)
-    obj.location = (x, y, z)
-    bpy.context.scene.collection.objects.link(obj)
-    light_objs[name] = obj
-    print(f"curtain glow light: {name} at ({x:.3f}, {y:.3f}, {z:.3f}), "
-          f"{watts} W, color {color}")
 
 # --- cameras ---
 cam_objs = {}

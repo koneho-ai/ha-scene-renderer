@@ -244,6 +244,10 @@ async def websocket_panel_data(
         msg["id"],
         {
             "mapping": dict(coordinator.mapping),
+            # YAML `objects` mapping (model object name -> driving
+            # entity id), merged with the script's objectDrivers by
+            # the panel for the Objects section (YAML wins).
+            "objects": dict(coordinator.objects),
             "cameras": cameras,
             "image_entities": image_entities,
             # The effective sun position (fixed override or live

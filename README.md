@@ -68,6 +68,7 @@ all.
 | `sun_entity` | `sun.sun` | Sun entity to follow; set to `null` to disable the sun |
 | `name` | `Scene Renderer` | Scene name, used for the device and entities |
 | `lights` | `{}` | Mapping of model light names (e.g. `living_room_1`) to HA light entity ids |
+| `objects` | `{}` | Mapping of model object names (e.g. `ceiling_fan`) to HA entity ids — the panel's Objects section lists them with their driving entity and a toggle |
 | `cameras` | all | Camera names to expose, one image entity each; omit to expose every camera the app offers |
 
 Changing the YAML needs a Home Assistant restart (standard for
@@ -181,6 +182,27 @@ and restart.
 > The panel also re-fetches its data when the frontend reconnects
 > after an HA restart, so a page loaded before the restart no longer
 > keeps a stale mapping or sun forever.
+>
+> **0.3.8** adds an `objects` key to the YAML block: map model objects
+> to entities the same way `lights` maps lights (e.g. `ceiling_fan:
+> light.wizcolor1`) — mapped objects show in the panel's Objects
+> section with their driving entity and a toggle, and the integration
+> re-renders when a driver changes. A YAML object mapping wins over
+> the script's `objectDrivers` for the same object. 0.3.8 also
+> removes the `curtain_glow_*` lights 0.3.7 added: the curtain's glow
+> is its own material (warm emissive where the sun hits it) and the
+> room fill from a sunlit window is the bounce light — no separate
+> glow light sources, nothing to map. The sample model's TV light
+> moved to 4 cm in front of the screen face, so the glow reads as
+> coming from the screen itself. 0.3.8 also fixes the bounce lights
+> at a low sun: the patch is clamped to within 5 m of its window
+> (about one room) and the bounce fades to 0 as the patch approaches
+> that limit, so a low sun no longer throws the bounce into another
+> room — high-sun behaviour is unchanged. 0.3.8 also fixes point
+> lights leaking through thin interior walls: the point-light shadow
+> depth bias is gone (it punched through 0.10 m walls in the
+> perspective cube camera) and shadow acne is handled by the normal
+> bias alone.
 
 ## What you get in Home Assistant
 
@@ -300,11 +322,15 @@ render shadows once and freeze them for the rest of the clip.
 
 Sheer curtains (`SheerCurtain` material) cast a dithered partial shadow —
 about 45% of the sun gets through, broken up like a weave — and glow warm
-when the sun is on their side. Sunlight bouncing off the floor patch is
-emulated with one soft point light per sunlit window (models mark their
-windows with empty `window_<room>` nodes); `curtain_glow_*` lights are the
-curtain's own re-emitted light, driven from the sun by `scene.js`. Neither
-casts shadows — both are diffuse re-emission, not point sources. See
+when the sun is on their side (the glow is the curtain material's own
+emissive, where the sun hits it — there is no separate glow light).
+Sunlight bouncing off the floor patch is emulated with one soft point
+light per sunlit window (models mark their windows with empty
+`window_<room>` nodes); the bounce light never casts shadows — it is
+diffuse re-emission, not a point source. The patch stays within 5 m
+of its window (about one room) and the bounce fades to 0 as the patch
+approaches that limit, so a low sun never throws the bounce into
+another room. See
 Creating Your Own Scene in the wiki for the conventions.
 
 ## Models
@@ -498,10 +524,7 @@ intensity, so setting `intensity` alone is enough. The scene API:
 `lookAt`), `getSun()`, `setMorph(object, morph, weight)`,
 `kelvinToRgb(k)`, plus `hasLight` / `hasObject` / `listLights` /
 `listObjects`. The script runs sandboxed in a SES Compartment: no
-`process`, no `require`, no network, no imports, no `eval`. The
-example script also drives the `curtain_glow_*` lights from the sun
-(see The sun above) — guarded with `hasLight`, so models without them
-run clean.
+`process`, no `require`, no network, no imports, no `eval`.
 
 ## Render service API
 

@@ -27,6 +27,12 @@ Full reference (all keys optional):
   (default "Scene Renderer").
 - ``lights``: mapping of model light names to HA entity ids. Only
   mapped lights follow live state; the rest render at base values.
+- ``objects``: mapping of model object names (e.g. the ``ceiling_fan``
+  group) to HA entity ids. The panel lists mapped objects in its
+  Objects section with their driving entity and a toggle, and the
+  integration re-renders when a driver entity changes. A YAML object
+  mapping wins over the script's ``objectDrivers`` for the same
+  object; the script still animates the object.
 - ``cameras``: camera names to expose, one image entity each; when
   omitted, all cameras the service offers.
 
@@ -51,6 +57,7 @@ from homeassistant.util import slugify
 from .const import (
     CONF_CAMERAS,
     CONF_LIGHTS,
+    CONF_OBJECTS,
     CONF_SERVICE_URL,
     CONF_SUN_AZIMUTH,
     CONF_SUN_ELEVATION,
@@ -103,6 +110,9 @@ CONFIG_SCHEMA = vol.Schema(
                         ),
                         vol.Optional(CONF_NAME, default=DEFAULT_NAME): cv.string,
                         vol.Optional(CONF_LIGHTS, default={}): {
+                            cv.string: cv.entity_id
+                        },
+                        vol.Optional(CONF_OBJECTS, default={}): {
                             cv.string: cv.entity_id
                         },
                         vol.Optional(CONF_CAMERAS): [cv.string],
@@ -196,6 +206,7 @@ async def async_setup(hass: HomeAssistant, config: dict[str, Any]) -> bool:
         sun_elevation=conf.get(CONF_SUN_ELEVATION),
         sun_azimuth=conf.get(CONF_SUN_AZIMUTH),
         mapping=conf.get(CONF_LIGHTS, {}),
+        objects=conf.get(CONF_OBJECTS, {}),
         cameras=conf.get(CONF_CAMERAS),
         name=conf.get(CONF_NAME, DEFAULT_NAME),
     )

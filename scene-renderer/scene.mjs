@@ -47,8 +47,7 @@
 //   - After the user script runs, castShadow is synced to the light's
 //     effective intensity (castShadow = intensity > 0), so a light the
 //     script lights on its own (the TV glow while its mapped entity is
-//     off) casts shadows too. Exception: curtain_glow_* lights never
-//     cast (diffuse re-emission, not point sources).
+//     off) casts shadows too.
 //   - SheerCurtain meshes cast a partial, dithered shadow (~45% of the
 //     sun gets through, broken up like a weave) and glow warm when the
 //     sun is on their side (see updateCurtainGlow).
@@ -73,12 +72,18 @@ const DEFAULT_CLEAR_ALPHA = 0;
 // light's shadows look the same on every render. A 2048 cube map is
 // ~100 MB (6 faces x 2048^2 x 4 B), but only lights that are ON
 // allocate one, and the hash spreads the 14 sample lights 7/4/3 across
-// the sizes (worst case, all on: ~426 MB). Bias values are tuned for
-// the flat low-poly surfaces of interior models: too little bias shows
-// acne, too much detaches shadows from their casters (peter-panning).
-// The sun keeps its own -0.0005 (proven in production).
+// the sizes (worst case, all on: ~426 MB). Bias: the depth bias is
+// ZERO — in a perspective cube shadow camera (near 0.1, far ~26 m)
+// a -0.004 NDC bias is ~0.3-0.5 m of world depth at 4-5 m from the
+// light, which punches straight through a 0.10 m interior wall (the
+// dining-room leak, 0.3.8). Acne is handled by the normal bias
+// alone (0.02 m along the surface normal — it offsets the sample
+// point, not the depth, so a thin wall still blocks). Too much
+// normal bias detaches shadows from their casters (peter-panning).
+// The sun keeps its own -0.0005 (proven in production; ortho camera,
+// only ~1.7 cm of leak, harmless).
 export const POINT_SHADOW_MAP_SIZES = [512, 1024, 2048];
-const POINT_SHADOW_BIAS = -0.004;
+const POINT_SHADOW_BIAS = 0;
 const POINT_SHADOW_NORMAL_BIAS = 0.02;
 
 // Shadow map size for one light, from a deterministic hash of its name
@@ -117,15 +122,14 @@ const SHADOW_ONLY_MATERIAL = "ShadowOnly";
 //     intensity proportional to sun intensity x alignment (see
 //     updateCurtainGlow). Each curtain mesh gets its own clone of the
 //     shared material so the two windows can glow independently.
-// Lights named curtain_glow_* are the curtain's re-emitted light (see
-// scene.example.js): diffuse re-emission, not point sources, so they
-// never cast shadows — see syncLightVisibilityAndShadow.
+//   The curtain's own glow is the material emissive, not a light:
+//   the room fill from a sunlit window comes from the bounce lights
+//   below, not from a separate glow light.
 const SHEER_CURTAIN_MATERIAL = "SheerCurtain";
 const CURTAIN_DITHER_DISCARD = 0.35;
 const CURTAIN_DITHER_CELL_M = 0.02;
 const CURTAIN_GLOW_COLOR = 0xfff2dd;
 const CURTAIN_GLOW_SCALE = 0.3;
-export const CURTAIN_GLOW_LIGHT_PREFIX = "curtain_glow_";
 
 // Bounce lights (emulated indirect illumination): when the sun shines
 // through a window, the bright patch on the floor re-illuminates the
@@ -137,12 +141,16 @@ export const CURTAIN_GLOW_LIGHT_PREFIX = "curtain_glow_";
 //   - transmission: how much sun the window's treatment lets through,
 //     by room (the bundled model has a fixed treatment per room;
 //     unknown rooms default to a bare window, 1.0). A curtained window
-//     gets BOTH a dim patch bounce and its curtain_glow_* light; a
-//     bare window gets a full bounce and no glow.
+//     gets a dim patch bounce (the curtain's own glow is its material
+//     emissive, not a light); a bare window gets a full bounce.
 //   - the bounce light never casts shadows (diffuse re-emission), has
 //     a short range (~room size), and peaks at ~20% of the direct
-//     sun's effect at 2 m (BOUNCE_SCALE), so the two re-emission
-//     paths never double-count into a blowout.
+//     sun's effect at 2 m (BOUNCE_SCALE), so the bounce lifts the
+//     room without blowing it out.
+//   - the patch never wanders further than one room from its window:
+//     past 3 m the intensity fades out, and at 5 m it is gone (a low
+//     sun used to throw the patch ~10 m across the house, where the
+//     whole-house bounds clamp stacked it in the wrong room).
 export const WINDOW_MARKER_PREFIX = "window_";
 export const WINDOW_TRANSMISSION = {
   living_room: 0.35, // sheer curtains
@@ -163,6 +171,15 @@ const BOUNCE_FLOOR_ALBEDO = 0.5; // warm wood floor
 const BOUNCE_HEIGHT_ABOVE_PATCH = 1.0;
 const BOUNCE_SCALE = 2.0;
 const BOUNCE_WARM = [1.0, 0.9, 0.75];
+// A low sun throws the patch far (~10 m at 9 deg elevation) — past
+// the room, into another one. The patch is clamped to within
+// BOUNCE_MAX_PATCH_DISTANCE of its window (about one room), and the
+// intensity fades linearly to 0 between BOUNCE_FADE_START_DISTANCE
+// and the max, so there is no popping as the sun moves. High-sun
+// patches sit ~1-1.5 m from the window, well inside the fade start,
+// so the high-sun lift is unchanged.
+const BOUNCE_MAX_PATCH_DISTANCE = 5;
+const BOUNCE_FADE_START_DISTANCE = 3;
 
 // Inject a world-space dither discard into a depth material's shaders:
 // fragments in ~55% of the 2 cm cells are discarded, so the shadow is a
@@ -369,9 +386,7 @@ export async function loadModel(arrayBuffer) {
       // lights: 2D maps). Shadow camera near/far are set after the
       // bounds are known, below. applyLightStates switches castShadow
       // off with the light, so off lights cost no shadow passes.
-      // Exception: curtain_glow_* lights are diffuse re-emission and
-      // never cast (see syncLightVisibilityAndShadow).
-      obj.castShadow = !obj.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX);
+      obj.castShadow = true;
       if (obj.shadow) {
         // Per-light shadow softness: the map size comes from the light's
         // name (see shadowMapSizeForLight). Set at load time, before the
@@ -563,17 +578,13 @@ export function applyLightStates(lights, params) {
 // without this sync that light would stay invisible (three.js skips
 // invisible lights entirely: no illumination, no shadow) and shine
 // without casting any shadow. A script that dims a mapped-on light
-// to 0 hides it and stops its shadow the same way. Exception:
-// curtain_glow_* lights are diffuse re-emission from a sheer curtain,
-// not point sources, so they NEVER cast shadows (no hard shadows
-// from a glow) — but they still become visible when lit. Exported
-// for tests.
+// to 0 hides it and stops its shadow the same way. No exceptions:
+// every lit light casts. Exported for tests.
 export function syncLightVisibilityAndShadow(lights) {
-  for (const [name, light] of lights) {
+  for (const light of lights.values()) {
     const lit = light.intensity > 0;
     light.visible = lit;
-    light.castShadow =
-      lit && !name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX);
+    light.castShadow = lit;
   }
 }
 
@@ -620,14 +631,16 @@ export function updateCurtainGlow(model) {
 // intersection of the sunlight ray through the window center with the
 // floor plane (no scene raycast: cheap, deterministic, and the exact
 // patch shape does not matter for a diffuse light). A low sun throws
-// the patch far, so it is clamped inside the house — in reality the
-// patch would hit the far wall. Intensity is sun intensity x window
-// transmission x floor albedo x alignment (the window's projected
-// area) x BOUNCE_SCALE; color is the sun color warmed. The light is
-// created once at load and repositioned per frame, intensity 0 when
-// its window is dark. Called per frame after the user script (the
-// script can move the sun), next to updateCurtainGlow. Exported for
-// tests.
+// the patch far, so it is clamped to within 5 m of its window (about
+// one room) and the intensity fades to 0 as the patch approaches that
+// limit — without the clamp the patch crossed the house and the
+// whole-house bounds clamp stacked it in the wrong room. Intensity is
+// sun intensity x window transmission x floor albedo x alignment (the
+// window's projected area) x BOUNCE_SCALE x the distance fade; color
+// is the sun color warmed. The light is created once at load and
+// repositioned per frame, intensity 0 when its window is dark. Called
+// per frame after the user script (the script can move the sun), next
+// to updateCurtainGlow. Exported for tests.
 export function updateBounceLights(model) {
   const windows = model.windows || [];
   if (windows.length === 0) return;
@@ -658,6 +671,27 @@ export function updateBounceLights(model) {
       continue;
     }
     const patch = w.position.clone().addScaledVector(sunDir, t);
+    // A low sun throws the patch far — clamp it to within one room
+    // of its window (the whole-house bounds clamp below used to let
+    // it land in a different room entirely), and fade the intensity
+    // out as the patch approaches the limit so there is no popping
+    // as the sun moves.
+    const dx = patch.x - w.position.x;
+    const dz = patch.z - w.position.z;
+    const patchDistance = Math.hypot(dx, dz);
+    const fade =
+      patchDistance <= BOUNCE_FADE_START_DISTANCE
+        ? 1
+        : Math.max(
+            0,
+            (BOUNCE_MAX_PATCH_DISTANCE - patchDistance) /
+              (BOUNCE_MAX_PATCH_DISTANCE - BOUNCE_FADE_START_DISTANCE),
+          );
+    if (patchDistance > BOUNCE_MAX_PATCH_DISTANCE) {
+      const s = BOUNCE_MAX_PATCH_DISTANCE / patchDistance;
+      patch.x = w.position.x + dx * s;
+      patch.z = w.position.z + dz * s;
+    }
     if (bounds) {
       patch.x = Math.min(
         Math.max(patch.x, bounds.min.x + 0.2),
@@ -675,7 +709,8 @@ export function updateBounceLights(model) {
       w.transmission *
       BOUNCE_FLOOR_ALBEDO *
       BOUNCE_SCALE *
-      alignment;
+      alignment *
+      fade;
     w.light.color
       .copy(sun.color)
       .multiply(new THREE.Color(BOUNCE_WARM[0], BOUNCE_WARM[1], BOUNCE_WARM[2]));

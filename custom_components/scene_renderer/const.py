@@ -16,6 +16,7 @@ CONF_SUN_ENTITY = "sun_entity"
 CONF_SUN_ELEVATION = "sun_elevation"
 CONF_SUN_AZIMUTH = "sun_azimuth"
 CONF_LIGHTS = "lights"
+CONF_OBJECTS = "objects"
 CONF_CAMERAS = "cameras"
 
 # Default sun entity, and the default scene name.

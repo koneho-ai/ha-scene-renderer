@@ -62,17 +62,12 @@ const ON_STATES = new Set(["on", "playing", "paused", "idle"]);
 //   the sun gets through, broken up like a weave) and glows warm when
 //   the sun is on its side (see _updateCurtainGlow);
 // - a mesh whose materials are all transparent (glass) casts no shadow.
-// Lights named curtain_glow_* are diffuse re-emission from a sheer
-// curtain, not point sources: they never cast shadows.
 const SHADOW_ONLY_MATERIAL = "ShadowOnly";
 const SHEER_CURTAIN_MATERIAL = "SheerCurtain";
-const CURTAIN_GLOW_LIGHT_PREFIX = "curtain_glow_";
 const CURTAIN_DITHER_DISCARD = 0.35;
 const CURTAIN_DITHER_CELL_M = 0.02;
 const CURTAIN_GLOW_COLOR = 0xfff2dd;
 const CURTAIN_GLOW_SCALE = 0.3;
-const CURTAIN_GLOW_MAX = 10;
-const CURTAIN_GLOW_RGB = [255, 240, 214];
 
 // Bounce lights (mirror scene.mjs updateBounceLights): empty nodes
 // named window_<room> mark the windows; each sunlit window gets one
@@ -94,6 +89,15 @@ const BOUNCE_FLOOR_ALBEDO = 0.5;
 const BOUNCE_HEIGHT_ABOVE_PATCH = 1.0;
 const BOUNCE_SCALE = 2.0;
 const BOUNCE_WARM = [1.0, 0.9, 0.75];
+// A low sun throws the patch far (~10 m at 9 deg elevation) — past
+// the room, into another one. The patch is clamped to within
+// BOUNCE_MAX_PATCH_DISTANCE of its window (about one room), and the
+// intensity fades linearly to 0 between BOUNCE_FADE_START_DISTANCE
+// and the max, so there is no popping as the sun moves. High-sun
+// patches sit ~1-1.5 m from the window, well inside the fade start,
+// so the high-sun lift is unchanged. (Mirror scene.mjs.)
+const BOUNCE_MAX_PATCH_DISTANCE = 5;
+const BOUNCE_FADE_START_DISTANCE = 3;
 
 function materialsOf(obj) {
   if (Array.isArray(obj.material)) return obj.material;
@@ -326,7 +330,7 @@ class SceneRendererPanel extends HTMLElement {
     this._loadState = "loading"; // loading | ready | error | no-entries
     this._entries = [];
     this._entryId = null;
-    this._panelData = null; // { mapping, cameras, image_entities, sun, script_entities, script_object_drivers }
+    this._panelData = null; // { mapping, objects, cameras, image_entities, sun, script_entities, script_object_drivers }
     this._stateMap = new Map();
 
     // three.js objects (created once, model swapped per entry)
@@ -343,7 +347,7 @@ class SceneRendererPanel extends HTMLElement {
     this._lightMarkers = []; // { name, mesh, baseRadius }
     this._modelLights = []; // { name, light, baseIntensity, baseColor }
     this._cameraMarkers = []; // { name, group }
-    this._scriptObjects = []; // { name, entityId, object } — script-driven objects from objectDrivers
+    this._scriptObjects = []; // { name, entityId, object } — driven objects: the YAML `objects` mapping merged with the script's objectDrivers (YAML wins on conflict)
     this._curtains = []; // { name, mesh, material, outward } — sheer curtains, for the glow + dithered shadow
     this._windows = []; // { name, room, position, outward, transmission, light } — window markers, for the bounce lights
     this._floorY = 0; // floor plane for the bounce patch (bottom of the model bounds)
@@ -1310,15 +1314,18 @@ class SceneRendererPanel extends HTMLElement {
       // The map size comes from the light's name (256/512/1024), so
       // some lights cast soft shadows and others crisp ones — the same
       // hash the render service uses, one step lighter so the
-      // browser's shadow memory stays modest. Exception:
-      // curtain_glow_* lights are diffuse re-emission and never cast.
-      obj.castShadow = !obj.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX);
+      // browser's shadow memory stays modest.
+      obj.castShadow = true;
       if (obj.shadow) {
         const mapSize = shadowMapSizeForLight(obj.name);
         obj.shadow.mapSize.set(mapSize, mapSize);
         obj.shadow.camera.near = 0.1;
         obj.shadow.camera.far = radius * 3;
-        obj.shadow.bias = -0.004;
+        // No depth bias: in a perspective cube camera -0.004 NDC is
+        // ~0.3-0.5 m of world depth at 4-5 m, which punches through a
+        // 0.10 m interior wall (the dining-room leak, 0.3.8). The
+        // normal bias alone handles acne — mirror scene.mjs.
+        obj.shadow.bias = 0;
         obj.shadow.normalBias = 0.02;
       }
       this._modelLights.push({
@@ -1364,9 +1371,7 @@ class SceneRendererPanel extends HTMLElement {
     // Sheer curtains: each mesh gets its own clone of the shared
     // material (so the two windows can glow independently) with a warm
     // emissive that _updateCurtainGlow drives, and its outward normal
-    // (derived from the mesh, not hardcoded per room). Glow lights take
-    // the facing of their nearest curtain (each sits just inside its
-    // window).
+    // (derived from the mesh, not hardcoded per room).
     this._finalizeCurtains();
 
     // Bounce-light windows: one renderer-owned point light per
@@ -1375,7 +1380,7 @@ class SceneRendererPanel extends HTMLElement {
   }
 
   _finalizeCurtains() {
-    if (this._curtains.length === 0 && !this._modelLights.some((e) => e.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX))) {
+    if (this._curtains.length === 0) {
       return;
     }
     this._modelGroup.updateMatrixWorld(true);
@@ -1396,26 +1401,6 @@ class SceneRendererPanel extends HTMLElement {
         curtain.material = clone;
       }
       curtain.outward = curtainOutwardNormal(curtain.mesh, this._modelCenter);
-    }
-    // A glow light's facing is its nearest curtain's outward normal.
-    // (Bounding-box centers, not node positions — the curtain nodes
-    // sit at the origin with baked world-space geometry.)
-    for (const entry of this._modelLights) {
-      if (!entry.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX)) continue;
-      let best = null;
-      let bestDist = Infinity;
-      const pos = entry.light.getWorldPosition(new THREE.Vector3());
-      for (const curtain of this._curtains) {
-        const curtainCenter = new THREE.Box3()
-          .setFromObject(curtain.mesh)
-          .getCenter(new THREE.Vector3());
-        const d = pos.distanceTo(curtainCenter);
-        if (d < bestDist) {
-          bestDist = d;
-          best = curtain;
-        }
-      }
-      entry.glowFacing = best ? best.outward : null;
     }
   }
 
@@ -1443,10 +1428,12 @@ class SceneRendererPanel extends HTMLElement {
     }
   }
 
-  // Collect the script-driven objects for the Objects section: the
-  // script's objectDrivers map model object names to the entity driving
-  // each one. Only objects that exist in this model are listed — the
-  // same scene.js works against any model, so a driver for an object
+  // Collect the driven objects for the Objects section: the YAML
+  // `objects` mapping (panel_data.objects) merged with the script's
+  // objectDrivers — YAML wins when both drive the same object, so a
+  // fan mapped in configuration.yaml beats the script's driver for
+  // it. Only objects that exist in this model are listed — the same
+  // scene.js works against any model, so a driver for an object
   // this model does not have is skipped quietly. Runs at scene build
   // and again after a reconnect refresh (the drivers come from
   // panel_data, so they can appear or change). Also rebuilds the 3D
@@ -1454,8 +1441,10 @@ class SceneRendererPanel extends HTMLElement {
   _collectScriptObjects() {
     this._scriptObjects = [];
     if (!this._modelGroup) return;
-    const drivers =
-      (this._panelData && this._panelData.script_object_drivers) || {};
+    const drivers = {
+      ...((this._panelData && this._panelData.script_object_drivers) || {}),
+      ...((this._panelData && this._panelData.objects) || {}),
+    };
     for (const [name, entityId] of Object.entries(drivers)) {
       if (typeof entityId !== "string") continue;
       const obj = this._modelGroup.getObjectByName(name);
@@ -1594,33 +1583,6 @@ class SceneRendererPanel extends HTMLElement {
 
   /** Marker color/opacity/scale for one model light from its HA entity. */
   _lightAppearance(modelName) {
-    // Curtain glow lights are sun-driven, not entity-driven: their
-    // appearance comes from the effective sun and the window's facing
-    // (same math as the render service's scene.example.js), so the
-    // marker and list show the glow the viewer is actually rendering.
-    if (modelName.startsWith(CURTAIN_GLOW_LIGHT_PREFIX)) {
-      const entry = this._modelLights.find((e) => e.name === modelName);
-      const intensity = entry
-        ? this._curtainGlowIntensity(entry.glowFacing)
-        : 0;
-      if (intensity <= 0) {
-        return {
-          rgb: [0x3a, 0x3f, 0x44],
-          opacity: 0.55,
-          scale: 1,
-          brightness: 0,
-          state: "off",
-        };
-      }
-      const frac = Math.min(1, intensity / CURTAIN_GLOW_MAX);
-      return {
-        rgb: CURTAIN_GLOW_RGB,
-        opacity: 0.35 + 0.65 * frac,
-        scale: 0.85 + 0.3 * frac,
-        brightness: frac,
-        state: "sun",
-      };
-    }
     const mapping = (this._panelData && this._panelData.mapping) || {};
     const entityId = mapping[modelName];
     if (!entityId) {
@@ -1692,15 +1654,6 @@ class SceneRendererPanel extends HTMLElement {
   brightness no matter what HA said. */
   _updateModelLights() {
     for (const entry of this._modelLights) {
-      if (entry.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX)) {
-        // Sun-driven, not entity-driven: the sun path
-        // (_updateCurtainGlow, via _updateSunLight) owns the intensity
-        // — the viewer mirrors scene.example.js, which drives these
-        // lights from the sun. They never cast shadows (diffuse
-        // re-emission, not point sources).
-        entry.light.castShadow = false;
-        continue;
-      }
       const app = this._lightAppearance(entry.name);
       if (app.state === "unmapped") {
         entry.light.intensity = entry.baseIntensity;
@@ -1878,9 +1831,9 @@ class SceneRendererPanel extends HTMLElement {
   horizon to 3.0 at 30 degrees, color warms toward the horizon, and
   the hemisphere follows (0.06 at night, 0.15-0.6 by day, 0.5 when no
   sun state is available). Below the horizon the sun light is off.
-  Also drives the sheer curtains' glow and the curtain_glow_* lights
-  (see _updateCurtainGlow) and the bounce lights (see
-  _updateBounceLights) — all follow the same effective sun. */
+  Also drives the sheer curtains' glow (see _updateCurtainGlow) and
+  the bounce lights (see _updateBounceLights) — all follow the same
+  effective sun. */
   _updateSunLight() {
     if (!this._sunLight || !this._hemi) return;
     const sun = this._effectiveSun();
@@ -1923,38 +1876,17 @@ class SceneRendererPanel extends HTMLElement {
     this._requestShadowUpdate();
   }
 
-  // One curtain glow light's intensity from the effective sun and the
-  // window's facing (mirror scene.example.js): full when the sun is
-  // square on the window, zero when it is behind the house or below
-  // the horizon. The cos(elevation) term is the 3D dot product — a
-  // high sun shines through a vertical window less than a low one.
-  _curtainGlowIntensity(facing) {
-    if (!facing) return 0;
-    const sun = this._effectiveSun();
-    if (!sun || sun.elevation <= 0) return 0;
-    const dir = this._sunDirection(sun.azimuth, sun.elevation);
-    const alignment = Math.max(0, dir.dot(facing));
-    const dayFrac = Math.min(1, Math.max(0, sun.elevation / 30));
-    return CURTAIN_GLOW_MAX * dayFrac * alignment;
-  }
-
   // Sheer-curtain glow (mirror scene.mjs updateCurtainGlow): a curtain
   // glows warm when the sun is on its side, with intensity proportional
   // to sun intensity x alignment; zero when the sun is on the other
-  // side or below the horizon. Also drives the curtain_glow_* point
-  // lights from the sun — the viewer does not run scene.js, so this is
-  // the viewer's own copy of that logic (same math, same constants).
+  // side or below the horizon. The glow is the curtain material's
+  // emissive — there is no separate glow light.
   _updateCurtainGlow() {
     const sun = this._effectiveSun();
     const sunI = this._sunLight ? this._sunLight.intensity : 0;
     if (!sun || sun.elevation <= 0 || sunI <= 0) {
       for (const c of this._curtains) {
         if (c.material) c.material.emissiveIntensity = 0;
-      }
-      for (const entry of this._modelLights) {
-        if (entry.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX)) {
-          entry.light.intensity = 0;
-        }
       }
       return;
     }
@@ -1964,24 +1896,17 @@ class SceneRendererPanel extends HTMLElement {
       const alignment = Math.max(0, dir.dot(c.outward));
       c.material.emissiveIntensity = CURTAIN_GLOW_SCALE * sunI * alignment;
     }
-    for (const entry of this._modelLights) {
-      if (!entry.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX)) continue;
-      entry.light.intensity = this._curtainGlowIntensity(entry.glowFacing);
-      entry.light.color.setRGB(
-        CURTAIN_GLOW_RGB[0] / 255,
-        CURTAIN_GLOW_RGB[1] / 255,
-        CURTAIN_GLOW_RGB[2] / 255,
-        THREE.SRGBColorSpace,
-      );
-    }
   }
 
   // Bounce lights (mirror scene.mjs updateBounceLights): for each
   // window marker, when the effective sun is above the horizon and on
   // the window's side, place a soft point light just above the sun
-  // patch on the floor — the patch re-illuminating the room. Called
-  // from _updateSunLight on all paths, so the sun slider moves the
-  // bounce with the sun, like the curtain glow.
+  // patch on the floor — the patch re-illuminating the room. The
+  // patch is clamped to within 5 m of its window and the intensity
+  // fades to 0 as it approaches that limit, so a low sun never
+  // throws the bounce into another room. Called from _updateSunLight
+  // on all paths, so the sun slider moves the bounce with the sun,
+  // like the curtain glow.
   _updateBounceLights() {
     if (this._windows.length === 0) return;
     const sun = this._effectiveSun();
@@ -2008,6 +1933,27 @@ class SceneRendererPanel extends HTMLElement {
         continue;
       }
       const patch = w.position.clone().addScaledVector(sunDir, t);
+      // A low sun throws the patch far — clamp it to within one room
+      // of its window (the whole-house bounds clamp below used to let
+      // it land in a different room entirely), and fade the intensity
+      // out as the patch approaches the limit so there is no popping
+      // as the sun moves. (Mirror scene.mjs.)
+      const dx = patch.x - w.position.x;
+      const dz = patch.z - w.position.z;
+      const patchDistance = Math.hypot(dx, dz);
+      const fade =
+        patchDistance <= BOUNCE_FADE_START_DISTANCE
+          ? 1
+          : Math.max(
+              0,
+              (BOUNCE_MAX_PATCH_DISTANCE - patchDistance) /
+                (BOUNCE_MAX_PATCH_DISTANCE - BOUNCE_FADE_START_DISTANCE),
+            );
+      if (patchDistance > BOUNCE_MAX_PATCH_DISTANCE) {
+        const s = BOUNCE_MAX_PATCH_DISTANCE / patchDistance;
+        patch.x = w.position.x + dx * s;
+        patch.z = w.position.z + dz * s;
+      }
       if (bounds) {
         patch.x = Math.min(
           Math.max(patch.x, bounds.min.x + 0.2),
@@ -2021,7 +1967,7 @@ class SceneRendererPanel extends HTMLElement {
       patch.y = this._floorY + BOUNCE_HEIGHT_ABOVE_PATCH;
       w.light.position.copy(patch);
       w.light.intensity =
-        sunI * w.transmission * BOUNCE_FLOOR_ALBEDO * BOUNCE_SCALE * alignment;
+        sunI * w.transmission * BOUNCE_FLOOR_ALBEDO * BOUNCE_SCALE * alignment * fade;
       w.light.color
         .copy(this._sunLight.color)
         .multiply(
@@ -2113,11 +2059,7 @@ class SceneRendererPanel extends HTMLElement {
       nameEl.textContent = marker.name;
       const sub = document.createElement("div");
       sub.className = "row-sub";
-      sub.textContent = entityId
-        ? entityId
-        : marker.name.startsWith(CURTAIN_GLOW_LIGHT_PREFIX)
-          ? "driven by the sun"
-          : "not mapped";
+      sub.textContent = entityId ? entityId : "not mapped";
       main.appendChild(nameEl);
       main.appendChild(sub);
       const stateEl = document.createElement("span");
@@ -2190,7 +2132,7 @@ class SceneRendererPanel extends HTMLElement {
     list.innerHTML = "";
     this._objectRows = new Map();
     if (this._scriptObjects.length === 0) {
-      list.innerHTML = `<li class="row-sub">No script-driven objects. Declare them in scene.js with <code>objectDrivers</code>.</li>`;
+      list.innerHTML = `<li class="row-sub">No driven objects. Map one in the YAML <code>objects</code> block or declare it in scene.js with <code>objectDrivers</code>.</li>`;
       return;
     }
     for (const { name, entityId } of this._scriptObjects) {

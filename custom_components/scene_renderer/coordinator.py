@@ -38,6 +38,14 @@ and re-renders with the new entity set. No script -> the built-in set
 entities are tracked the same way, and the panel shows the objects
 with their driving entity and a toggle.
 
+The YAML ``objects`` mapping does the same for objects without a
+script: model object name -> driving entity ID (e.g. the ceiling fan
+-> a light). Its entities are tracked like the script's drivers, so a
+change re-renders; the panel merges the YAML mapping with the
+script's ``objectDrivers`` for the Objects section, YAML winning on
+conflict. The mapping only links object and entity — the script (or
+the panel viewer's own fan/TV handling) still does the animating.
+
 Light parametrization: each mapped entity is normalized into a render
 parameter set (see :func:`normalize_light_state`):
 
@@ -186,6 +194,7 @@ class SceneRenderCoordinator:
         sun_elevation: float | None = None,
         sun_azimuth: float | None = None,
         mapping: dict[str, str] | None = None,
+        objects: dict[str, str] | None = None,
         cameras: list[str] | None = None,
         name: str = DEFAULT_NAME,
     ) -> None:
@@ -205,6 +214,12 @@ class SceneRenderCoordinator:
             else None
         )
         self.mapping: dict[str, str] = dict(mapping or {})
+        # YAML `objects` mapping: model object name -> driving entity
+        # id. Its entities are tracked like the script's object
+        # drivers (see _tracked_entities), and panel_data exposes the
+        # mapping so the panel's Objects section can list the objects
+        # without a script.
+        self.objects: dict[str, str] = dict(objects or {})
         self.cameras: list[str] = list(cameras or [])
         self.service = RenderServiceClient(hass, self.service_url)
 
@@ -359,10 +374,11 @@ class SceneRenderCoordinator:
     @property
     def _tracked_entities(self) -> set[str]:
         """Every entity whose changes re-render: mapped lights + sun +
-        the script's resolved subscriptions."""
+        the YAML object drivers + the script's resolved subscriptions."""
         entities = set(self.mapping.values())
         if self.sun_enabled and self.sun_fixed is None:
             entities.add(self.sun_entity_id)
+        entities.update(self.objects.values())
         entities.update(self._script_entities)
         return entities
 

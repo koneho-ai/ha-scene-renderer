@@ -41,7 +41,7 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.discovery import async_load_platform
-from homeassistant.util.slugify import slugify
+from homeassistant.util import slugify
 
 from .const import (
     CONF_CAMERAS,

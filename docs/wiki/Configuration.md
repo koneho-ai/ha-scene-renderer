@@ -53,6 +53,13 @@ at the bottom of the page, and adds a toggle switch to each mapped
 light in the panel's light list so the render can be tested from the
 panel itself.
 
+**0.3.2** fixes a startup crash in 0.3.1 (`No module named
+'homeassistant.util.slugify'` — the migration imported slugify from a
+submodule that doesn't exist in HA; it lives in `homeassistant.util`).
+If 0.3.1 left the entities unavailable and the panel missing, update to
+0.3.2 and restart — the migration runs on setup and everything comes
+back under the new ids.
+
 ## How lights are rendered
 
 The integration normalizes each mapped entity into a parameter set:

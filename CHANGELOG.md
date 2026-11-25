@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.3.11 — 2026-11-25
+- Render-service restarts fixed (root cause: the kernel OOM killer): the service grew to ~750 MB RSS after its first render and the host killed it mid-render, so renders failed and images went stale — point-light shadow maps are now capped at 1024 px (was up to 2048, 96 MB per light; worst case 426 MB → 210 MB) and a light's shadow map is freed when it turns off, so memory tracks the lights actually on; sun/moon maps 2048 → 1024 px
+- Objects section unlinked too: object rows show only the object name, live state and toggle — no driver entity underneath, and the marker-click info line shows no entity either
+- Sidebar spacing: section titles were rendering at the browser-default 24 px with almost no gap above them (a stray duplicate `aside` block in the panel CSS swallowed the `aside h2` rule, and `aside h2:first-child` was also zeroing the top margin of every section title) — titles are 14 px uppercase again with 24 px above them, rows are roomier (8 px padding)
+
 ## 0.3.10 — 2026-11-25
 - Panel shadow fix: the sun/moon shadow-camera projection matrix could freeze at the three.js default ±5 m frustum when a state update landed during the model load, so the sun's shadows covered only a 10×10 m box (random per reload) — the panel now calls `updateProjectionMatrix()` after setting the sun/moon and point-light shadow cameras
 - Panel sidebar redesign: Entities on top with REAL controls (toggle calls the HA service, brightness slider calls `light.turn_on` on drag end); Lights below as debug-only model-light toggles (local preview, "(preview)" mark, Reset preview); the panel no longer shows which entity drives which light — the mapping lives in code

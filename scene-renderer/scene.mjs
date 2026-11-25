@@ -92,7 +92,21 @@ const DEFAULT_CLEAR_ALPHA = 0;
 // shadows from their casters (peter-panning). The sun keeps its own
 // -0.0005 (proven in production; ortho camera, only ~1.7 cm of leak,
 // harmless).
-export const POINT_SHADOW_MAP_SIZES = [512, 1024, 2048];
+// Point-light shadow map sizes (cube faces), by name hash. CAPPED AT
+// 1024 (was [512, 1024, 2048]): a 2048 cube map is 6 faces x 2048^2 x
+// 4 B = 96 MB per light, and three.js caches every light's shadow map
+// on first use and never frees it — with 14 lights the maps alone were
+// ~458 MB, and the render service (node-webgl, ~150 MB idle) grew to
+// ~750 MB RSS after its first render. On the 4 GB HA host that pushed
+// the kernel OOM killer to kill the node process mid-render (14:27:43
+// CET 2026-11-25, anon-rss 757 MB; the service then restarted silently
+// under s6, leaving renders failing and images stale). Capping at 1024
+// brings the worst case to ~210 MB (plus 8 MB sun/moon), and the
+// shadow maps of lights that are off are freed outright (see
+// syncLightVisibilityAndShadow), so memory tracks the lights that are
+// actually on. 1024 is also the panel viewer's largest size, so the
+// service now matches the panel's sharpest shadows.
+export const POINT_SHADOW_MAP_SIZES = [512, 1024, 1024];
 const POINT_SHADOW_BIAS = 0;
 const POINT_SHADOW_NORMAL_BIAS = 0.02;
 
@@ -647,6 +661,11 @@ export async function loadModel(arrayBuffer) {
     if (!light.shadow) continue;
     light.shadow.camera.near = 0.1;
     light.shadow.camera.far = diag * 1.5;
+    // Recompute the projection now: three.js only does it when the
+    // shadow map is first allocated, so a state update landing during
+    // the async GLB load could otherwise allocate the map with the
+    // default ±5 m frustum (the panel's 0.3.10 bug, same fix here).
+    light.shadow.camera.updateProjectionMatrix();
   }
 
   // Sun (directional, added by the service, not part of the model) and a
@@ -654,7 +673,11 @@ export async function loadModel(arrayBuffer) {
   const sun = new THREE.DirectionalLight(0xffffff, 0);
   sun.name = "sun";
   sun.castShadow = true;
-  sun.shadow.mapSize.set(2048, 2048);
+  // 1024 (was 2048): a 2048 directional map is 16 MB and the sun
+  // covers a ~30 m frustum, so 1024 (~34 px/m) is plenty — and it
+  // halves the sun/moon shadow memory. See POINT_SHADOW_MAP_SIZES
+  // for the OOM context.
+  sun.shadow.mapSize.set(1024, 1024);
   sun.shadow.camera.near = 1;
   sun.shadow.camera.far = diag * 4;
   sun.shadow.camera.left = -diag;
@@ -662,6 +685,10 @@ export async function loadModel(arrayBuffer) {
   sun.shadow.camera.top = diag;
   sun.shadow.camera.bottom = -diag;
   sun.shadow.bias = -0.0005;
+  // Recompute the projection now (see the point-light loop above):
+  // without this the first shadow-map allocation can freeze the
+  // default ±5 m frustum.
+  sun.shadow.camera.updateProjectionMatrix();
   scene.add(sun);
   scene.add(sun.target);
   // Moon (directional, same shadow setup as the sun): a dim, cool
@@ -671,7 +698,7 @@ export async function loadModel(arrayBuffer) {
   const moon = new THREE.DirectionalLight(MOON_COLOR, 0);
   moon.name = "moon";
   moon.castShadow = true;
-  moon.shadow.mapSize.set(2048, 2048);
+  moon.shadow.mapSize.set(1024, 1024);
   moon.shadow.camera.near = 1;
   moon.shadow.camera.far = diag * 4;
   moon.shadow.camera.left = -diag;
@@ -679,6 +706,7 @@ export async function loadModel(arrayBuffer) {
   moon.shadow.camera.top = diag;
   moon.shadow.camera.bottom = -diag;
   moon.shadow.bias = -0.0005;
+  moon.shadow.camera.updateProjectionMatrix();
   scene.add(moon);
   scene.add(moon.target);
   const hemi = new THREE.HemisphereLight(0xbfd4e6, 0x8a7a66, 0.5);
@@ -770,6 +798,25 @@ export function syncLightVisibilityAndShadow(lights) {
     const lit = light.intensity > 0;
     light.visible = lit;
     light.castShadow = lit;
+    if (!lit && light.shadow && light.shadow.map) {
+      // Free the shadow map: three.js allocates it on first use and
+      // caches it on light.shadow.map forever — a light that was on
+      // once keeps its (up to 24 MB) cube map allocated even after it
+      // goes dark, so over a day every light's map ends up resident
+      // (~210 MB at the capped sizes). Disposing here makes memory
+      // track the lights that are actually on; three.js re-allocates
+      // the map the next time the light casts a shadow (the same
+      // dispose pattern its WebGLShadowMap uses when the shadow type
+      // changes). Runs before renderer.render(), so the map is never
+      // in use when freed.
+      const map = light.shadow.map;
+      if (map.depthTexture) {
+        map.depthTexture.dispose();
+        map.depthTexture = null;
+      }
+      map.dispose();
+      light.shadow.map = null;
+    }
   }
 }
 

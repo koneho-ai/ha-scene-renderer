@@ -662,21 +662,16 @@ class SceneRendererPanel extends HTMLElement {
           padding: 12px 16px;
           background: var(--card-background-color, #fff);
         }
-          width: 300px; flex-shrink: 0; overflow-y: auto;
-          border-left: 1px solid var(--divider-color, #e0e0e0);
-          padding: 12px 16px;
-          background: var(--card-background-color, #fff);
-        }
         aside h2 {
-          font-size: 14px; margin: 16px 0 8px; font-weight: 500;
+          font-size: 14px; margin: 24px 0 8px; font-weight: 500;
           color: var(--secondary-text-color, #727272);
           text-transform: uppercase; letter-spacing: 0.04em;
         }
-        aside h2:first-child { margin-top: 0; }
+        aside > h2:first-child { margin-top: 0; }
         ul { list-style: none; margin: 0; padding: 0; }
         li {
           display: flex; align-items: center; gap: 8px;
-          padding: 6px 4px; font-size: 14px;
+          padding: 8px 4px; font-size: 14px;
           border-bottom: 1px solid var(--divider-color, #eee);
         }
         li.clickable { cursor: pointer; }
@@ -2108,12 +2103,13 @@ class SceneRendererPanel extends HTMLElement {
   }
 
   // Select a script-driven object: details in the info line and the
-  // row highlighted in the Objects list.
+  // row highlighted in the Objects list. No entity in the info line:
+  // the panel never displays which entity drives an object.
   _selectObject(name) {
     const entry = this._scriptObjects.find((o) => o.name === name);
     if (!entry) return;
     const state = this._emulatedState(entry.entityId);
-    this._els.info.textContent = `Object ${name} — ${entry.entityId} — ${state}`;
+    this._els.info.textContent = `Object ${name} — ${state}`;
     if (this._objectRows) {
       for (const [rowName, row] of this._objectRows) {
         row.li.classList.toggle("active", rowName === name);
@@ -3158,8 +3154,8 @@ class SceneRendererPanel extends HTMLElement {
 
   // Script-driven objects (fan, TV screen): one row per object the
   // script declared a driver for (see _buildScene) — object name,
-  // driving entity, live state, and a toggle for the entity when its
-  // domain has a toggle service.
+  // live state, and a toggle for the entity when its domain has a
+  // toggle service. The driver entity is never shown in the row.
   _renderObjectList() {
     const list = this._els.objectList;
     list.innerHTML = "";
@@ -3179,11 +3175,10 @@ class SceneRendererPanel extends HTMLElement {
       const nameEl = document.createElement("div");
       nameEl.className = "row-name";
       nameEl.textContent = name;
-      const sub = document.createElement("div");
-      sub.className = "row-sub";
-      sub.textContent = entityId;
+      // No entity shown under the name: the panel never displays
+      // which entity drives which object (the mapping lives in code),
+      // same as the Lights section.
       main.appendChild(nameEl);
-      main.appendChild(sub);
       const stateEl = document.createElement("span");
       stateEl.className = "row-state";
       li.appendChild(dot);

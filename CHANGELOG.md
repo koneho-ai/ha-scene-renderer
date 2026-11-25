@@ -1,11 +1,15 @@
 # Changelog
 
+## 0.3.10 — 2026-11-25
+- Panel shadow fix: the sun/moon shadow-camera projection matrix could freeze at the three.js default ±5 m frustum when a state update landed during the model load, so the sun's shadows covered only a 10×10 m box (random per reload) — the panel now calls `updateProjectionMatrix()` after setting the sun/moon and point-light shadow cameras
+- Panel sidebar redesign: Entities on top with REAL controls (toggle calls the HA service, brightness slider calls `light.turn_on` on drag end); Lights below as debug-only model-light toggles (local preview, "(preview)" mark, Reset preview); the panel no longer shows which entity drives which light — the mapping lives in code
+
 ## 0.3.9 — 2026-11-24
 - YAML `north_offset` (0–360°): rotate the sun and moon to match the real house orientation (renders + panel; the script sees model-frame azimuths)
 - Panel season slider (day-of-year, 1–365) next to the time-of-day sun slider; Live resets both
 - Panel weather emulator: sunny / overcast / rainy / snowy presets (sun dim, hemisphere, clear tint; real rain/snow particles outside the house, never inside); `weather` field on POST /render (service default sunny)
 - Overview camera is now an angled 3/4 aerial view instead of top-down (still orthographic)
-- Light→entity mapping moved from YAML `lights:` into scene.js (`lightMapping` table); YAML holds a flat `entities:` subscription list; panel gains an Entities section with emulation
+- Light→entity mapping moved from YAML `lights:` into scene.js (`lightMapping` table); YAML holds a flat `entities:` subscription list; panel gains an Entities section (real toggles since 0.3.10)
 - Moonlight: dim cool directional moon (Schlyter ephemeris), fading in as the sun sets; ambient `night` floor keeps rooms dimly visible
 - Soft shadows: PCFSoft → PCFShadowMap, per-light shadow blur radius (TV 16, others 1)
 - `ha_light` glTF extras: area lights (TV screen as a RectAreaLight + point light for shadows) and ambient lights (day/night values)

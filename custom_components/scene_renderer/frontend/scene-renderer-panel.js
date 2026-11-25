@@ -22,27 +22,32 @@
 // The light→entity mapping lives in the scene script (`lightMapping`,
 // panel_data.light_mapping): the viewer applies it the same way the
 // script does — a mapped light follows its entity's on/off, brightness
-// and color; a light not in the table renders OFF. panel_data.entities
-// lists the subscribed entities; the Entities section shows them with
-// emulation toggles (and a brightness slider for lights that support
-// it), so the preview can be driven from the entities as well as from
-// the lights.
+// and color; a light not in the table renders OFF. The panel never
+// shows which entity drives which light: the mapping is in code, and
+// the panel does no static analysis to figure it out.
 //
-// The toggles, the sun slider, the season slider and the weather
-// select are VIEWER-ONLY emulation: flipping a toggle sets a local
-// override for that entity or light in this viewer (never calling any
-// HA service), the sun slider moves the viewer's sun to the chosen
-// time of day, the season slider moves it to the chosen day of the
-// year, and the weather select dims the sun and adds rain or snow —
-// all without touching the renders or the real entities. Precedence
-// for a light: a direct light toggle wins; otherwise the light
-// follows its mapped entity (whose state and brightness may
-// themselves be emulated from the Entities section); the TV glow is
-// a fallback only when neither is set. Overridden rows are marked
-// "(preview)"; the Reset preview button clears all entity, light and
-// brightness overrides and the sun slider's Live button returns the
-// sun (and the season) to the real ones. Overrides are session-local
-// (gone on reload) and never affect the renders.
+// Sidebar order: Entities first, then Lights, then the rest.
+// The Entities section lists the subscribed entities
+// (panel_data.entities — the YAML list plus the script's subscriptions
+// and the object drivers) with a toggle that calls the REAL Home
+// Assistant service for that entity (light.toggle, media_player.toggle,
+// ...) and, for lights that report one, a brightness slider that calls
+// light.turn_on with the chosen brightness. These are real controls:
+// flipping one changes the actual entity, and the new state comes back
+// through hass. No mapping is shown here.
+//
+// The Lights section lists every light source the model declares, one
+// row per model light, with a toggle that is DEBUG-ONLY: it sets a
+// local preview override for that one model light, never touching HA
+// or any entity, so the model's behaviour can be emulated regardless
+// of what the entities are doing. No entity is shown here either. A
+// direct light toggle wins over the mapped entity's state; the TV glow
+// is a fallback only when neither is set. Overridden light rows are
+// marked "(preview)"; the Reset preview button clears the light
+// overrides, and the sun slider's Live button returns the sun (and the
+// season) to the real ones. The sun slider, the season slider and the
+// weather select are VIEWER-ONLY emulation, and light overrides are
+// session-local (gone on reload) and never affect the renders.
 
 import * as THREE from "./three.module.js";
 import { OrbitControls } from "./OrbitControls.js";
@@ -541,18 +546,10 @@ class SceneRendererPanel extends HTMLElement {
     this._floorY = 0; // floor plane for the bounce patch (bottom of the model bounds)
     this._modelBounds = null; // Box3 of the model, for clamping the bounce patch inside the house
     this._objectMarkers = []; // { name, entityId, mesh } — 3D markers for the script-driven objects
-    // Viewer-only emulation overrides (see the file header): entity_id
-    // -> emulated state ("on"/"off" for lights, "playing"/"off" for
-    // media players). Toggles write here, never to HA. Session-local.
-    this._overrides = new Map();
-    // Direct light toggles (Lights section): model light name ->
-    // "on"/"off". A set toggle wins over the mapped entity's state
-    // (and over the TV glow) for that light.
+    // Direct light toggles (Lights section, debug-only): model light
+    // name -> "on"/"off". A set toggle wins over the mapped entity's
+    // state (and over the TV glow) for that light. Session-local.
     this._lightOverrides = new Map();
-    // Emulated brightness (Entities section slider): entity_id -> 0..1.
-    // Only the brightness is overridden; the on/off state still comes
-    // from the entity (or its toggle override).
-    this._brightnessOverrides = new Map();
     // Viewer-only sun override from the time-of-day slider: minutes
     // from midnight, or null for the live sun (panel_data / sun.sun).
     this._sunOverride = null;
@@ -768,13 +765,13 @@ class SceneRendererPanel extends HTMLElement {
             </div>
           </div>
           <aside>
-            <div class="section-head">
-              <h2>Lights</h2>
-              <button id="reset-preview" class="mini" disabled title="Clear all preview overrides and return to the real entity states">Reset preview</button>
-            </div>
-            <ul id="light-list"><li class="row-sub">Loading…</li></ul>
             <h2>Entities</h2>
             <ul id="entity-list"><li class="row-sub">Loading…</li></ul>
+            <div class="section-head">
+              <h2>Lights</h2>
+              <button id="reset-preview" class="mini" disabled title="Clear the light preview overrides and return to the real entity states">Reset preview</button>
+            </div>
+            <ul id="light-list"><li class="row-sub">Loading…</li></ul>
             <h2>Objects</h2>
             <ul id="object-list"><li class="row-sub">Loading…</li></ul>
             <h2>Cameras</h2>
@@ -998,35 +995,28 @@ class SceneRendererPanel extends HTMLElement {
   // the local override when one is set, else the real HA state. The
   // attributes always come from the real entity (brightness/color),
   // because an override only flips the on/off state.
+  // The state the viewer uses for an entity: the REAL state from hass.
+  // Entities are no longer emulated — the Entities section toggles the
+  // real entity (see _toggleEntity), so there is no local override to
+  // apply here. (The name is kept because the light-appearance code
+  // calls it for the mapped entity's state.)
   _emulatedState(entityId) {
     const st = this._state(entityId);
     if (!st) return "unknown";
-    return this._overrides.get(entityId) || st.state;
+    return st.state;
   }
 
-  _isOverridden(entityId) {
-    return this._overrides.has(entityId);
-  }
-
-  // Flip a toggle: set a LOCAL preview override, never touching HA
-  // (the toggles are emulation-only — see the file header). The
-  // emulated state flips between the entity's "on" and "off" forms:
-  // media players flip to "playing" (the TV's on state), everything
-  // else to "on".
+  // Toggle a REAL entity: call the Home Assistant `toggle` service
+  // for its domain (light.toggle, media_player.toggle, ...). The new
+  // state comes back through `set hass` and re-renders the viewer; this
+  // method deliberately does not update the UI itself, so the toggle
+  // always reflects the real entity state. No-op when the hass object
+  // has no callService (e.g. the test stub) — the panel never crashes
+  // on a missing service.
   _toggleEntity(entityId) {
-    const current = this._emulatedState(entityId);
-    const onState = entityId.startsWith("media_player.") ? "playing" : "on";
-    this._overrides.set(
-      entityId,
-      ON_STATES.has(current) ? "off" : onState,
-    );
-    this._updateResetButton();
-    this._updateLightMarkers();
-    this._updateModelLights();
-    this._updateLightList();
-    this._updateEntityList();
-    this._updateObjectList();
-    this._updateTvState();
+    if (typeof this.hass?.callService !== "function") return;
+    const domain = entityId.split(".")[0];
+    this.hass.callService(domain, "toggle", { entity_id: entityId });
   }
 
   // Flip a light's direct toggle (Lights section): a LOCAL preview
@@ -1046,41 +1036,28 @@ class SceneRendererPanel extends HTMLElement {
     this._updateEntityList();
   }
 
-  // Set a LOCAL preview brightness for an entity (Entities section
-  // slider, 0..1), never touching HA. A value equal to the entity's
-  // real brightness clears the override instead, so the slider
-  // returning to the real value removes the "(preview)" mark.
-  _setBrightnessOverride(entityId, value) {
-    const st = this._state(entityId);
-    const real =
-      st && typeof st.attributes?.brightness === "number"
-        ? st.attributes.brightness / 255
-        : 1;
-    if (Math.abs(value - real) < 0.005) {
-      this._brightnessOverrides.delete(entityId);
-    } else {
-      this._brightnessOverrides.set(entityId, value);
+  // Set a REAL entity's brightness: call light.turn_on with the
+  // chosen brightness (0 turns it off). The new brightness comes back
+  // through `set hass`. No-op when the hass object has no callService.
+  _setEntityBrightness(entityId, value) {
+    if (typeof this.hass?.callService !== "function") return;
+    if (value <= 0) {
+      this.hass.callService("light", "turn_off", { entity_id: entityId });
+      return;
     }
-    this._updateResetButton();
-    this._updateLightMarkers();
-    this._updateModelLights();
-    this._updateLightList();
-    this._updateEntityList();
+    this.hass.callService("light", "turn_on", {
+      entity_id: entityId,
+      brightness: Math.round(value * 255),
+    });
   }
 
-  // Clear all entity, light and brightness overrides and return the
-  // viewer to the real entity states. (The sun slider has its own
+  // Clear the Lights section's debug overrides and return the viewer
+  // to the real entity states. (Entities are real controls now, so
+  // there is nothing to reset for them; the sun slider has its own
   // Live button.)
   _resetOverrides() {
-    if (
-      this._overrides.size === 0 &&
-      this._lightOverrides.size === 0 &&
-      this._brightnessOverrides.size === 0
-    )
-      return;
-    this._overrides.clear();
+    if (this._lightOverrides.size === 0) return;
     this._lightOverrides.clear();
-    this._brightnessOverrides.clear();
     this._updateResetButton();
     this._updateLightMarkers();
     this._updateModelLights();
@@ -1091,10 +1068,7 @@ class SceneRendererPanel extends HTMLElement {
   }
 
   _updateResetButton() {
-    this._els.resetPreview.disabled =
-      this._overrides.size === 0 &&
-      this._lightOverrides.size === 0 &&
-      this._brightnessOverrides.size === 0;
+    this._els.resetPreview.disabled = this._lightOverrides.size === 0;
   }
 
   // The light->entity mapping from the script (panel_data.light_mapping);
@@ -1128,13 +1102,10 @@ class SceneRendererPanel extends HTMLElement {
     return null;
   }
 
-  // The brightness (0..1) the viewer shows for an entity: the local
-  // slider override when one is set, else the real brightness
-  // attribute (1 for on/off-only entities).
+  // The brightness (0..1) the viewer shows for an entity: the REAL
+  // brightness attribute (1 for on/off-only entities). Entities are
+  // no longer emulated, so there is no local override to apply.
   _emulatedBrightness(entityId) {
-    if (this._brightnessOverrides.has(entityId)) {
-      return this._brightnessOverrides.get(entityId);
-    }
     const st = this._state(entityId);
     if (st && typeof st.attributes?.brightness === "number") {
       return st.attributes.brightness / 255;
@@ -1689,7 +1660,14 @@ class SceneRendererPanel extends HTMLElement {
     // (see _updateSunLight), so the far plane must clear 5 radii and
     // the frustum must cover the whole model. The moon sits at the
     // same distance (see _updateMoonLight), so it gets the same
-    // shadow camera.
+    // shadow camera. updateProjectionMatrix is required here: three.js
+    // only recomputes a shadow camera's projection when its shadow
+    // map is first allocated, so a map allocated before _buildScene
+    // (e.g. a state update during the async model load) would freeze
+    // the DEFAULT +/-5 m frustum and this frustum change would never
+    // take effect — the sun's shadows would cover only a +/-5 m box
+    // of the 15x8 m house until a reload (the random-on-reload bug,
+    // 2026-11-25).
     if (this._sunLight) {
       this._sunLight.shadow.camera.near = 0.5;
       this._sunLight.shadow.camera.far = radius * 8;
@@ -1697,6 +1675,7 @@ class SceneRendererPanel extends HTMLElement {
       this._sunLight.shadow.camera.right = radius * 1.5;
       this._sunLight.shadow.camera.top = radius * 1.5;
       this._sunLight.shadow.camera.bottom = -radius * 1.5;
+      this._sunLight.shadow.camera.updateProjectionMatrix();
     }
     if (this._moonLight) {
       this._moonLight.shadow.camera.near = 0.5;
@@ -1705,6 +1684,7 @@ class SceneRendererPanel extends HTMLElement {
       this._moonLight.shadow.camera.right = radius * 1.5;
       this._moonLight.shadow.camera.top = radius * 1.5;
       this._moonLight.shadow.camera.bottom = -radius * 1.5;
+      this._moonLight.shadow.camera.updateProjectionMatrix();
     }
 
     const markerRadius = Math.max(0.05, Math.min(0.35, radius * 0.012));
@@ -1756,6 +1736,11 @@ class SceneRendererPanel extends HTMLElement {
         obj.shadow.mapSize.set(mapSize, mapSize);
         obj.shadow.camera.near = 0.1;
         obj.shadow.camera.far = radius * 3;
+        // Same as the sun/moon frustum above: the projection matrix
+        // is only recomputed on shadow-map allocation, so apply the
+        // near/far change now rather than trusting the first render
+        // to pick it up.
+        obj.shadow.camera.updateProjectionMatrix();
         // No depth bias: in a perspective cube camera -0.004 NDC is
         // ~0.3-0.5 m of world depth at 4-5 m, which punches through a
         // 0.10 m interior wall (the dining-room leak, 0.3.8). The
@@ -2128,9 +2113,7 @@ class SceneRendererPanel extends HTMLElement {
     const entry = this._scriptObjects.find((o) => o.name === name);
     if (!entry) return;
     const state = this._emulatedState(entry.entityId);
-    this._els.info.textContent =
-      `Object ${name} — ${entry.entityId} — ${state}` +
-      (this._isOverridden(entry.entityId) ? " (preview)" : "");
+    this._els.info.textContent = `Object ${name} — ${entry.entityId} — ${state}`;
     if (this._objectRows) {
       for (const [rowName, row] of this._objectRows) {
         row.li.classList.toggle("active", rowName === name);
@@ -2942,8 +2925,12 @@ class SceneRendererPanel extends HTMLElement {
 
   // --- side lists ------------------------------------------------------
 
+  // Model lights (Lights section, debug-only): one row per light
+  // source the model declares — name, live state, and a toggle that
+  // sets a LOCAL preview override for that light (see _toggleLight).
+  // No entity is shown here: the mapping lives in code and the panel
+  // does no static analysis to figure it out.
   _renderLightList() {
-    const mapping = this._lightMapping();
     const list = this._els.lightList;
     list.innerHTML = "";
     this._lightRows = new Map();
@@ -2952,7 +2939,6 @@ class SceneRendererPanel extends HTMLElement {
       return;
     }
     for (const marker of this._lightMarkers) {
-      const entityId = mapping[marker.name];
       const li = document.createElement("li");
       li.className = "clickable";
       const dot = document.createElement("span");
@@ -2962,11 +2948,7 @@ class SceneRendererPanel extends HTMLElement {
       const nameEl = document.createElement("div");
       nameEl.className = "row-name";
       nameEl.textContent = marker.name;
-      const sub = document.createElement("div");
-      sub.className = "row-sub";
-      sub.textContent = entityId ? entityId : "not mapped";
       main.appendChild(nameEl);
-      main.appendChild(sub);
       const stateEl = document.createElement("span");
       stateEl.className = "row-state";
       li.appendChild(dot);
@@ -2995,10 +2977,10 @@ class SceneRendererPanel extends HTMLElement {
     this._updateLightList();
   }
 
-  // A toggle switch for one entity: flips the viewer's LOCAL preview
-  // override for it (emulation-only — never calls an HA service).
-  // The label stops propagation so a switch inside a clickable row
-  // does not also trigger the row's click handler.
+  // A toggle switch for one entity: calls the REAL Home Assistant
+  // `toggle` service for it (see _toggleEntity). The label stops
+  // propagation so a switch inside a clickable row does not also
+  // trigger the row's click handler.
   _makeToggle(entityId, labelText) {
     const label = document.createElement("label");
     label.className = "switch";
@@ -3036,19 +3018,13 @@ class SceneRendererPanel extends HTMLElement {
 
   _updateLightList() {
     if (!this._lightRows) return;
-    const mapping = this._lightMapping();
     for (const [name, row] of this._lightRows) {
       const app = this._lightAppearance(name);
       row.dot.style.backgroundColor = `rgb(${app.rgb[0]},${app.rgb[1]},${app.rgb[2]})`;
       row.dot.style.opacity = String(app.opacity);
-      const entityId = mapping[name];
-      // Preview when the light itself is toggled, or its entity is
-      // (state or brightness) emulated.
-      const overridden =
-        this._lightOverrides.has(name) ||
-        (entityId &&
-          (this._isOverridden(entityId) ||
-            this._brightnessOverrides.has(entityId)));
+      // Preview only when this light's own debug toggle is set.
+      // Entities are real now, so nothing about them marks a row.
+      const overridden = this._lightOverrides.has(name);
       row.stateEl.textContent = overridden ? `${app.state} (preview)` : app.state;
       row.stateEl.classList.toggle("preview", overridden);
       if (row.toggleInput) {
@@ -3063,26 +3039,20 @@ class SceneRendererPanel extends HTMLElement {
 
   // Subscribed entities (panel_data.entities — the YAML list plus the
   // script's subscriptions and the object drivers): one row per
-  // entity, with the lights it drives, its live state, and emulation
-  // controls — a toggle for toggleable domains and a brightness slider
-  // for lights that report a brightness. Everything here feeds the
-  // preview ONLY, through the lightMapping: flipping an entity's
-  // toggle drives every light it maps to.
+  // entity, with its live state and REAL controls — a toggle for
+  // toggleable domains and a brightness slider for lights that report
+  // a brightness. Flipping a toggle calls the real HA service for
+  // that entity; the new state comes back through hass. No mapping is
+  // shown here: which light an entity drives lives in code, and the
+  // panel does no static analysis to figure it out.
   _renderEntityList() {
     const entities = (this._panelData && this._panelData.entities) || [];
-    const mapping = this._lightMapping();
     const list = this._els.entityList;
     list.innerHTML = "";
     this._entityRows = new Map();
     if (entities.length === 0) {
       list.innerHTML = `<li class="row-sub">No subscribed entities. List them in the YAML <code>entities</code> block or declare them in scene.js with <code>subscribe</code>.</li>`;
       return;
-    }
-    // Reverse the mapping: entity id -> model lights it drives.
-    const drivenBy = new Map();
-    for (const [light, entityId] of Object.entries(mapping)) {
-      if (!drivenBy.has(entityId)) drivenBy.set(entityId, []);
-      drivenBy.get(entityId).push(light);
     }
     for (const entityId of entities) {
       const li = document.createElement("li");
@@ -3094,15 +3064,11 @@ class SceneRendererPanel extends HTMLElement {
       const nameEl = document.createElement("div");
       nameEl.className = "row-name";
       nameEl.textContent = entityId;
-      const sub = document.createElement("div");
-      sub.className = "row-sub";
-      const driven = drivenBy.get(entityId) || [];
-      sub.textContent =
-        driven.length > 0 ? `drives ${driven.join(", ")}` : "drives no light";
       main.appendChild(nameEl);
-      main.appendChild(sub);
-      // Brightness slider for lights that report a brightness: the
-      // value comes from the real attribute until the slider moves.
+      // Brightness slider for lights that report a brightness: it
+      // shows the real brightness, and calls light.turn_on with the
+      // chosen value when the drag ends (change, not input, so a drag
+      // does not spam the service).
       let sliderInput = null;
       let sliderLabel = null;
       const st = this._state(entityId);
@@ -3122,7 +3088,10 @@ class SceneRendererPanel extends HTMLElement {
         sliderLabel = document.createElement("span");
         sliderInput.addEventListener("click", (ev) => ev.stopPropagation());
         sliderInput.addEventListener("input", () => {
-          this._setBrightnessOverride(entityId, Number(sliderInput.value) / 100);
+          sliderLabel.textContent = `${sliderInput.value}%`;
+        });
+        sliderInput.addEventListener("change", () => {
+          this._setEntityBrightness(entityId, Number(sliderInput.value) / 100);
         });
         row.appendChild(sliderInput);
         row.appendChild(sliderLabel);
@@ -3155,12 +3124,10 @@ class SceneRendererPanel extends HTMLElement {
   _updateEntityList() {
     if (!this._entityRows) return;
     for (const [entityId, row] of this._entityRows) {
+      // Real state only — entities are real controls, never preview.
       const state = this._emulatedState(entityId);
-      const overridden =
-        this._isOverridden(entityId) ||
-        this._brightnessOverrides.has(entityId);
-      row.stateEl.textContent = overridden ? `${state} (preview)` : state;
-      row.stateEl.classList.toggle("preview", overridden);
+      row.stateEl.textContent = state;
+      row.stateEl.classList.remove("preview");
       const active = ON_STATES.has(state);
       row.dot.style.backgroundColor = active ? "#ffb300" : "#3a3f44";
       row.dot.style.opacity = active ? "1" : "0.55";
@@ -3172,33 +3139,21 @@ class SceneRendererPanel extends HTMLElement {
       if (row.sliderInput) {
         const brightness = this._emulatedBrightness(entityId);
         // Don't fight the user mid-drag: only move the slider when
-        // the value actually changed (the input event already set
-        // the override, so a re-render keeps it in place).
+        // the value actually changed (the input event only updates
+        // the label, the real value arrives through hass).
         if (Number(row.sliderInput.value) !== Math.round(brightness * 100)) {
           row.sliderInput.value = String(Math.round(brightness * 100));
         }
         row.sliderInput.disabled = state !== "on";
         row.sliderLabel.textContent = `${Math.round(brightness * 100)}%`;
-        row.sliderLabel.classList.toggle(
-          "preview",
-          this._brightnessOverrides.has(entityId),
-        );
+        row.sliderLabel.classList.remove("preview");
       }
     }
   }
 
   _selectEntity(entityId) {
-    const mapping = this._lightMapping();
-    const driven = Object.entries(mapping)
-      .filter(([, e]) => e === entityId)
-      .map(([light]) => light);
     const state = this._emulatedState(entityId);
-    this._els.info.textContent =
-      `Entity ${entityId} — ${state}` +
-      (driven.length > 0 ? ` — drives ${driven.join(", ")}` : " — drives no light") +
-      (this._isOverridden(entityId) || this._brightnessOverrides.has(entityId)
-        ? " (preview)"
-        : "");
+    this._els.info.textContent = `Entity ${entityId} — ${state}`;
   }
 
   // Script-driven objects (fan, TV screen): one row per object the
@@ -3250,10 +3205,11 @@ class SceneRendererPanel extends HTMLElement {
   _updateObjectList() {
     if (!this._objectRows) return;
     for (const [name, row] of this._objectRows) {
+      // Real driver-entity state — object toggles call the real
+      // service, never a preview override.
       const state = this._emulatedState(row.entityId);
-      const overridden = this._isOverridden(row.entityId);
-      row.stateEl.textContent = overridden ? `${state} (preview)` : state;
-      row.stateEl.classList.toggle("preview", overridden);
+      row.stateEl.textContent = state;
+      row.stateEl.classList.remove("preview");
       // Active: on, or a media player doing something (playing, paused
       // and idle all mean the TV is on — same as the example script).
       const active = ON_STATES.has(state);
@@ -3310,19 +3266,10 @@ class SceneRendererPanel extends HTMLElement {
   }
 
   _selectLight(name) {
-    const mapping = this._lightMapping();
-    const entityId = mapping[name];
     const app = this._lightAppearance(name);
-    const overridden =
-      this._lightOverrides.has(name) ||
-      (entityId &&
-        (this._isOverridden(entityId) ||
-          this._brightnessOverrides.has(entityId)));
-    this._els.info.textContent = entityId
-      ? `Light ${name} — ${entityId} — ${app.state}` +
-        (overridden ? " (preview)" : "")
-      : `Light ${name} — not mapped to a Home Assistant entity` +
-        (overridden ? " (preview)" : "");
+    const overridden = this._lightOverrides.has(name);
+    this._els.info.textContent =
+      `Light ${name} — ${app.state}` + (overridden ? " (preview)" : "");
   }
 
   _selectSun() {
